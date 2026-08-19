@@ -2,6 +2,11 @@
 
 Internal reference for developing and maintaining the Rust port.
 
+For a navigable developer documentation set, start with
+[docs/DEVELOPER_OVERVIEW.md](docs/DEVELOPER_OVERVIEW.md). It links to focused
+architecture, runtime-flow, tool-system, KiCad-integration, and testing/release
+docs. This file remains the detailed internal reference.
+
 Repository-wide naming, public API, branch, and pull-request rules live in
 [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md).
 
