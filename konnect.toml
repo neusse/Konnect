@@ -1,0 +1,6 @@
+kicad_cli = "C:\\Users\\georg\\AppData\\Local\\Programs\\KiCad\\10.0\\bin\\kicad-cli.exe"
+kicad_binary = "C:\\Users\\georg\\AppData\\Local\\Programs\\KiCad\\10.0\\bin\\kicad.exe"
+ipc_address = 'ipc://C:\Users\georg\AppData\Local\Temp\kicad\api.sock'
+transport = "stdio"
+log_level = "info"
+auto_load_toolsets = false

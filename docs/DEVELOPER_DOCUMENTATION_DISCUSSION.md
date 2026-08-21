@@ -74,3 +74,17 @@ Questions for maintainers:
    becomes a PR?
 4. Do you prefer this proceed from Discussion to PR directly, or should we open
    an issue first after agreeing on scope?
+
+## Document links
+
+The draft documents are saved as standalone files here:
+
+[Konnect developer documentation proposal drafts](https://gist.github.com/neusse/46cc583b80f510032ddcd62d119d9423)
+
+- [Developer overview](https://gist.github.com/neusse/46cc583b80f510032ddcd62d119d9423#file-developer_overview-md)
+- [Architecture](https://gist.github.com/neusse/46cc583b80f510032ddcd62d119d9423#file-architecture-md)
+- [Runtime flows](https://gist.github.com/neusse/46cc583b80f510032ddcd62d119d9423#file-runtime_flows-md)
+- [Tool system](https://gist.github.com/neusse/46cc583b80f510032ddcd62d119d9423#file-tool_system-md)
+- [Developing tools](https://gist.github.com/neusse/46cc583b80f510032ddcd62d119d9423#file-developing_tools-md)
+- [KiCad integration](https://gist.github.com/neusse/46cc583b80f510032ddcd62d119d9423#file-kicad_integration-md)
+- [Testing and release](https://gist.github.com/neusse/46cc583b80f510032ddcd62d119d9423#file-testing_and_release-md)
