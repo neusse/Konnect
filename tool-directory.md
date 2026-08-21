@@ -72,7 +72,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `move_schematic_component` | Move a symbol to a new position. Does NOT adjust connected wires. |
 | `rotate_schematic_component` | Rotate a symbol by setting its absolute rotation angle (0/90/180/270). |
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
-| `move_region` | Move all symbols within a bounding box by a given offset. |
+| `move_region` | Move all symbols, wires, labels, global/hierarchical labels, junctions, text notes, and no-connect markers within a bounding box by a given offset. |
 | `annotate_schematic` | Run kicad-cli to auto-assign reference designators (`R?` → `R1`, `U?` → `U1`, etc.). |
 | `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on a symbol, accounting for rotation/mirroring, plus each pin's `orientation_degrees` (the direction leading away from the body, 0 = east) and `length_mm`. |
 | `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same per-pin fields. |

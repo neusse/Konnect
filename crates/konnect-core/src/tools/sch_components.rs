@@ -208,7 +208,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_region",
-            "Move all symbols within a bounding box by a given offset.",
+            "Move all schematic items within a bounding box by a given offset. \
+             Moves symbols, wires, labels, global/hierarchical labels, junctions, \
+             text notes, and no-connect markers together so a functional block \
+             remains movable as a coherent region.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1154,7 +1157,14 @@ async fn handle_move_region(
 
     let mut sch = cse::Schematic::load(&sch_path)?;
 
-    // Collect references of symbols within the bounding box
+    let (xmin, xmax) = (x1.min(x2), x1.max(x2));
+    let (ymin, ymax) = (y1.min(y2), y1.max(y2));
+    let in_region = |x: f64, y: f64| x >= xmin && x <= xmax && y >= ymin && y <= ymax;
+    let wire_in_region = |wire: &cse::Wire| {
+        in_region(wire.start.0, wire.start.1) && in_region(wire.end.0, wire.end.1)
+    };
+
+    // Collect references of symbols within the bounding box.
     let refs_to_move: Vec<String> = sch
         .symbols
         .within_rectangle(x1, y1, x2, y2)
@@ -1172,11 +1182,88 @@ async fn handle_move_region(
         }
     }
 
+    let mut wires_moved = 0usize;
+    for wire in sch.wires.iter_mut() {
+        if wire_in_region(wire) {
+            wire.translate(dx, dy);
+            wires_moved += 1;
+        }
+    }
+
+    let mut labels_moved = 0usize;
+    for label in sch.labels.iter_mut() {
+        let (x, y) = label.position();
+        if in_region(x, y) {
+            label.translate(dx, dy);
+            labels_moved += 1;
+        }
+    }
+
+    let mut global_labels_moved = 0usize;
+    for label in sch.global_labels.iter_mut() {
+        let (x, y) = label.position();
+        if in_region(x, y) {
+            label.translate(dx, dy);
+            global_labels_moved += 1;
+        }
+    }
+
+    let mut hierarchical_labels_moved = 0usize;
+    for label in sch.hierarchical_labels.iter_mut() {
+        let (x, y) = label.position();
+        if in_region(x, y) {
+            label.translate(dx, dy);
+            hierarchical_labels_moved += 1;
+        }
+    }
+
+    let mut junctions_moved = 0usize;
+    for junction in &mut sch.junctions {
+        let (x, y) = junction.position();
+        if in_region(x, y) {
+            junction.translate(dx, dy);
+            junctions_moved += 1;
+        }
+    }
+
+    let mut texts_moved = 0usize;
+    for text in &mut sch.texts {
+        let (x, y) = text.position();
+        if in_region(x, y) {
+            text.translate(dx, dy);
+            texts_moved += 1;
+        }
+    }
+
+    let mut no_connects_moved = 0usize;
+    for no_connect in &mut sch.no_connects {
+        let (x, y) = no_connect.position();
+        if in_region(x, y) {
+            no_connect.translate(dx, dy);
+            no_connects_moved += 1;
+        }
+    }
+
     sch.overwrite()?;
 
     Ok(CallToolResult::json(&json!({
-        "moved_count": moved.len(),
-        "moved": moved
+        "moved_count": moved.len()
+            + wires_moved
+            + labels_moved
+            + global_labels_moved
+            + hierarchical_labels_moved
+            + junctions_moved
+            + texts_moved
+            + no_connects_moved,
+        "symbols_moved_count": moved.len(),
+        "symbols_moved": moved,
+        "wires_moved_count": wires_moved,
+        "labels_moved_count": labels_moved,
+        "global_labels_moved_count": global_labels_moved,
+        "hierarchical_labels_moved_count": hierarchical_labels_moved,
+        "junctions_moved_count": junctions_moved,
+        "texts_moved_count": texts_moved,
+        "no_connects_moved_count": no_connects_moved
     })))
 }
 
@@ -2198,6 +2285,55 @@ mod tests {
             Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
             other => panic!("expected text content, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn move_region_moves_complete_schematic_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("region.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(paper \"A4\")\n\t(lib_symbols)\n\t(junction (at 12 12) (diameter 0) (uuid \"junction-1\"))\n\t(no_connect (at 13 13) (uuid \"nc-1\"))\n\t(wire (pts (xy 10 10) (xy 20 10)) (uuid \"wire-1\"))\n\t(text \"block note\" (at 15 15 0) (uuid \"text-1\"))\n\t(label \"LOCAL\" (at 20 10 0) (uuid \"label-1\"))\n\t(global_label \"GLOBAL\" (shape bidirectional) (at 21 10 0) (uuid \"global-1\"))\n\t(hierarchical_label \"SHEET\" (shape input) (at 22 10 0) (uuid \"hier-1\"))\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 14 14 0)\n\t\t(unit 1)\n\t\t(uuid \"sym-1\")\n\t\t(property \"Reference\" \"R1\" (at 14 12 0))\n\t)\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_move_region(
+            &json!({
+                "schematic": path.display().to_string(),
+                "x1": 9.0, "y1": 9.0,
+                "x2": 23.0, "y2": 16.0,
+                "dx": 10.0, "dy": 5.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let out: serde_json::Value = serde_json::from_str(&content_text(&result)).unwrap();
+        assert_eq!(out["symbols_moved_count"], 1);
+        assert_eq!(out["wires_moved_count"], 1);
+        assert_eq!(out["labels_moved_count"], 1);
+        assert_eq!(out["global_labels_moved_count"], 1);
+        assert_eq!(out["hierarchical_labels_moved_count"], 1);
+        assert_eq!(out["junctions_moved_count"], 1);
+        assert_eq!(out["texts_moved_count"], 1);
+        assert_eq!(out["no_connects_moved_count"], 1);
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch.symbols.by_reference("R1").unwrap();
+        assert_eq!(sym.position(), (24.13, 19.05));
+        assert_eq!(sch.wires.as_slice()[0].start, (20.0, 15.0));
+        assert_eq!(sch.wires.as_slice()[0].end, (30.0, 15.0));
+        assert_eq!(sch.labels.as_slice()[0].position(), (30.0, 15.0));
+        assert_eq!(sch.global_labels.as_slice()[0].position(), (31.0, 15.0));
+        assert_eq!(
+            sch.hierarchical_labels.as_slice()[0].position(),
+            (32.0, 15.0)
+        );
+        assert_eq!(sch.junctions[0].position(), (22.0, 17.0));
+        assert_eq!(sch.texts[0].position(), (25.0, 20.0));
+        assert_eq!(sch.no_connects[0].position(), (23.0, 18.0));
     }
 
     #[tokio::test]
