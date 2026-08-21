@@ -1,11 +1,7 @@
 # Testing And Release
 
-This document summarizes the checks developers should understand before opening
-a PR.
-
-## Core Local Checks
-
-Run the same main checks CI expects:
+The pull-request baseline is defined in `CONTRIBUTING.md`. Run the same commands
+locally when the required platform dependencies are available:
 
 ```bash
 cargo test --workspace --locked --lib --tests
@@ -14,70 +10,77 @@ cargo clippy --workspace --locked --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-`protoc` is required for `konnect-ipc` protobuf code generation. Some platforms
-also require the protobuf well-known type files from a separate package.
+`protoc` and its well-known type includes are required by
+`crates/konnect-ipc/build.rs`.
 
-## Build Checks
+## Coverage Map
 
-Build the server binary:
-
-```bash
-cargo build --release -p konnect
-```
-
-Build the schematic viewer separately:
-
-```bash
-cd crates/schematic-viewer
-cargo build --release
-```
-
-The viewer is excluded from the workspace, so workspace-level cargo commands do
-not cover it.
-
-## Test Coverage Map
-
-| Area | Where |
-|------|-------|
-| MCP protocol and CLI behavior | `crates/konnect/tests` and unit tests under `crates/konnect/src` |
-| Router invariants | `crates/konnect-core/src/router/mod.rs` tests |
-| Tool dispatch and required-argument behavior | `crates/konnect-core/src/mcp/handler.rs` tests |
-| Tool handlers and shared helpers | `crates/konnect-core` tests and module unit tests |
-| S-expression parsing/writing | `crates/konnect-sexp` tests |
+| Area | Source of tests |
+|---|---|
+| MCP protocol, CLI, and asset contracts | `crates/konnect/tests` and `crates/konnect/src` unit tests |
+| Router and toolset invariants | `crates/konnect-core/src/router` tests |
+| Dispatch and required-argument behavior | `crates/konnect-core/src/mcp/handler.rs` tests |
+| Domain handlers and evidence rules | tests beside modules in `crates/konnect-core/src/tools` |
+| S-expression parsing and atomic writes | `crates/konnect-sexp` tests |
 | Typed schematic model | `crates/konnect-schematic-editor` tests |
-| KiCad IPC builders/client behavior | `crates/konnect-ipc` tests |
-| Live KiCad behavior | ignored tests and `.github/workflows/e2e-kicad.yml` |
-| Viewer behavior | `crates/schematic-viewer` tests and CI viewer job |
-| Python plugin lifecycle | `plugin/tests` and CI plugin job |
-| PCM metadata | `packaging/validate-pcm.py` and packaging CI |
+| IPC builders, transport, and client behavior | `crates/konnect-ipc` tests |
+| Real KiCad behavior | ignored live tests and `.github/workflows/e2e-kicad.yml` |
+| Viewer | `crates/schematic-viewer` tests and its CI job |
+| Python plugin | `plugin/tests` and the plugin CI job |
+| PCM package | `packaging/validate-pcm.py` and packaging CI jobs |
 
-## CI Shape
+The viewer is outside the Cargo workspace. Build or test it from
+`crates/schematic-viewer`; workspace commands do not cover it.
 
-The normal CI workflow checks the Rust workspace across supported operating
-systems, formatting, clippy, docs, viewer, plugin tests, Nix build, and PCM
-metadata validation.
+## Evidence-Focused Regression Tests
 
-The end-to-end KiCad workflow runs against a real KiCad install. It is not a
-normal per-PR gate and is used for scheduled, manual, and release-related
-validation.
+When a tool returns a count, success state, or verdict, test the evidence behind
+that field. The v0.7 reference cases include:
 
-## Release Packaging
+- complete DRC category parsing in `tools/cli.rs`;
+- DRC-backed review/readiness decisions in `tools/design_review.rs` and
+  `tools/manufacturing.rs`;
+- footprint-type discrimination and post-commit read-back in
+  `tools/pcb_sync.rs` and `konnect-ipc/src/builders.rs`;
+- closed-board placement and flip refusal cases in `tools/pcb_components.rs`.
 
-Release packaging builds standalone server binaries and KiCad PCM packages. The
-macOS package is universal; platform PCM packages include the matching server
-binary and plugin assets.
+Use real KiCad-generated fixtures for formats KiCad owns. For an IPC path, unit
+tests should prove request construction and failure classification; an ignored
+live test or the end-to-end workflow should prove behavior that depends on a
+running editor.
 
-If a change affects plugin files, metadata, installer behavior, binary layout, or
-packaged assets, validate the PCM package before proposing release.
+## CI And Live Validation
 
-## Documentation Checks
+`.github/workflows/ci.yml` covers the Rust workspace, formatting, clippy,
+documentation tests, viewer, plugin, Nix, and PCM validation. The live KiCad
+workflow is separate because it requires an installed graphical application and
+is not an ordinary per-PR gate.
 
-When a change touches public behavior, update the docs in the same PR. At
-minimum, check:
+In the PR description, list every command run and explicitly name checks skipped
+because they require KiCad, another operating system, credentials, or release
+infrastructure.
 
-- README for user-facing install or workflow changes.
-- DEV.md and these developer docs for architecture or contributor workflow
-  changes.
-- `tool-directory.md` for tool schema/listing changes.
-- Bundled skills under `crates/konnect/assets/skills` for AI workflow changes.
+## Documentation
 
+For a public behavior change, inspect README, `DEV.md`, `tool-directory.md`,
+these developer maps, and bundled guidance under
+`crates/konnect/assets/skills` and `assets/agents`. Tool-count locations and
+their enforcement are defined by `CONTRIBUTING.md` and
+`crates/konnect/tests/doc_tool_counts.rs`; link to the authoritative catalogue
+instead of copying totals into new documents.
+
+Every behavioral claim in these maps should name its source module. When the
+module changes, a contributor can find the claim by searching for the old path.
+Describe unimplemented future behavior explicitly as design intent rather than
+current capability.
+
+## Packaging And Release
+
+Build the server with `cargo build --release -p konnect`. Build the viewer
+separately when it is in scope. Changes to plugin files, binary layout, metadata,
+icons, or release scripts require PCM assembly and
+`packaging/validate-pcm.py` validation.
+
+`packaging/build-pcm.ps1` and `build-pcm.sh` enumerate the files staged into the
+PCM archive. Developer documentation stays in the repository and is not added
+to release zips.

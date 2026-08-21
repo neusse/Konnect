@@ -1,92 +1,92 @@
 # KiCad Integration
 
-Konnect integrates with KiCad through three mechanisms: direct schematic file
-editing, KiCad 10 IPC for live PCB operations, and `kicad-cli` subprocesses for
-exports and checks.
+Konnect uses direct KiCad file editing, KiCad IPC, and `kicad-cli`. The correct
+path depends on the operation and whether KiCad currently owns the document.
 
-## Direct Schematic Editing
+## Schematic File Editing
 
-Schematic tools operate on `.kicad_sch` files using Konnect's own parsers and
-writers. This allows schematic work without a running KiCad process.
+Schematic handlers under `crates/konnect-core/src/tools/sch_*.rs` operate on
+saved `.kicad_sch` files through `konnect-schematic-editor` and
+`konnect-sexp`. These paths work without a running KiCad process and preserve
+the embedded library definitions, UUIDs, and instance information needed by
+KiCad.
 
-Key properties:
+Existing-file writes use the atomic/conflict-aware machinery in
+`konnect-sexp/src/writer.rs`. Multi-file changes use
+`konnect-sexp/src/transaction.rs`; a source revision change must become a
+conflict rather than an overwrite.
 
-- Reads and writes KiCad S-expression files.
-- Embeds required library symbol definitions into schematic files.
-- Preserves UUID and instance-path behavior needed by KiCad.
-- Uses revision-aware atomic replacement for existing-file writes.
-- Uses write-ahead journals for multi-file schematic operations.
+## KiCad IPC
 
-If a schematic file changed after it was read, the writer should report a
-conflict rather than overwrite it.
+`crates/konnect-ipc` sends typed protobuf requests over NNG. The socket comes
+from `ipc_address` or `KICAD_API_SOCKET`; KiCad-provided credentials such as
+`KICAD_API_TOKEN` are carried in the IPC client request metadata.
 
-## KiCad 10 IPC
+The three board-write gates are:
 
-PCB editor operations use KiCad 10's IPC API through `konnect-ipc`.
+- `KiCadIpcClient::ensure_board_is_active` in `konnect-ipc/src/client.rs`
+  prevents a request naming one board from changing another open board.
+- `attempt_ipc_write` in `konnect-core/src/tools/pcb_board.rs` permits a file
+  fallback only when IPC is unreachable. A response from KiCad, including a
+  rejection, fails closed.
+- `refuse_if_board_open_in_kicad` in the same module protects file-only tools
+  from edits KiCad would discard on its next save.
 
-Transport details:
+Closed-board move, rotate, and flip in `tools/pcb_components.rs` are narrowly
+scoped exceptions with explicit geometry checks. They are not a general license
+to edit a live board file.
 
-- NNG request/reply transport.
-- Protobuf `ApiRequest` / `ApiResponse` envelope.
-- Socket path from config or `KICAD_API_SOCKET`.
-- API token from `KICAD_API_TOKEN` when KiCad launches the plugin.
+## Schematic-To-Board Sync
 
-Most PCB tools require KiCad running with the target board open. Some narrow
-single-footprint operations can fall back to a closed board file only when IPC
-transport is unreachable. A request that reached KiCad and timed out or was
-rejected must not be treated as safe for a file fallback.
+`update_pcb_from_schematic` in `tools/pcb_sync.rs` is live-IPC-only. It uses
+`tools/cli.rs` to export a netlist from the saved hierarchy, plans against a live
+snapshot, requires the current plan revision for apply, performs one IPC commit,
+and reads the affected footprint shapes back.
+
+The read-back is a correctness boundary, not merely a diagnostic convenience.
+In earlier releases, protobuf `Any` values carrying footprint graphics decoded
+as empty pads because unknown proto fields are skipped; KiCad accepted the
+mutation. The v0.7 path discriminates the declared type and verifies the board
+after commit.
 
 ## `kicad-cli`
 
-Konnect uses `kicad-cli` for operations that KiCad exposes through its command
-line interface, including schematic export, board export, ERC, DRC, rendering,
-and manufacturing outputs.
+`crates/konnect-core/src/tools/cli.rs` is the shared subprocess and result parser
+for ERC, DRC, exports, and rendering. Callers should use it rather than build
+ad-hoc command lines.
 
-The CLI path comes from config or standard install-path discovery. On macOS,
-users often need to point Konnect at the binary inside the KiCad app bundle.
+The DRC result model preserves design-rule violations, unconnected items, and
+schematic parity. `verification.rs`, `pcb_export.rs`, `design_review.rs`, and
+`manufacturing.rs` consume that complete result; unavailable categories or a
+failed CLI run cannot be treated as a clean board.
 
-## Config Sources
+Freerouting remains usable through its KiCad ActionPlugin, but Konnect does not
+currently have a safe DSN/SES bridge. The `autoroute` behavior in
+`tools/integration.rs` reports that limitation instead of claiming KiCad removed
+CLI commands that never existed.
 
-The server loads config from these places, in order:
+## Configuration
 
-1. `konnect.toml` in the working directory.
-2. `settings.json` in the working directory.
-3. `settings.json` beside the executable.
-4. `settings.json` one directory above the executable.
-5. Platform config path, such as `%APPDATA%\konnect\config.toml` on Windows.
+`crates/konnect/src/config.rs` searches, in order:
 
-An explicit `--config <path>` loads that file. JSON is selected by `.json`
-extension; other extensions are parsed as TOML.
+1. `konnect.toml` in the working directory;
+2. `settings.json` in the working directory;
+3. `settings.json` beside the executable;
+4. `settings.json` one directory above the executable;
+5. the platform configuration directory.
 
-Important fields:
+`--config <path>` loads an explicit file. Relevant fields include `kicad_cli`,
+`kicad_binary`, `ipc_address`, `transport`, `http_address`, `jlcpcb_db_path`,
+`log_level`, `auto_load_toolsets`, and `eager_toolsets`. The legacy
+`ipc_socket_path` alias is accepted by the serde definition in `config.rs`.
 
-- `kicad_cli`
-- `kicad_binary`
-- `ipc_address` or legacy alias `ipc_socket_path`
-- `transport`
-- `http_address`
-- `jlcpcb_db_path`
-- `log_level`
-- `auto_load_toolsets`
-- `eager_toolsets`
+## Plugin, Viewer, And Packaging
 
-If `ipc_address` is blank, `KICAD_API_SOCKET` can fill it.
+`plugin` is a thin Python KiCad integration layer that launches/configures the
+Rust server included in a PCM bundle. The standalone viewer in
+`crates/schematic-viewer` watches schematic files and renders through
+`kicad-cli`; it is built and tested separately from the Rust workspace.
 
-## KiCad Plugin Package
-
-The KiCad Plugin and Content Manager package includes:
-
-- Python ActionPlugin files from `plugin`.
-- Rust server binary under the package `bin` directory.
-- PCM metadata and resources from `packaging`.
-
-The Python plugin provides the PCB editor settings entry. The Rust binary is the
-actual MCP server.
-
-## Viewer
-
-The schematic viewer is launched separately or through the
-`open_schematic_viewer` tool. It watches the root schematic and sub-sheets,
-renders SVG snapshots with `kicad-cli`, and updates the view without blocking
-KiCad's own saves.
-
+The PCM assembly scripts in `packaging/build-pcm.ps1` and `build-pcm.sh` stage
+only metadata, plugin files, icons, and binaries. Repository developer
+documentation under `docs/` is intentionally not part of the install zip.

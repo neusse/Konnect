@@ -1,81 +1,52 @@
 # Tool System
 
-Konnect's MCP API is organized as a small always-visible starter surface plus
-toolsets that are loaded on demand.
+Konnect exposes always-visible meta-tools plus domain toolsets loaded on demand.
+The implementation is split between `crates/konnect-core/src/mcp`, `router`, and
+`tools`.
 
-## Core Types
+## Definitions And Context
 
-`ToolDef` in `crates/konnect-core/src/tools/mod.rs` is the unit of exposure:
+`ToolDef` in `crates/konnect-core/src/tools/mod.rs` is the unit exposed through
+MCP. It carries a public name, description, JSON input schema, and async handler.
+The `tool!` macro constructs definitions in each domain module.
 
-- `name`: public MCP tool name.
-- `description`: text shown to the model/client.
-- `input_schema`: JSON Schema object exposed in `tools/list`.
-- `handler`: async function receiving JSON arguments and `ToolContext`.
+`ToolContext` carries `ServerConfig`, the shared `ToolRouter`, the call observer,
+and shared integration state. Public tool names and schema fields are API; apply
+the naming and compatibility rules in `docs/NAMING_CONVENTIONS.md` and
+`CONTRIBUTING.md`.
 
-The `tool!` macro builds a `ToolDef` from a name, description, schema, and typed
-async handler.
+## Toolsets And Meta-Tools
 
-`ToolContext` carries:
+`crates/konnect-core/src/router/registry.rs` declares `ALL_TOOLSETS`, the starter
+set, each toolset's metadata, and the `tools_for` mapping. Registry tests compare
+declared per-toolset counts with the definitions returned by the domain module.
 
-- `ServerConfig`
-- shared `ToolRouter`
-- shared `CallObserver`
-- in-memory JLCPCB query cache
+`router/meta_tools.rs` defines the always-visible discovery, load/unload, and
+observability surface. Meta-tools are outside `ALL_TOOLSETS`. `load_toolset`
+accepts either one name or an array; a successful change causes
+`mcp/handler.rs` to emit `notifications/tools/list_changed`.
 
-## Toolsets
+## Dispatch
 
-Toolsets are declared in `crates/konnect-core/src/router/registry.rs`.
+`McpHandler` in `mcp/handler.rs` dispatches in this order:
 
-Each entry in `ALL_TOOLSETS` has:
+1. Handle a meta-tool.
+2. Handle a loaded domain tool.
+3. If `auto_load_toolsets` is enabled, load the owning toolset and retry.
+4. If a registered tool is not loaded, return `toolset_not_loaded`.
+5. Otherwise return `unknown_tool`.
 
-- `name`
-- `description`
-- `category`
-- `tool_count`
-
-`tools_for(name)` maps a toolset name to that module's `tools()` function. The
-router tests assert that the declared `tool_count` matches the actual number of
-tools returned.
-
-The default starter kit is:
-
-```text
-project
-config
-```
-
-Together with meta-tools, this keeps the baseline `tools/list` small. Load larger
-domains only when the current task needs them.
-
-## Meta-Tools
-
-Meta-tools are always visible and handled before domain tools. They include
-toolset discovery/loading and observability tools such as recent-call and server
-statistics queries.
-
-Meta-tools are not part of `ALL_TOOLSETS`, so do not add them to a domain count.
-
-## Dispatch Rules
-
-Tool dispatch in `McpHandler` follows this order:
-
-1. Try meta-tool.
-2. Try loaded domain tool.
-3. If `auto_load_toolsets` is enabled, find the owner toolset, load it, and try
-   again.
-4. If the tool exists but is not loaded, return structured `toolset_not_loaded`.
-5. If no registered tool owns the name, return structured `unknown_tool`.
-
-When `load_toolset` or `unload_toolset` changes the active set, the server emits
-`notifications/tools/list_changed`.
+This distinction lets a client recover from an unloaded tool without confusing
+it with a misspelled or removed public API.
 
 ## Argument Contracts
 
-The schema `required` list is enforced at dispatch before the handler runs. This
-prevents handlers from accidentally substituting defaults for omitted required
-arguments.
+`mcp/handler.rs` enforces the schema's `required` list before invoking a domain
+handler. Presence is only the first gate: handlers must use the typed helpers in
+`tools/mod.rs` so a value of the wrong JSON type produces a structured
+`invalid_argument` response.
 
-Inside handlers, use the argument helpers in `tools/mod.rs`:
+Use the appropriate helper, including:
 
 - `require_str`
 - `require_f64`
@@ -83,37 +54,42 @@ Inside handlers, use the argument helpers in `tools/mod.rs`:
 - `require_u64`
 - `get_path`
 
-The schema gate checks presence only. Type-specific helpers still matter because
-they produce structured `invalid_argument` errors for wrong types.
+Do not use an `unwrap_or` default for a schema-required argument. An explicit
+empty array is a value; an omitted required array is an invalid request.
 
-An explicit empty array is a valid value. A missing array is an argument error.
+## Response And Evidence Contracts
+
+A response must describe what the backend observed or committed, not merely echo
+what the caller requested. This rule is especially important across IPC and CLI
+boundaries:
+
+- `tools/pcb_sync.rs` compares the post-commit board with the footprint shapes
+  it sent and reports or refuses mismatches.
+- `tools/cli.rs` derives DRC results from every category KiCad reports rather
+  than treating an absent finding in one category as a clean board.
+- `tools/design_review.rs` and `tools/manufacturing.rs` require DRC evidence for
+  a positive verdict and distinguish "not checked" from "none found."
+
+When a successful write cannot be trusted from the immediate return value,
+prefer a bounded read-back or an independently derived result. If the evidence
+is unavailable, return an incomplete/diagnostic state rather than a positive
+claim.
 
 ## Structured Errors
 
-MCP `CallToolResult` has no top-level structured error object. Konnect encodes
-structured error details inside the text content as JSON while setting
-`is_error: true`.
+`CallToolResult` does not provide a separate top-level structured error object.
+`crates/konnect-core/src/mcp/error.rs` serializes the error detail into text
+content while setting `is_error`.
 
-Current common kinds include:
+Common error kinds include `toolset_not_loaded`, `unknown_tool`,
+`invalid_argument`, `file_not_found`, `conflict`, and `handler_error`. Add a new
+kind in `mcp/error.rs` only when callers need a stable new classification; use
+`CallToolResult::error_kind` to return it.
 
-- `toolset_not_loaded`
-- `unknown_tool`
-- `invalid_argument`
-- `file_not_found`
-- `conflict`
-- `handler_error`
+## Documentation Coupling
 
-Add new error kinds in `crates/konnect-core/src/mcp/error.rs`, then use
-`CallToolResult::error_kind`.
-
-## Updating Tool Documentation
-
-When adding, removing, or renaming tools:
-
-1. Update the toolset module's `tools()` list.
-2. Update `tool_count` in `router/registry.rs`.
-3. Regenerate or update `tool-directory.md`.
-4. Update README and DEV stats if total counts changed.
-5. Add or update tests that cover the schema, argument validation, and failure
-   path.
-
+When tools are added, removed, or renamed, update the domain `tools()` list,
+`router/registry.rs`, `tool-directory.md`, and the guarded count locations named
+by `CONTRIBUTING.md`. Do not repeat catalogue totals in these map documents;
+`crates/konnect/tests/doc_tool_counts.rs` enforces the designated sources and
+sweeps documentation for stale totals.

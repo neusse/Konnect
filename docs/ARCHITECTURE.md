@@ -1,118 +1,162 @@
 # Architecture
 
-Konnect is organized around clear runtime boundaries: the outer binary owns
-process concerns, `konnect-core` owns MCP/tool behavior, and the lower crates
-own specific KiCad data access strategies.
+Konnect separates process concerns, MCP/tool behavior, and KiCad data access.
+This page describes both those static boundaries and the runtime flows through
+them. `DEV.md` remains the deeper implementation reference.
 
-## Crate Responsibilities
+## Static Boundaries
 
-### `crates/konnect`
+### Server process: `crates/konnect`
 
-The `konnect` crate builds the main server binary and the KiCad plugin-facing
-library entry points.
+`crates/konnect/src/main.rs` classifies help, version, installer, transaction,
+and server invocations before any server-side writes occur. It loads
+`Config`, initializes tracing on stderr, constructs `McpHandler`, and selects
+stdio, HTTP, or both transports.
 
-Important modules:
+`crates/konnect/src/config.rs` owns TOML/JSON discovery and the environment
+fallback for `KICAD_API_SOCKET`. The transport implementations live in
+`crates/konnect/src/transport/stdio.rs` and `http.rs`. Client guidance
+installation is owned by `crates/konnect/src/install.rs`; schematic transaction
+inspection and recovery commands are owned by `transaction_cli.rs`.
 
-- `src/main.rs` classifies CLI invocations, runs installer/status/transaction
-  subcommands, detects double-click install mode, loads config, starts tracing,
-  builds `McpHandler`, and selects the transport.
-- `src/config.rs` loads TOML or JSON config from the working directory, paths
-  near the executable, or the platform config directory. `KICAD_API_SOCKET`
-  fills a blank `ipc_address`.
-- `src/transport/stdio.rs` runs JSON-RPC over stdin/stdout. Stdout is protocol
-  only; tracing goes to stderr.
-- `src/transport/http.rs` runs Streamable HTTP on `/mcp` with SSE for
-  server-initiated notifications and localhost-only Origin validation.
-- `src/install.rs` installs bundled skills and agents for supported AI clients.
-- `src/transaction_cli.rs` inspects, recovers, or force-abandons schematic
-  write-ahead journals.
+### MCP and domain logic: `crates/konnect-core`
 
-### `crates/konnect-core`
+`crates/konnect-core/src/mcp/handler.rs` handles MCP methods, enforces required
+argument presence, dispatches tool calls, emits tool-list notifications, and
+records calls through `observability.rs`.
 
-`konnect-core` contains the MCP protocol handler, router, observability, and all
-domain tool implementations.
+`crates/konnect-core/src/router/registry.rs` declares toolsets and resolves each
+toolset to its definitions. `router/mod.rs` tracks loaded definitions, and
+`router/meta_tools.rs` implements the always-visible discovery, loading, and
+observability tools.
 
-Important modules:
+`crates/konnect-core/src/tools/mod.rs` owns `ToolDef`, `ToolContext`,
+`ServerConfig`, the `tool!` macro, required-argument helpers, and shared path and
+library helpers. Domain handlers live in the other files under `src/tools`.
 
-- `src/mcp/protocol.rs` defines the JSON-RPC and MCP wire types.
-- `src/mcp/handler.rs` handles MCP methods, dispatches tool calls, validates
-  required arguments before handlers run, emits `tools/list_changed`, and
-  records observability data.
-- `src/router/mod.rs` tracks loaded toolsets and maps tool names to handlers.
-- `src/router/registry.rs` declares all toolsets, tool counts, descriptions, and
-  the startup `STARTER_KIT`.
-- `src/router/meta_tools.rs` defines always-visible router/observability tools.
-- `src/tools/mod.rs` defines `ToolDef`, `ToolContext`, `ServerConfig`, the
-  `tool!` macro, argument helpers, and shared KiCad path/library helpers.
-- `src/tools/*.rs` are the domain toolsets: project, schematic, PCB, library,
-  integration, verification, review, templates, and manufacturing.
+### KiCad data layers
 
-### `crates/konnect-sexp`
+`crates/konnect-sexp` owns low-level KiCad S-expression parsing, edits, geometry,
+layer/net primitives, atomic replacement, reversible commands, and multi-file
+transaction journals. It does not require a live KiCad process.
 
-`konnect-sexp` is the low-level S-expression layer used for KiCad files. It is
-the right place for parsing, writing, reversible edit commands, geometry helpers,
-net/layer primitives, and multi-file transaction journals.
+`crates/konnect-schematic-editor` owns the typed schematic model, library symbol
+resolution, and parse-mutate-serialize workflows for symbols, wires, labels,
+sheets, and related schematic concepts.
 
-This crate intentionally avoids requiring a live KiCad process. It is used when
-Konnect needs direct file edits with atomic replacement and conflict detection.
+`crates/konnect-ipc` owns the KiCad IPC client, generated protobuf types, NNG
+request/reply transport, typed board operations, and the distinction between an
+unreachable transport and a request KiCad received and rejected.
 
-### `crates/konnect-schematic-editor`
+### Non-workspace and non-Rust boundaries
 
-`konnect-schematic-editor` is the typed schematic model. Use it when a schematic
-operation is easier to express as parse -> mutate typed model -> write instead
-of direct S-expression edits.
+`crates/schematic-viewer` is a separate Tauri application and is deliberately
+outside the Cargo workspace. `plugin` is the thin Python KiCad integration
+layer. `packaging` contains the PCM build scripts, metadata, schema, and package
+validation. Bundled AI guidance under `crates/konnect/assets/skills` and
+`assets/agents` is user-facing workflow behavior and must track the tools it
+names.
 
-It owns typed concepts such as symbols, wires, labels, sheets, and library
-lookup.
+## Server Startup
 
-### `crates/konnect-ipc`
+```text
+crates/konnect/src/main.rs
+  -> classify invocation
+  -> Config::load or Config::load_from
+  -> McpHandler::new
+  -> ToolRouter with starter toolsets (or every toolset when configured)
+  -> stdio and/or HTTP transport
+```
 
-`konnect-ipc` is the KiCad 10 IPC client. It generates Rust protobuf types from
-the copied KiCad proto files, sends requests over NNG, and exposes typed helper
-methods for board operations.
+`McpHandler::new` in `mcp/handler.rs` uses the `STARTER_KIT` declared by
+`router/registry.rs` unless `eager_toolsets` requests a complete initial list.
+The latter exists for clients that do not refresh after
+`notifications/tools/list_changed`; the configuration contract is documented
+beside the fields in `crates/konnect/src/config.rs`.
 
-This crate is responsible for KiCad IPC transport classification. A transport
-that cannot be reached is different from a request that reached KiCad and was
-rejected or timed out. Callers use that distinction to decide whether a
-file-based fallback is safe.
+## Listing, Loading, And Calling Tools
 
-### `crates/schematic-viewer`
+```text
+tools/list
+  -> McpHandler::dispatch
+  -> meta_tools::meta_tool_descriptions
+  -> ToolRouter::active_tools
 
-The schematic viewer is a separate Tauri application, excluded from the Cargo
-workspace. It watches schematic files, renders snapshots through `kicad-cli`,
-and presents a pan/zoom SVG view with multi-sheet navigation.
+tools/call load_toolset
+  -> router/meta_tools.rs
+  -> ToolRouter::load
+  -> notifications/tools/list_changed
 
-Because it is outside the workspace, `cargo test --workspace` does not test it.
-Run its checks explicitly from `crates/schematic-viewer`.
+tools/call domain_tool
+  -> McpHandler::execute_tool
+  -> meta-tool or loaded domain definition
+  -> required-field gate
+  -> handler
+  -> CallToolResult and observability record
+```
 
-## Non-Rust Boundaries
+`load_toolset` accepts one name or an array of names in
+`router/meta_tools.rs`. If an unloaded tool is called, `mcp/handler.rs` either
+auto-loads its owner when configured or returns a structured
+`toolset_not_loaded` error. Stdio delivers list-change notifications through
+`transport/stdio.rs`; HTTP delivers them through the SSE path in
+`transport/http.rs`.
 
-### `plugin`
+## Schematic File Mutation
 
-The Python plugin is a thin KiCad integration layer. It gives users an ActionPlugin
-entry in the PCB editor, displays settings, and launches/configures the Rust
-server binary packaged with the PCM bundle.
+Schematic handlers in `tools/sch_*.rs` read a saved schematic, mutate it through
+`konnect-schematic-editor` or `konnect-sexp`, and commit with revision-aware
+atomic replacement. If the source changes after it is read, the writer must
+return a conflict instead of overwriting it.
 
-### `packaging`
+Multi-file schematic changes use the write-ahead journal in
+`konnect-sexp/src/transaction.rs`. The `konnect transaction` commands in
+`crates/konnect/src/transaction_cli.rs` inspect, recover, or explicitly abandon
+those journals.
 
-The packaging directory contains KiCad Plugin and Content Manager metadata,
-schema validation, icon resources, and platform package scripts.
+## Board Mutation And Write Gates
 
-### Bundled guidance
+Board writes use three distinct patterns:
 
-`crates/konnect/assets/skills` and `crates/konnect/assets/agents` are distributed
-with the server and installed by `konnect init` for supported AI clients. These
-files are part of the user-facing AI workflow and should be kept in sync with
-tool behavior.
+1. Live IPC handlers call `KiCadIpcClient::ensure_board_is_active` in
+   `konnect-ipc/src/client.rs` before changing the editor document.
+2. Hybrid handlers use `attempt_ipc_write` in
+   `konnect-core/src/tools/pcb_board.rs`. Only an unreachable IPC transport may
+   fall back to a file edit; a reached-and-rejected request fails closed.
+3. File-only board handlers call `refuse_if_board_open_in_kicad` in
+   `tools/pcb_board.rs` so KiCad cannot later overwrite an invisible file edit.
+
+Closed-board move, rotate, and flip behavior is implemented in
+`tools/pcb_components.rs`. These paths preserve rigid-body footprint geometry
+and refuse inputs whose geometry cannot be transformed safely.
+
+`update_pcb_from_schematic` is a special live-only path in `tools/pcb_sync.rs`.
+It exports the saved schematic hierarchy through the CLI wrapper, creates a dry
+run plan, requires that plan's revision for apply, performs one IPC commit, and
+reads the result back. The read-back check exists because a prior protobuf type
+mistake converted footprint graphics into pads while every layer reported
+success.
+
+## Checks, Exports, And Verdicts
+
+`crates/konnect-core/src/tools/cli.rs` is the subprocess wrapper for KiCad CLI
+checks and exports. Domain-facing handlers in `verification.rs`,
+`pcb_export.rs`, `sch_export.rs`, `manufacturing.rs`, and `design_review.rs`
+interpret those results.
+
+Positive review and manufacturing verdicts are evidence-gated. In particular,
+the DRC model in `tools/cli.rs` preserves KiCad's design-rule,
+unconnected-item, and schematic-parity categories; `design_review.rs` and
+`manufacturing.rs` treat unavailable evidence as incomplete rather than clean.
 
 ## Ownership Rules
 
-- Process lifecycle, CLI behavior, transport selection, and config loading belong
-  in `crates/konnect`.
-- MCP method handling, routing, structured tool errors, and observability belong
-  in `crates/konnect-core`.
-- KiCad schematic file primitives and atomic writes belong in `konnect-sexp` or
+- CLI lifecycle, configuration, installer behavior, and transports belong in
+  `crates/konnect`.
+- MCP protocol handling, routing, tool responses, and observability belong in
+  `crates/konnect-core`.
+- Schematic and general KiCad file primitives belong in `konnect-sexp` or
   `konnect-schematic-editor`.
-- KiCad live PCB IPC behavior belongs in `konnect-ipc`.
-- KiCad Plugin Manager packaging belongs in `packaging` and `plugin`.
-
+- Live board IPC behavior and transport classification belong in `konnect-ipc`;
+  policy for using it belongs in the calling `konnect-core` handler.
+- KiCad plugin and PCM changes belong in `plugin` and `packaging`.
