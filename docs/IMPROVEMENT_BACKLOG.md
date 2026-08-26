@@ -1,237 +1,226 @@
-# Konnect improvement backlog — 25-Aug-2026 (v0.8.0)
+# Konnect improvement backlog — 26-Aug-2026 (v0.9.0)
 
 > **Disclosure.** I posted this Codex-assisted evaluation after reviewing the
-> Konnect v0.8.0 release and source, the current roadmap and contributor rules,
-> every open issue, every open pull request, relevant closed/merged work,
+> Konnect v0.9.0 release and source, the current roadmap and contributor rules,
+> every open issue, every open pull request, relevant closed and merged work,
 > maintainer responses, project discussions, and our actual end-to-end KiCad
 > use with the version-matched `konnect-codex` plugin. The priorities below are
 > recommendations, not maintainer assignments. Before implementing an item, I
 > will claim it on the issue, agree on the design, and follow the roadmap and
-> contribution process with one focused PR.
+> contribution process with focused PRs.
 
 ## Snapshot
 
-- Release reviewed: [v0.8.0](https://github.com/mixelpixx/Konnect/releases/tag/v0.8.0),
-  tag commit [`dee8a27`](https://github.com/mixelpixx/Konnect/commit/dee8a27ce606f644cef0220deac98e88640d9b16).
-- Current upstream `main`: [`c68c745`](https://github.com/mixelpixx/Konnect/commit/c68c745c2a26808726a477b2ef8e56e05833bdc0),
-  one metadata-only PCM packaging commit ahead of the tag.
-- Release delta: 98 commits and 61 changed files since v0.7.0.
-- Live inventory at this snapshot: **32 open issues and 13 open pull requests**.
-- Tool surface: 19 toolsets, 204 registered tools, 210 total.
-- Companion reviewed and installed: `konnect-codex` v0.8.0 companion revision 1.
+- Released contract: [v0.9.0](https://github.com/mixelpixx/Konnect/releases/tag/v0.9.0),
+  tag commit [`8648fe25`](https://github.com/mixelpixx/Konnect/commit/8648fe2573377eac78525907cbdd16216986f08e).
+- Released surface: **19 toolsets, 206 registered tools, 212 total tools**.
+- Current upstream `main`: [`2b5a33f`](https://github.com/mixelpixx/Konnect/commit/2b5a33f62a087d54b670ac41a93f4d1827c1b4e9),
+  already 17 substantial commits beyond the tag, with **20 toolsets, 210
+  registered tools, 216 total tools**.
+- Live inventory at publication: **30 open issues and eight open pull requests**.
+- Companion reviewed and installed: `konnect-codex` v0.9.0 companion revision 1.
+
+The release and current `main` are separate snapshots. Rendering, visual
+baselines, design hashes, geometry scaffolding and placement scoring on current
+`main` are promising, but they are not v0.9.0 features until released.
 
 ## Executive assessment
 
-v0.8.0 is a major reliability release. It closes 13 items from the 21-August
-backlog, repairs legacy footprint corruption, fixes repeated board-outline
-corruption, replaces `move_connected` false success with an honest refusal,
-adds catalogue-wide schema parameter checks, and moves several PCB reads and
-zone creation onto live IPC.
+v0.9.0 is a meaningful correctness release. It adds atomic, revision-gated
+footprint-library refresh; atomic batch placement with live readback; junction
+reconciliation after ordinary schematic movement; multi-unit schematic
+mutations; trustworthy live pad readback; transformed symbol geometry; and
+correct bus-entry endpoint reporting.
 
-The top risk has changed. [#326](https://github.com/mixelpixx/Konnect/issues/326)
-now belongs at P0 because `create_netclass` can omit `wire_width` from the
-Default netclass, causing Eeschema to suppress or strip junction dots and
-potentially change project-wide connectivity. The v0.8.0 shared connectivity
-index also remains bus-blind (#328), and `add_bus_entry` reports its two
-endpoints backwards (#329). These are small-looking defects with outsized
-agent-workflow consequences.
+The most important new limitation is
+[#331](https://github.com/mixelpixx/Konnect/issues/331): the new
+`update_footprints_from_library` tool correctly refuses unsupported content,
+but `fp_text user` makes it refuse most official KiCad footprints. This is safe
+failure, not corruption, but it prevents the advertised workflow for the
+dominant library case.
 
-## Released progress since v0.7.0
+The P0 group is now narrower and more actionable. #326 has a green active fix
+in #333. #240 still guards against stale-file mutation after live IPC loss;
+#252 still requires truthful artifact verification; #189 can choose an
+unrelated project root; and #182 still has unit-1-only readers even though its
+mutation half shipped.
 
-- [#294](https://github.com/mixelpixx/Konnect/pull/294) adds a dry-run-first,
-  revision-gated `repair_corrupted_footprints` tool, proven against a real
-  68-footprint board with 848 phantom pads.
-- [#314](https://github.com/mixelpixx/Konnect/issues/314) fixes
-  `set_board_size` appending overlapping Edge.Cuts on every call.
-- [#315](https://github.com/mixelpixx/Konnect/issues/315) stops
-  `move_connected` from claiming it preserved wires when it did not. The real
-  connected-move capability remains open and depends on #120.
-- [#285](https://github.com/mixelpixx/Konnect/pull/285) lands the #251
-  parameter-honesty series and a catalogue-wide CI guard.
-- [#307–#313](https://github.com/mixelpixx/Konnect/pull/307) and
-  [#317](https://github.com/mixelpixx/Konnect/pull/317) fix idempotent edits,
-  sheet movement, duplicated UUIDs, text justification, project library-table
-  targeting, generated-pin positions, SVG return, and invalid sheet-pin syntax.
-- [#323](https://github.com/mixelpixx/Konnect/pull/323) gives schematic
-  connectivity tools one shared index; #262 resolves power symbols and #267
-  respects intentional no-connects.
-- [#316](https://github.com/mixelpixx/Konnect/pull/316) creates/refills zones
-  through live IPC when possible and reports explicit live/file provenance.
-- [#207](https://github.com/mixelpixx/Konnect/pull/207) reads board state and
-  pads from the live board; #324 adds custom User paper dimensions.
-- [#327](https://github.com/mixelpixx/Konnect/pull/327) uses the local JLCPCB
-  catalogue Datasheet column before network lookup.
-- [#306](https://github.com/mixelpixx/Konnect/pull/306) ships the approved
-  developer architecture, tool, integration, testing, and release guides.
+## Released progress in v0.9.0
+
+- [#232](https://github.com/mixelpixx/Konnect/pull/232) adds atomic,
+  dry-run/revision-gated `update_footprints_from_library` and closes #231.
+- [#264](https://github.com/mixelpixx/Konnect/pull/264) adds atomic
+  `set_component_placements`, one undo entry and post-commit readback.
+- [#330](https://github.com/mixelpixx/Konnect/pull/330) reconciles junction dots
+  after ordinary component moves and closes #120. Actual wire-carrying movement
+  remains #315.
+- [#273](https://github.com/mixelpixx/Konnect/pull/273) makes reference-based
+  mutations affect all placed units. #182 remains open for batch/export/
+  analysis/review readers.
+- [#265](https://github.com/mixelpixx/Konnect/pull/265) makes live pad readback
+  fail instead of fabricating or dropping data.
+- [#275](https://github.com/mixelpixx/Konnect/pull/275) uses transformed symbol
+  geometry for layout and overlap checks.
+- #329 is closed: `add_bus_entry` responses now report the endpoints actually
+  written.
+- Dependency PRs #243, #320 and #321 also shipped.
 
 ## P0 — correctness and non-destructive behavior
 
-### 1. Preserve the complete Default netclass — #326
+### 1. Preserve the complete Default netclass — #326 / PR #333
 
-[`create_netclass` omits `wire_width`](https://github.com/mixelpixx/Konnect/issues/326),
-and an incomplete Default netclass can disable or strip schematic junctions.
+[#326](https://github.com/mixelpixx/Konnect/issues/326) can omit `wire_width`
+from the Default netclass and cause Eeschema to suppress or strip junction
+dots. [PR #333](https://github.com/mixelpixx/Konnect/pull/333) is mergeable and
+green across platforms. Keep the issue at P0 until the fix is released and a
+real project proves the complete field set, T-junction connectivity and ERC
+survive a KiCad round trip.
 
-Recommended implementation:
-
-- serialize every KiCad Default netclass field, including `wire_width`;
-- use KiCad defaults when optional caller values are absent;
-- round-trip a real project through KiCad and prove the full field set survives;
-- verify T-junction connectivity and ERC before/after the mutation;
-- add a regression test that fails if any required Default field disappears.
-
-Until fixed, workflows should not create or overwrite Default without explicit
-round-trip evidence.
-
-### 2. Make schematic moves connectivity-safe — #120 and #315
-
-[#120](https://github.com/mixelpixx/Konnect/issues/120) is the underlying
-junction/connectivity problem; [#315](https://github.com/mixelpixx/Konnect/issues/315)
-tracks the missing wire-carrying move. v0.8.0 correctly refuses instead of
-lying. [PR #330](https://github.com/mixelpixx/Konnect/pull/330) is a useful,
-green junction-on-move prerequisite, not a complete `move_connected` solution.
-
-Land this as staged, testable work: reconcile affected junctions first, then
-implement explicit wire stretching/shrinking, rotation and delete behavior,
-with KiCad ERC and serialized connectivity fixtures at every stage.
-
-### 3. Refuse stale-file mutation after live IPC loss — #240/#241
+### 2. Refuse stale-file mutation after live IPC loss — #240 / #241 / PR #334
 
 [#240](https://github.com/mixelpixx/Konnect/issues/240) remains the central
-wrong-state hazard: after a tool has observed an open document, IPC loss must
-not silently fall back to editing a stale file. [#241](https://github.com/mixelpixx/Konnect/issues/241)
-should supply the reusable document-answering IPC test harness.
+wrong-state hazard: after observing a live board, Konnect must not silently
+fall back to a stale file when IPC disappears. #241 supplies the reusable
+document-answering mock. [PR #334](https://github.com/mixelpixx/Konnect/pull/334)
+is relevant groundwork, but its platform test failures need resolution.
 
-Every mutator should bind to the requested document identity, report its
-source, and fail closed if a formerly live document becomes unavailable.
+Every mutator should bind to the requested document identity, report its source
+and fail closed when a formerly live document is unavailable.
 
-### 4. Finish unit-aware mutation — #182
+### 3. Verify every reported artifact — #252 / PR #270
 
-The shared connectivity index improves reads, but mutation is still incomplete.
-Rebase [PR #273](https://github.com/mixelpixx/Konnect/pull/273) over #323 and
-prove multi-unit placement, movement, rotation, deletion, annotation, pin lookup,
-and connectivity without duplicate references or cross-unit corruption.
+[#252](https://github.com/mixelpixx/Konnect/issues/252) requires every snapshot,
+export and manufacturing response to verify the requested output path,
+existence, nonzero size, format signature, board/revision identity and
+per-artifact failure state. [PR #270](https://github.com/mixelpixx/Konnect/pull/270)
+is still the main implementation path but now conflicts with `main` and needs a
+focused rebase.
+
+### 4. Finish unit-aware reads and analyses — #182
+
+v0.9.0 fixes multi-unit mutation. The remaining
+[#182](https://github.com/mixelpixx/Konnect/issues/182) scope is unit-1-only
+behavior in `sch_batch`, `sch_export`, `sch_analysis` and `design_review`.
+Complete those reads with multi-unit fixtures without reopening the solved
+mutation work.
 
 ### 5. Bound project-root and library discovery — #189
 
 [#189](https://github.com/mixelpixx/Konnect/issues/189) can still select an
 unrelated ancestor project or library table. Search must stop at an explicit
-project boundary, expose candidates, and refuse ambiguity rather than choosing
+project boundary, expose candidates and refuse ambiguity rather than choosing
 the first match.
-
-### 6. Verify every reported artifact — #252
-
-[#252](https://github.com/mixelpixx/Konnect/issues/252) remains open even after
-the schema-honesty work. Every snapshot, export and manufacturing response must
-verify the requested output path, existence, nonzero size, format signature,
-board/revision identity, and per-artifact failure state.
 
 ## P1 — high-value workflow reliability
 
-### Bus and response correctness — #328/#329
+### Footprint refresh and schematic connectivity
 
+- [#331](https://github.com/mixelpixx/Konnect/issues/331): represent and
+  preserve standard `fp_text user` content so official footprints pass
+  dry-run/apply/save/no-op convergence. Never solve this by dropping artwork.
 - [#328](https://github.com/mixelpixx/Konnect/issues/328): make the shared
   connectivity index understand buses, bus entries and bus-attached labels.
-  Until then, KiCad ERC is authoritative for bus sheets; agent guidance must not
-  “repair” correct geometry from a Konnect-only orphan result.
-- [#329](https://github.com/mixelpixx/Konnect/issues/329): return `bus_side` and
-  `wire_side` from the endpoints actually written. Add all-orientation tests and
-  require response geometry to equal serialized geometry.
+  Until then, KiCad ERC remains authoritative for bus sheets.
+- [#315](https://github.com/mixelpixx/Konnect/issues/315): implement actual
+  connected wire movement. v0.9.0 completed junction reconciliation, not wire
+  stretching or shrinking.
 
-### Lifecycle and client reachability — #103/#233/#242/#325
+### Lifecycle and client reachability
 
-- [#103](https://github.com/mixelpixx/Konnect/issues/103): own server children,
-  track multiple instances, and remove orphaned processes safely.
+- [#103](https://github.com/mixelpixx/Konnect/issues/103): server-owned
+  multi-instance lifecycle and orphan cleanup remain open.
 - [#242](https://github.com/mixelpixx/Konnect/issues/242): MCP startup must not
-  reinstall guidance after an explicit uninstall. Use an explicit-init model or
-  a durable tombstone distinct from “never installed.”
+  reinstall guidance after explicit uninstall.
 - [#233](https://github.com/mixelpixx/Konnect/issues/233) and
   [#325](https://github.com/mixelpixx/Konnect/issues/325): support clients that
-  cap tools or do not refetch after dynamic loading. The roadmap's compact
-  surface plus tool-directory resource is the right direction. Codex remains
-  functional through eager toolsets and does not need a proxy today.
+  cap tools or never refetch changed tool lists with a compact surface and/or
+  MCP resource directory.
 
 ### Board identity, platform and mutation completeness
 
-- [#256](https://github.com/mixelpixx/Konnect/issues/256): opening a requested
-  PCB must prove that exact document became active.
-- [#257](https://github.com/mixelpixx/Konnect/issues/257): remove KiCad 11 SWIG
-  assumptions and move necessary DSN/SES/editor operations toward supported IPC.
-- [#231](https://github.com/mixelpixx/Konnect/issues/231): provide a live,
-  verified Update Footprints from Library path; rebase #232 and repeat real-KiCad evidence.
+- [#256](https://github.com/mixelpixx/Konnect/issues/256): open and prove the
+  exact requested board.
+- [#257](https://github.com/mixelpixx/Konnect/issues/257): prepare for KiCad 11
+  SWIG removal and deprecated IPC fields.
 - [#254](https://github.com/mixelpixx/Konnect/issues/254): discover supported
-  per-user Windows KiCad installations without a hard-coded Program Files path.
-- [#258](https://github.com/mixelpixx/Konnect/issues/258): support explicit
-  custom-field upsert in batch schematic edits.
+  per-user Windows KiCad installs.
+- [#258](https://github.com/mixelpixx/Konnect/issues/258): add explicit custom
+  field upsert for batch schematic edits.
 - [#291](https://github.com/mixelpixx/Konnect/issues/291): honor or reject the
-  requested schematic SVG filename instead of silently changing it.
-- [#119](https://github.com/mixelpixx/Konnect/issues/119): bound, categorize and
-  preserve complete DRC reporting.
+  requested schematic SVG filename. The post-tag PNG renderer does not close it.
+- [#119](https://github.com/mixelpixx/Konnect/issues/119): bound and preserve
+  complete DRC output.
 - [#221](https://github.com/mixelpixx/Konnect/issues/221): make live-CI claims
-  match actual coverage and fix the rotation read-back race.
+  real and fix rotation-readback flakiness.
+- [#84](https://github.com/mixelpixx/Konnect/issues/84): finish replacing
+  indentation and line-ending-sensitive scans with structural reads.
 
 ### Freerouting bridge
 
-Konnect v0.8.0 intentionally has no `autoroute` tool. The roadmap now adopts the
-standalone-JAR DSN/export-route-SES/import bridge we recommended: distinguish
-engine detection from bridge availability, bind the exact board, import
-atomically, and verify placement/inventory/unrouted/short/DRC results. The
-version-matched `konnect-codex` plugin already supplies a non-overwriting bridge
-and remains an evidence source, not a Rust implementation dependency.
+The maintainer explicitly identified Freerouting as the preferred contribution.
+The direction remains a standalone JAR with exact-board binding, DSN export,
+headless routing, atomic SES import and route acceptance evidence. Launching
+Java is straightforward and needs no computer-use automation. The unresolved
+architecture decision is how a Rust/IPC-only Konnect supports durable DSN
+export and SES import now that the companion's KiCad 10 Python/SWIG bridge has
+a KiCad 11 deadline under #257.
+
+Because #253 is closed while the roadmap still says to claim implementation
+there, agree with the maintainer whether to reopen it or create a focused
+implementation issue. Then use a short PR series: capability contract; DSN
+producer; SES parser and dry-run plan; atomic IPC apply; public autoroute
+workflow and end-to-end evidence.
 
 ## P2/P3 — bounded enhancements and maintenance
 
-- [#84](https://github.com/mixelpixx/Konnect/issues/84) — finish structural
-  replacement of indentation-sensitive schematic scans. **P1** because it
-  underpins correctness, but stage it behind active P0 mutations.
-- [#118](https://github.com/mixelpixx/Konnect/issues/118) — real layer-aware 2-D board plot.
-- [#131](https://github.com/mixelpixx/Konnect/issues/131) — sign/notarize both macOS slices and final artifact. **P1** release work.
-- [#154](https://github.com/mixelpixx/Konnect/issues/154) — Homebrew after stable signed artifacts.
-- [#181](https://github.com/mixelpixx/Konnect/issues/181) — preserve lock-name compatibility before `sha2` bump.
-- [#210](https://github.com/mixelpixx/Konnect/issues/210) — reduce whole-sheet serialization diff churn.
-- [#225](https://github.com/mixelpixx/Konnect/issues/225) — select footprint graphics by identity, not only layer.
-- [#226](https://github.com/mixelpixx/Konnect/issues/226) — resolve placed metadata fidelity from measured impact.
-- [#241](https://github.com/mixelpixx/Konnect/issues/241) — reusable open-document refusal mock; P2 support for P0 #240.
-- [#296](https://github.com/mixelpixx/Konnect/issues/296) — advanced symbol/footprint generation as agreed focused PRs.
-- [#305](https://github.com/mixelpixx/Konnect/issues/305) — add or deliberately route placed-footprint 3-D model editing.
+- [#118](https://github.com/mixelpixx/Konnect/issues/118) — true layer-aware
+  2-D board plot.
+- [#131](https://github.com/mixelpixx/Konnect/issues/131) — sign and notarize
+  both macOS slices and final artifacts. This is P1 release work.
+- [#154](https://github.com/mixelpixx/Konnect/issues/154) — Homebrew after
+  signed artifacts stabilize.
+- [#181](https://github.com/mixelpixx/Konnect/issues/181) — preserve lock-name
+  compatibility before the `sha2` upgrade.
+- [#210](https://github.com/mixelpixx/Konnect/issues/210) — reduce whole-sheet
+  reserialization diff churn.
+- [#225](https://github.com/mixelpixx/Konnect/issues/225) — select footprint
+  graphics by stable identity, not only layer.
+- [#226](https://github.com/mixelpixx/Konnect/issues/226) — restore placed
+  Datasheet and Description fidelity based on measured impact.
+- [#296](https://github.com/mixelpixx/Konnect/issues/296) — advanced symbol and
+  footprint generation as focused tool-plus-guidance PRs.
+- [#305](https://github.com/mixelpixx/Konnect/issues/305) — supported placed
+  footprint 3-D model editing.
 
-## Completed since the 21-August backlog
+## Post-release `main`: important but not released
 
-| Issue | Released resolution |
-| --- | --- |
-| [#219](https://github.com/mixelpixx/Konnect/issues/219) | User paper dimensions through #324. |
-| [#234](https://github.com/mixelpixx/Konnect/issues/234) | Required nested fields and missing-coordinate refusal through #268/#318. |
-| [#251](https://github.com/mixelpixx/Konnect/issues/251) | Parameter-honesty consolidation and CI guard through #285. |
-| [#255](https://github.com/mixelpixx/Konnect/issues/255) | Local-catalog datasheet lookup through #327. |
-| [#286](https://github.com/mixelpixx/Konnect/issues/286) | Text justification through #308. |
-| [#287](https://github.com/mixelpixx/Konnect/issues/287) | Sheet captions and pins move with the sheet through #309. |
-| [#288](https://github.com/mixelpixx/Konnect/issues/288) | Fresh nested UUIDs on duplication through #310. |
-| [#289](https://github.com/mixelpixx/Konnect/issues/289) | Correct project library-table targeting through #311. |
-| [#290](https://github.com/mixelpixx/Konnect/issues/290) | Actual SVG result returned through #313. |
-| [#292](https://github.com/mixelpixx/Konnect/issues/292) | Idempotent edits through #307. |
-| [#293](https://github.com/mixelpixx/Konnect/issues/293) | Resolved generated-pin geometry through #312. |
-| [#303](https://github.com/mixelpixx/Konnect/issues/303) | Valid sheet-pin rotation through #317. |
-| [#304](https://github.com/mixelpixx/Konnect/issues/304) | Pre-6.0 footprint upgrade hint through #319. |
+The 17 commits after v0.9.0 add gate/verdict contracts, design hashes,
+structural board geometry, `konnect-render`, `konnect-vcs`,
+`render_schematic_png`, visual baseline capture/comparison and
+`score_placement` in a new placement toolset. These align with the workflow
+gaps documented in
+[Discussion #295](https://github.com/mixelpixx/Konnect/discussions/295).
+
+Once released, the guidance should use native schematic rendering, visual
+baseline comparison and placement scoring as evidence sources rather than
+duplicating those judgments. For now, feature-detect them on `main`; do not
+describe them as v0.9.0 capabilities.
 
 ## Open pull-request assessment
 
-“Conflicting” means the branch needs reconciliation; it is not a quality
-verdict. Green status is recorded at this snapshot.
+“Conflicting” describes Git state, not code quality. Status below is from the
+publication snapshot.
 
 | PR | State | Backlog assessment |
 | --- | --- | --- |
-| [#176](https://github.com/mixelpixx/Konnect/pull/176) reload server | Conflicting, stale | Supersede or redesign for #103/#242 rather than reviving broad old behavior. |
-| [#232](https://github.com/mixelpixx/Konnect/pull/232) live footprint update | Conflicting | Rebase and repeat real-KiCad preservation evidence. |
-| [#243](https://github.com/mixelpixx/Konnect/pull/243) setup-python v7 | Mergeable, green | Small CI dependency update. |
-| [#264](https://github.com/mixelpixx/Konnect/pull/264) placement batch | Conflicting | Still useful after design confirmation and rebase. |
-| [#265](https://github.com/mixelpixx/Konnect/pull/265) pad-read hardening | Draft, conflicting | Rebase only its remaining delta over merged #207. |
-| [#268](https://github.com/mixelpixx/Konnect/pull/268) nested validation | Conflicting | Reduce to malformed-input coverage not already landed in #318/#285. |
-| [#270](https://github.com/mixelpixx/Konnect/pull/270) artifact verification | Conflicting | Rebase and narrow to unresolved #252 behavior. |
-| [#273](https://github.com/mixelpixx/Konnect/pull/273) multi-unit mutation | Conflicting | Rebase over #323; remains the main #182 implementation path. |
-| [#275](https://github.com/mixelpixx/Konnect/pull/275) symbol bounds | Conflicting | Rebase after unit-aware work. |
-| [#320](https://github.com/mixelpixx/Konnect/pull/320) viewer UUID update | Mergeable, green | Bounded dependency update. |
-| [#321](https://github.com/mixelpixx/Konnect/pull/321) workspace UUID update | Mergeable, green | Bounded dependency update. |
-| [#322](https://github.com/mixelpixx/Konnect/pull/322) structural library fields | Mergeable, Windows failing | Useful read path, not ready until Windows is green. |
-| [#330](https://github.com/mixelpixx/Konnect/pull/330) junction reconciliation | Mergeable, green | High-priority partial #120 prerequisite; remove stray artifacts and preserve its explicit partial scope. |
+| [#176](https://github.com/mixelpixx/Konnect/pull/176) reload server | Conflicting, stale | A POSIX `exec` is not a complete Windows or multi-instance lifecycle solution. |
+| [#268](https://github.com/mixelpixx/Konnect/pull/268) nested validation | Conflicting | Reduce to coverage not already shipped through #234 work. |
+| [#270](https://github.com/mixelpixx/Konnect/pull/270) artifact verification | Conflicting | Still the main #252 path; rebase and preserve a focused truth-in-artifacts scope. |
+| [#322](https://github.com/mixelpixx/Konnect/pull/322) structural library fields | Mergeable, green | Strong structural replacement for escaped and multiline field reads. |
+| [#332](https://github.com/mixelpixx/Konnect/pull/332) junction sheet-pin test | Mergeable, green | Useful coverage of the v0.9.0 junction reconciler. |
+| [#333](https://github.com/mixelpixx/Konnect/pull/333) complete Default netclass | Mergeable, green | Active P0 #326 fix; review whether the caller-visible response refactor belongs in the same PR. |
+| [#334](https://github.com/mixelpixx/Konnect/pull/334) shared IPC gate/mock | Blocked; platform tests failed/cancelled | Useful #240/#241 groundwork after the failing test is fixed. |
+| [#335](https://github.com/mixelpixx/Konnect/pull/335) delete graphics | Conflicting; Ubuntu failed | Rebase and reconcile its append semantics with the already-fixed outline replacement behavior. |
 
 ## Complete open-issue disposition
 
@@ -241,63 +230,57 @@ verdict. Green status is recorded at this snapshot.
 | [#103](https://github.com/mixelpixx/Konnect/issues/103) | P1 | Server ownership and multi-instance lifecycle. |
 | [#118](https://github.com/mixelpixx/Konnect/issues/118) | P2 | Layer-aware 2-D board plot. |
 | [#119](https://github.com/mixelpixx/Konnect/issues/119) | P1 | Bounded, complete DRC output. |
-| [#120](https://github.com/mixelpixx/Konnect/issues/120) | P0 | Junction-safe move/delete; #330 is a partial prerequisite. |
-| [#131](https://github.com/mixelpixx/Konnect/issues/131) | P1 | macOS signing/notarization. |
+| [#131](https://github.com/mixelpixx/Konnect/issues/131) | P1 | macOS signing and notarization. |
 | [#154](https://github.com/mixelpixx/Konnect/issues/154) | P2 | Homebrew after signed artifacts stabilize. |
 | [#181](https://github.com/mixelpixx/Konnect/issues/181) | P3 | Preserve lock-name compatibility before dependency bump. |
-| [#182](https://github.com/mixelpixx/Konnect/issues/182) | P0 | Rebase and finish multi-unit mutation. |
+| [#182](https://github.com/mixelpixx/Konnect/issues/182) | P0 | Finish unit-aware batch/export/analysis/review reads; mutation shipped. |
 | [#189](https://github.com/mixelpixx/Konnect/issues/189) | P0 | Bound root/library discovery and refuse ambiguity. |
 | [#210](https://github.com/mixelpixx/Konnect/issues/210) | P2 | Reduce serialization diff churn. |
 | [#221](https://github.com/mixelpixx/Konnect/issues/221) | P1 | Fix live-CI claims and rotation race. |
 | [#225](https://github.com/mixelpixx/Konnect/issues/225) | P2 | Select footprint graphics by identity. |
-| [#226](https://github.com/mixelpixx/Konnect/issues/226) | P3 | Resolve placed metadata fidelity with evidence. |
-| [#231](https://github.com/mixelpixx/Konnect/issues/231) | P1 | Live Update Footprints from Library. |
-| [#233](https://github.com/mixelpixx/Konnect/issues/233) | P1 | Client tool-list refresh/cap compatibility. |
+| [#226](https://github.com/mixelpixx/Konnect/issues/226) | P3 | Restore placed metadata fidelity based on evidence. |
+| [#233](https://github.com/mixelpixx/Konnect/issues/233) | P1 | Support capped/non-refreshing client tool lists. |
 | [#240](https://github.com/mixelpixx/Konnect/issues/240) | P0 | Refuse stale fallback after observed-live IPC loss. |
-| [#241](https://github.com/mixelpixx/Konnect/issues/241) | P2 | Shared document-answering IPC test harness. |
+| [#241](https://github.com/mixelpixx/Konnect/issues/241) | P1 support | Shared document-answering IPC mock for #240. |
 | [#242](https://github.com/mixelpixx/Konnect/issues/242) | P1 | Remove startup guidance mutation. |
 | [#252](https://github.com/mixelpixx/Konnect/issues/252) | P0 | Verify every reported artifact. |
 | [#254](https://github.com/mixelpixx/Konnect/issues/254) | P1 | Per-user Windows KiCad discovery. |
 | [#256](https://github.com/mixelpixx/Konnect/issues/256) | P1 | Open and prove the requested PCB document. |
-| [#257](https://github.com/mixelpixx/Konnect/issues/257) | P1 | KiCad 11 IPC/SWIG transition. |
+| [#257](https://github.com/mixelpixx/Konnect/issues/257) | P1/deadline | KiCad 11 lifecycle and SWIG removal. |
 | [#258](https://github.com/mixelpixx/Konnect/issues/258) | P1 | Explicit custom-field upsert. |
 | [#291](https://github.com/mixelpixx/Konnect/issues/291) | P1 | Honor or reject requested SVG filename. |
 | [#296](https://github.com/mixelpixx/Konnect/issues/296) | P2 | Focused advanced symbol/footprint generation. |
 | [#305](https://github.com/mixelpixx/Konnect/issues/305) | P2 | Route placed-footprint 3-D model editing. |
-| [#315](https://github.com/mixelpixx/Konnect/issues/315) | P1 | Implement real connected move after #120. |
+| [#315](https://github.com/mixelpixx/Konnect/issues/315) | P1 | Implement actual connected wire movement. |
 | [#325](https://github.com/mixelpixx/Konnect/issues/325) | P1 | Compact surface/resource directory for capped clients. |
-| [#326](https://github.com/mixelpixx/Konnect/issues/326) | P0 | Preserve Default netclass and schematic junctions. |
-| [#328](https://github.com/mixelpixx/Konnect/issues/328) | P1 | Make connectivity bus-aware. |
-| [#329](https://github.com/mixelpixx/Konnect/issues/329) | P1 | Correct bus-entry response endpoints. |
+| [#326](https://github.com/mixelpixx/Konnect/issues/326) | P0, active | Preserve Default netclass; green fix in #333. |
+| [#328](https://github.com/mixelpixx/Konnect/issues/328) | P1 | Make shared connectivity bus-aware. |
+| [#331](https://github.com/mixelpixx/Konnect/issues/331) | P1 | Preserve `fp_text user` during library refresh. |
 
-## Recommended execution order
+## Roadmap and contribution follow-through
 
-1. Claim and fix #326 with a full KiCad Default-netclass round trip.
-2. Review/land the bounded part of #330, then continue #120/#315 in focused PRs.
-3. Implement #240 with reusable #241 IPC document fixtures.
-4. Rebase #273 for #182, then address #189 and #252.
-5. Fix #328/#329 before trusting agent-driven bus cleanup.
-6. Implement the roadmap Freerouting bridge with exact-board and import evidence.
-7. Address #103/#242 and compact client discovery (#233/#325).
-8. Rebase, narrow or close stale PRs before adding more overlapping work.
+The roadmap direction remains useful but its status is stale: #273 and #120
+have shipped, the v0.8 skill-layer gate has passed, and it tells contributors
+to claim Freerouting on closed #253. It should be updated to the post-v0.9
+rendering, placement and gate work without changing the still-valid
+Freerouting direction.
 
-## Release and benchmark follow-through
+The unchanged contribution rules still require issue-first design agreement,
+focused PRs, compatibility handling for public contracts, tests, doc tests,
+warnings-denied Clippy, formatting, real-KiCad fixtures for board/footprint
+parsing, structured argument validation and synchronized tool counts.
 
-The version-matched `konnect-codex` v0.8.0 plugin has been reviewed against all
-17 upstream guidance files. It carries the three upstream skill changes plus
-temporary safety gates for #315/#326/#328/#329, preserves the companion
-Freerouting bridge, and removes the nonexistent Konnect `autoroute` hook.
+Recommended order:
 
-The remaining evidence step is a v0.8.0 end-to-end benchmark that includes:
+1. Review and land #333, then release and verify the #326 round trip.
+2. Repair #334 and use it to implement #240 with #241 evidence.
+3. Rebase and narrow #270 for #252.
+4. Finish the remaining #182 reads, then bound #189.
+5. Fix #331 and #328; keep #315 as its own connected-move series.
+6. Agree on the Freerouting DSN/SES architecture and issue, then implement it
+   as a short, testable PR series.
+7. Resolve #103/#242 and compact-client discovery (#233/#325).
+8. Rebase, narrow or close stale conflicting PRs before adding overlapping work.
 
-- structured schematic SVG return and visual readability inspection;
-- a Default-netclass/junction probe for #326;
-- a bus sheet that exposes #328/#329 until fixed;
-- exact-board live reads and live zone creation;
-- local-catalog datasheet resolution;
-- footprint-corruption repair dry-run/apply evidence;
-- transfer inventory, placement image, Freerouting provenance, route-import
-  inventory, direct ERC/DRC, 3-D review, and manufacturing artifacts.
-
-This backlog should be refreshed after that benchmark or whenever a new minor
-release changes the issue/PR inventory.
+Refresh this backlog whenever a release changes the issue/PR inventory or the
+post-tag rendering and placement work becomes part of a published contract.
