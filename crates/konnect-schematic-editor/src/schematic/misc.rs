@@ -157,4 +157,9 @@ impl NoConnect {
     pub fn position(&self) -> (f64, f64) {
         (self.x, self.y)
     }
+
+    pub fn translate(&mut self, dx: f64, dy: f64) {
+        self.x += dx;
+        self.y += dy;
+    }
 }

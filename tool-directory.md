@@ -12,8 +12,8 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **19 toolsets** organized into 10 categories
-- **204 registered tools** + **6 always-visible meta-tools** = **210 total**
+- **20 toolsets** organized into 10 categories
+- **210 registered tools** + **6 always-visible meta-tools** = **216 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -25,7 +25,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 19 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 20 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -68,20 +68,20 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `create_schematic` | Create a new blank `.kicad_sch` schematic file, on A4 unless another paper size is given. Use `set_schematic_page` to change it later. |
 | `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid. |
-| `delete_schematic_component` | Remove a symbol instance from the schematic by its reference designator. |
-| `edit_schematic_component` | Update fields (Reference, Value, Footprint, custom properties) of a symbol instance. |
-| `get_schematic_component` | Get all properties, position, and pin locations for a symbol instance. |
+| `delete_schematic_component` | Remove a component and all of its placed units by reference designator. |
+| `edit_schematic_component` | Update shared fields consistently across every placed unit of a component. |
+| `get_schematic_component` | Get shared properties and every placed unit's position for a component. |
 | `list_schematic_components` | List all symbol instances with positions, values, footprints, and pin locations. |
-| `move_schematic_component` | Move a symbol to a new position. Does NOT adjust connected wires. |
-| `rotate_schematic_component` | Rotate a symbol by setting its absolute rotation angle (0/90/180/270). |
+| `move_schematic_component` | Move the lowest-numbered unit to a new position and translate every other unit by the same delta. Does NOT adjust connected wires. |
+| `rotate_schematic_component` | Set the lowest-numbered unit's absolute rotation and rotate every other unit by the same delta. |
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
-| `move_region` | Move all symbols within a bounding box by a given offset. |
+| `move_region` | Move all symbols, wires, labels, global/hierarchical labels, junctions, text notes, and no-connect markers within a bounding box by a given offset. |
 | `annotate_schematic` | Run kicad-cli to auto-assign reference designators (`R?` → `R1`, `U?` → `U1`, etc.). |
-| `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on a symbol, accounting for rotation/mirroring, plus each pin's `orientation_degrees` (the direction leading away from the body, 0 = east) and `length_mm`. |
+| `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on every placed unit, accounting for rotation/mirroring, plus each pin's `orientation_degrees` and `length_mm`. |
 | `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same per-pin fields. |
-| `add_component_annotation` | Add a custom property (annotation) to a symbol instance. |
-| `group_components` | Add a group property to multiple components in the schematic. |
-| `replace_component` | Replace a component's `lib_id` with a new library symbol (swap the component type). |
+| `add_component_annotation` | Add or update a custom property across every placed unit of a component. |
+| `group_components` | Add or update a group property across every placed unit of multiple components. |
+| `replace_component` | Replace every placed unit's `lib_id` while preserving and validating its unit number. |
 | `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library". Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set. |
 | `reset_schematic_field_positions` | Move each symbol's Reference and Value text back to its library anchor, through the symbol's rotation — KiCad's "Reset field text positions". Repairs sheets whose fields sit at a uniform offset. |
 | `get_schematic_view` | Render a sheet with kicad-cli and return the path to the SVG it wrote. There is no PNG — KiCad has no schematic rasteriser. The file lands in a temp directory; use `export_schematic_svg` to choose the location. |
@@ -144,7 +144,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `find_shorted_nets` | Detect accidentally merged nets — pairs of distinct net names sharing a wire path. |
 | `find_single_pin_nets` | Find nets with only one label/connection — often indicates a missing counterpart. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
-| `check_schematic_overlaps` | Find overlapping symbols or labels that may indicate placement errors. |
+| `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
 ### `sch_batch` · 12 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
@@ -159,19 +159,22 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
 | `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`. |
 | `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. Aligns the text against that position with `justify`, per axis and defaulting to `left bottom` as KiCad does; an omitted axis is centred, and `center` centres both. |
-| `get_schematic_layout` | Return a compact spatial summary of the schematic: component positions, bounding box, optionally wires and labels. |
+| `get_schematic_layout` | Return component positions and transformed drawing/pin bounds (excluding free text), reporting unresolved geometry; optionally include wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in a single file read/write cycle. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. |
 
-### `sch_export` · 7 tools
-**Purpose:** Export schematic to SVG/PDF/netlist, run ERC, and synchronize a live PCB.
+### `sch_export` · 10 tools
+**Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.
 **Source:** [`crates/konnect-core/src/tools/sch_export.rs`](crates/konnect-core/src/tools/sch_export.rs)
 
 | Tool | Description |
 |------|-------------|
 | `export_schematic_svg` | Export a schematic sheet to SVG using kicad-cli, with optional monochrome rendering and colour theme. |
+| `render_schematic_png` | Render a sheet to PNG: kicad-cli SVG rasterized in-process with deterministic stroke-font rendering. Returns the path and actual pixel dimensions; `inline` adds base64 content so the caller can inspect its own output. |
+| `set_visual_baseline` | Capture the current render of a sheet as its visual baseline under the project's `.konnect/baselines/`, recording the source hash and renderer identity. |
+| `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged, never silently trusted. |
 | `export_schematic_pdf` | Export a schematic to PDF using kicad-cli, optionally monochrome or limited to the root sheet. |
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
@@ -220,8 +223,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
-### `pcb_components` · 17 tools
-**Purpose:** Place, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics.
+### `pcb_components` · 19 tools
+**Purpose:** Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics.
 **Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
 
 | Tool | Description |
@@ -229,15 +232,17 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `place_component` | Place a footprint through live KiCAD IPC when reachable, or use a revision-aware file fallback when no KiCAD process can hold the board open. The fallback preserves complete footprint content and rejects duplicate references. |
 | `move_component` | Move a placed footprint through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback. |
 | `rotate_component` | Set a placed footprint's absolute rotation through live KiCAD IPC when reachable, or use a revision-aware closed-board file fallback that updates child angles. |
+| `set_component_placements` | Set X/Y positions and absolute rotations for multiple existing footprints atomically, using one live KiCAD update and one undo step or one revision-aware closed-board write. |
 | `flip_component` | Set a placed footprint to F.Cu or B.Cu on a closed board with KiCAD-equivalent geometry mirroring and revision checks; refuses live-editor races and unsupported geometry. |
 | `delete_component` | Remove a footprint from the board via KiCAD IPC. |
 | `edit_component` | Update the value or other properties of a placed footprint via KiCAD IPC. |
 | `repair_corrupted_footprints` | Dry-run and atomically repair the exact legacy corruption from issue #244: anonymous layerless pads that replaced footprint drawing shapes. Restores the affected shapes from the registered library while preserving live placement, identity, pad nets and non-shape children; apply requires the dry-run revision and is one KiCAD undo commit. |
 | `find_component` | Find a footprint by reference designator and return its position. |
+| `update_footprints_from_library` | Plan or atomically apply KiCad's Update Footprints from Library operation to placed footprints on the live board. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placed-instance state and pad nets while refreshing supported library-owned content. |
 | `list_board_footprint_graphics` | List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit one. Reports `editable`, plus `outlines` and `holes` for polygons. Requires KiCAD running with the board open. |
 | `edit_board_footprint_graphic` | Replace the vertices of a single-outline polygon inside a placed footprint, selected by UUID, without re-placing the part. Anything with multiple outlines or holes is refused by name rather than flattened. Requires KiCAD running with the board open. |
-| `get_component_pads` | Return pad positions and net assignments for a footprint (IPC, falls back to file parse). A pad whose net node is present but unreadable reports `null` rather than an empty string, so "no net" stays distinguishable from "could not read it". |
-| `get_pad_position` | Return the schematic-space position of a specific pad number on a footprint. |
+| `get_component_pads` | Return live board-space pad positions, layers, and net assignments when KiCAD IPC is reachable; fall back to the saved board only when IPC is unreachable. A pad whose saved net node is present but unreadable reports `null` rather than an empty string. |
+| `get_pad_position` | Return the live board-space position, layers, and net assignment of a specific pad number. |
 | `get_component_list` | List all footprints on the board with positions, layers, and values. |
 | `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |
 | `align_components` | Align multiple footprints along a common X or Y axis via KiCAD IPC. |
@@ -263,6 +268,16 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets those patterns match. Reads the `.kicad_pro` and the board file, so KiCad need not be running. Reports `Default` (marked) and any pattern naming a class that does not exist. |
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
+
+### `placement` · 1 tool
+**Purpose:** Placement quality metrics — score the board's current placement before and after every change.
+**Source:** [`crates/konnect-core/src/tools/placement.rs`](crates/konnect-core/src/tools/placement.rs)
+
+| Tool | Description |
+|------|-------------|
+| `score_placement` | Score the placement 0-100 with named deductions (courtyard overlaps, off-board parts, connector edge distance, decoupling distance). Hard failures decide the verdict regardless of the numeric score; a missing outline blocks a pass rather than passing silently. |
+
+---
 
 ### `pcb_export` · 13 tools
 **Purpose:** Gerber, PDF, SVG, 3D model, BOM, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++.

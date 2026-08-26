@@ -56,9 +56,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_export",
-        description: "Export schematic to SVG/PDF/netlist, run ERC, and synchronize a live PCB",
+        description: "Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB",
         category: "schematic",
-        tool_count: 7,
+        tool_count: 10,
     },
     ToolsetMeta {
         name: "sch_hierarchy",
@@ -74,15 +74,21 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_components",
-        description: "Place, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics",
+        description: "Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics",
         category: "pcb",
-        tool_count: 17,
+        tool_count: 19,
     },
     ToolsetMeta {
         name: "pcb_routing",
         description: "Traces, vias, copper pours, net classes, differential pairs",
         category: "pcb",
         tool_count: 13,
+    },
+    ToolsetMeta {
+        name: "placement",
+        description: "Placement quality: score the current placement with named deductions; placers land next",
+        category: "pcb",
+        tool_count: 1,
     },
     ToolsetMeta {
         name: "pcb_export",
@@ -149,6 +155,7 @@ pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "pcb_board" => Some(pcb_board::tools()),
         "pcb_components" => Some(pcb_components::tools()),
         "pcb_routing" => Some(pcb_routing::tools()),
+        "placement" => Some(placement::tools()),
         "pcb_export" => Some(pcb_export::tools()),
         "library" => Some(library::tools()),
         "integration" => Some(integration::tools()),
