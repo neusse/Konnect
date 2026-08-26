@@ -28,6 +28,8 @@ pub struct IpcPad {
     pub y: f64,
     /// Net name, empty when the pad carries no net.
     pub net: String,
+    /// KiCad layer names from the live pad stack.
+    pub layers: Vec<String>,
 }
 
 /// The document's title block, which the board file also carries.
@@ -37,6 +39,19 @@ pub struct IpcTitleBlock {
     pub date: String,
     pub revision: String,
     pub company: String,
+}
+
+/// Complete target placement for one existing footprint.
+///
+/// Keeping the four values together lets the IPC client transform all selected
+/// footprints from one board snapshot and publish them in one undoable update,
+/// instead of issuing a move and a rotation as separate round trips.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcFootprintPlacement {
+    pub reference: String,
+    pub x: f64,
+    pub y: f64,
+    pub rotation: f64,
 }
 
 #[derive(Debug, Clone)]

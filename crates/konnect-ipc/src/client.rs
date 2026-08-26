@@ -23,27 +23,10 @@ fn nm_to_mm(nm: i64) -> f64 {
 
 /// Map a BoardLayer enum integer back to a KiCAD layer name string.
 fn layer_enum_to_name(layer: i32) -> &'static str {
-    match kiapi::board::types::BoardLayer::try_from(layer) {
-        Ok(l) => match l {
-            kiapi::board::types::BoardLayer::BlFCu => "F.Cu",
-            kiapi::board::types::BoardLayer::BlBCu => "B.Cu",
-            kiapi::board::types::BoardLayer::BlIn1Cu => "In1.Cu",
-            kiapi::board::types::BoardLayer::BlIn2Cu => "In2.Cu",
-            kiapi::board::types::BoardLayer::BlFSilkS => "F.SilkS",
-            kiapi::board::types::BoardLayer::BlBSilkS => "B.SilkS",
-            kiapi::board::types::BoardLayer::BlFMask => "F.Mask",
-            kiapi::board::types::BoardLayer::BlBMask => "B.Mask",
-            kiapi::board::types::BoardLayer::BlFPaste => "F.Paste",
-            kiapi::board::types::BoardLayer::BlBPaste => "B.Paste",
-            kiapi::board::types::BoardLayer::BlFCrtYd => "F.CrtYd",
-            kiapi::board::types::BoardLayer::BlBCrtYd => "B.CrtYd",
-            kiapi::board::types::BoardLayer::BlFFab => "F.Fab",
-            kiapi::board::types::BoardLayer::BlBFab => "B.Fab",
-            kiapi::board::types::BoardLayer::BlEdgeCuts => "Edge.Cuts",
-            _ => "Unknown",
-        },
-        Err(_) => "Unknown",
-    }
+    kiapi::board::types::BoardLayer::try_from(layer)
+        .ok()
+        .and_then(crate::builders::layer_name)
+        .unwrap_or("Unknown")
 }
 
 /// A placed footprint's anchor in board nanometres, and its orientation in
@@ -1027,30 +1010,62 @@ impl KiCadIpcClient {
             document,
             kiapi::common::types::KiCadObjectType::KotPcbFootprint,
         )?;
+        let mut found = None;
         for item in &items {
-            let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
-            else {
+            if !crate::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
                 continue;
-            };
+            }
+            let fp = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                .context("KiCad returned an unreadable footprint instance")?;
             if footprint_reference(&fp) != reference {
                 continue;
             }
-            let pads = fp
+            if found.is_some() {
+                anyhow::bail!(
+                    "footprint reference '{}' appears more than once on the board",
+                    reference
+                );
+            }
+
+            let definition = fp
                 .definition
-                .iter()
-                .flat_map(|definition| definition.items.iter())
-                .filter(|child| child.type_url.ends_with("kiapi.board.types.Pad"))
-                .filter_map(|child| kiapi::board::types::Pad::decode(child.value.as_slice()).ok())
-                .map(|pad| IpcPad {
+                .as_ref()
+                .with_context(|| format!("footprint '{reference}' has no definition"))?;
+            let mut pads = Vec::new();
+            for child in &definition.items {
+                if !crate::builders::any_is(child, "kiapi.board.types.Pad") {
+                    continue;
+                }
+                let pad = kiapi::board::types::Pad::decode(child.value.as_slice())
+                    .with_context(|| format!("footprint '{reference}' has an unreadable pad"))?;
+                let position = pad.position.with_context(|| {
+                    format!(
+                        "footprint '{reference}' pad '{}' has no position",
+                        pad.number
+                    )
+                })?;
+                let layers = pad
+                    .pad_stack
+                    .as_ref()
+                    .map(|stack| {
+                        stack
+                            .layers
+                            .iter()
+                            .map(|layer| layer_enum_to_name(*layer).to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                pads.push(IpcPad {
                     number: pad.number,
-                    x: pad.position.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0),
-                    y: pad.position.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0),
+                    x: nm_to_mm(position.x_nm),
+                    y: nm_to_mm(position.y_nm),
                     net: pad.net.map(|net| net.name).unwrap_or_default(),
-                })
-                .collect();
-            return Ok(Some(pads));
+                    layers,
+                });
+            }
+            found = Some(pads);
         }
-        Ok(None)
+        Ok(found)
     }
 
     /// Read the title block of a specific open document.
@@ -1455,6 +1470,162 @@ impl KiCadIpcClient {
         anyhow::bail!("Footprint '{}' not found", reference)
     }
 
+    /// Set the complete placement of several footprints in one KiCad undo
+    /// transaction and one `UpdateItems` request.
+    ///
+    /// KiCad serializes footprint children in absolute board coordinates, so
+    /// every child must receive the same rigid transform as its parent. Doing
+    /// that from one board snapshot also avoids the transient state and the
+    /// two IPC round trips produced by a separate move followed by a rotate.
+    /// Returns the placements as the board holds them after the commit —
+    /// read back from KiCad, never echoed from the request (the #294/#232
+    /// standard). KiCad may normalize what it stores (angles in particular),
+    /// so the response has to come from the result.
+    pub fn set_footprint_placements(
+        &self,
+        placements: &[IpcFootprintPlacement],
+    ) -> Result<Vec<IpcFootprintPlacement>> {
+        if placements.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut requested = std::collections::HashSet::new();
+        for placement in placements {
+            if !requested.insert(placement.reference.as_str()) {
+                anyhow::bail!(
+                    "placement request contains duplicate footprint reference '{}'",
+                    placement.reference
+                );
+            }
+        }
+
+        self.run_commit("Set component placements", |client| {
+            let items = client.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+            let mut matched = std::collections::HashSet::new();
+            let mut updates = Vec::with_capacity(placements.len());
+
+            for item in items {
+                if !crate::builders::any_is(&item, "kiapi.board.types.FootprintInstance") {
+                    continue;
+                }
+                let mut footprint =
+                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+                let reference = footprint
+                    .reference_field
+                    .as_ref()
+                    .and_then(|field| field.text.as_ref())
+                    .and_then(|text| text.text.as_ref())
+                    .map(|text| text.text.as_str())
+                    .unwrap_or("");
+                let Some(target) = placements
+                    .iter()
+                    .find(|placement| placement.reference == reference)
+                else {
+                    continue;
+                };
+                if !matched.insert(reference.to_string()) {
+                    anyhow::bail!(
+                        "footprint reference '{}' appears more than once on the board",
+                        reference
+                    );
+                }
+
+                let old_position = footprint.position.unwrap_or_default();
+                let old_rotation = footprint
+                    .orientation
+                    .as_ref()
+                    .map(|angle| angle.value_degrees)
+                    .unwrap_or(0.0);
+                let rotation_delta = target.rotation - old_rotation;
+                if rotation_delta != 0.0 {
+                    crate::transform::transform_footprint_children(
+                        &mut footprint,
+                        &crate::transform::Xform::Rotate {
+                            cx_nm: old_position.x_nm,
+                            cy_nm: old_position.y_nm,
+                            delta_deg: rotation_delta,
+                        },
+                    )?;
+                }
+
+                let new_position = crate::builders::vec2(target.x, target.y);
+                let dx_nm = new_position.x_nm - old_position.x_nm;
+                let dy_nm = new_position.y_nm - old_position.y_nm;
+                if dx_nm != 0 || dy_nm != 0 {
+                    crate::transform::transform_footprint_children(
+                        &mut footprint,
+                        &crate::transform::Xform::Translate { dx_nm, dy_nm },
+                    )?;
+                }
+                footprint.position = Some(new_position);
+                footprint.orientation = Some(kiapi::common::types::Angle {
+                    value_degrees: target.rotation,
+                });
+                updates.push(crate::builders::pack_any(
+                    &footprint,
+                    "kiapi.board.types.FootprintInstance",
+                ));
+            }
+
+            let missing: Vec<_> = placements
+                .iter()
+                .filter(|placement| !matched.contains(&placement.reference))
+                .map(|placement| placement.reference.as_str())
+                .collect();
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "footprint{} {} not found on board",
+                    if missing.len() == 1 { "" } else { "s" },
+                    missing.join(", ")
+                );
+            }
+
+            client.update_items(updates)
+        })?;
+
+        // Post-commit read-back: report what the board holds, in request order.
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let mut held = std::collections::HashMap::new();
+        for item in &items {
+            if !crate::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+                continue;
+            }
+            let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+            let reference = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.clone())
+                .unwrap_or_default();
+            let position = footprint.position.unwrap_or_default();
+            held.insert(
+                reference.clone(),
+                IpcFootprintPlacement {
+                    reference,
+                    x: nm_to_mm(position.x_nm),
+                    y: nm_to_mm(position.y_nm),
+                    rotation: footprint
+                        .orientation
+                        .as_ref()
+                        .map(|angle| angle.value_degrees)
+                        .unwrap_or(0.0),
+                },
+            );
+        }
+        placements
+            .iter()
+            .map(|placement| {
+                held.remove(&placement.reference).with_context(|| {
+                    format!(
+                        "footprint '{}' was updated but is missing from the post-commit read-back",
+                        placement.reference
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Update the visible value field of an existing footprint.
     pub fn set_footprint_value(&self, reference: &str, value: &str) -> Result<()> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
@@ -1522,9 +1693,12 @@ impl KiCadIpcClient {
     /// coordinates: KiCAD serializes `FootprintInstance` children that way
     /// and re-creates them verbatim (issue #23 — see the `transform` module
     /// docs), so every footprint-local point is rotated and translated here.
+    ///
+    /// An associated function rather than a method: it is pure construction,
+    /// and callers that never dial KiCAD (library-side planning) must not
+    /// need a client to reach it.
     #[allow(clippy::too_many_arguments)]
     pub fn build_footprint_item(
-        &self,
         lib_id: &str,
         reference: &str,
         value: &str,
@@ -1774,7 +1948,7 @@ impl KiCadIpcClient {
         {
             anyhow::bail!("footprint reference '{reference}' already exists on the board");
         }
-        let item = self.build_footprint_item(
+        let item = Self::build_footprint_item(
             lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
         )?;
         self.create_items_in(document.clone(), vec![item])?;
@@ -2171,23 +2345,19 @@ mod footprint_graphics_tests {
         y: f64,
         rotation: f64,
     ) -> kiapi::board::types::FootprintInstance {
-        // build_footprint_item is pure — no IPC round-trip — so the socket
-        // path is never dialed.
-        let client = KiCadIpcClient::new("tcp://never-dialed");
-        let any = client
-            .build_footprint_item(
-                "Lib:Fp",
-                "R1",
-                "R",
-                &[],
-                graphics,
-                &crate::types::IpcFieldPlacement::default(),
-                x,
-                y,
-                rotation,
-                "F.Cu",
-            )
-            .unwrap();
+        let any = KiCadIpcClient::build_footprint_item(
+            "Lib:Fp",
+            "R1",
+            "R",
+            &[],
+            graphics,
+            &crate::types::IpcFieldPlacement::default(),
+            x,
+            y,
+            rotation,
+            "F.Cu",
+        )
+        .unwrap();
         kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap()
     }
 
@@ -2408,21 +2578,19 @@ mod footprint_graphics_tests {
         };
 
         for layer in ["F.Cu", "B.Cu"] {
-            let client = KiCadIpcClient::new("tcp://never-dialed");
-            let any = client
-                .build_footprint_item(
-                    "Lib:Fp",
-                    "R1",
-                    "R",
-                    &[pad(layer)],
-                    &[],
-                    &crate::types::IpcFieldPlacement::default(),
-                    10.0,
-                    10.0,
-                    0.0,
-                    "F.Cu",
-                )
-                .unwrap();
+            let any = KiCadIpcClient::build_footprint_item(
+                "Lib:Fp",
+                "R1",
+                "R",
+                &[pad(layer)],
+                &[],
+                &crate::types::IpcFieldPlacement::default(),
+                10.0,
+                10.0,
+                0.0,
+                "F.Cu",
+            )
+            .unwrap();
             let fp = kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap();
             let pad_any = fp
                 .definition
@@ -2462,21 +2630,19 @@ mod footprint_graphics_tests {
                 size: 1.0,
             },
         ];
-        let client = KiCadIpcClient::new("tcp://never-dialed");
-        let any = client
-            .build_footprint_item(
-                "Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal",
-                "J1",
-                "USB_C",
-                &[],
-                &graphics,
-                &crate::types::IpcFieldPlacement::default(),
-                100.0,
-                100.0,
-                0.0,
-                "F.Cu",
-            )
-            .expect("a Dwgs.User graphic must place");
+        let any = KiCadIpcClient::build_footprint_item(
+            "Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal",
+            "J1",
+            "USB_C",
+            &[],
+            &graphics,
+            &crate::types::IpcFieldPlacement::default(),
+            100.0,
+            100.0,
+            0.0,
+            "F.Cu",
+        )
+        .expect("a Dwgs.User graphic must place");
 
         let fp = kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap();
         let undefined = kiapi::board::types::BoardLayer::BlUndefined as i32;
@@ -2512,9 +2678,8 @@ mod footprint_graphics_tests {
     /// what stops the next one KiCAD adds from crashing it again.
     #[test]
     fn an_unmappable_layer_refuses_the_whole_footprint() {
-        let client = KiCadIpcClient::new("tcp://never-dialed");
         let build = |pads: &[IpcPadDefinition], graphics: &[IpcGraphicDefinition], layer: &str| {
-            client.build_footprint_item(
+            KiCadIpcClient::build_footprint_item(
                 "Lib:Fp",
                 "R1",
                 "R",

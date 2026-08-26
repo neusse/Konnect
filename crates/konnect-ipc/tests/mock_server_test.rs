@@ -834,40 +834,38 @@ fn record_doc(
 /// A footprint carrying one pad and one silkscreen line, both with KIIDs, as
 /// KiCad would send it.
 fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_types::Any {
-    let client = KiCadIpcClient::new("inproc://not-connected");
-    let item = client
-        .build_footprint_item(
-            "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
-            "U1",
-            "NE555",
-            &[konnect_ipc::IpcPadDefinition {
-                number: "1".to_string(),
-                pad_type: "smd".to_string(),
-                shape: "rect".to_string(),
-                x: 0.0,
-                y: 0.0,
-                rotation: 0.0,
-                size_x: 1.0,
-                size_y: 1.0,
-                drill_x: None,
-                drill_y: None,
-                drill_oval: false,
-                layers: vec!["F.Cu".to_string()],
-                roundrect_ratio: 0.0,
-            }],
-            &[konnect_ipc::IpcGraphicDefinition::Poly {
-                points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],
-                layer: "F.SilkS".to_string(),
-                width: 0.12,
-                filled: false,
-            }],
-            &konnect_ipc::IpcFieldPlacement::default(),
-            10.0,
-            10.0,
-            0.0,
-            "F.Cu",
-        )
-        .unwrap();
+    let item = KiCadIpcClient::build_footprint_item(
+        "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
+        "U1",
+        "NE555",
+        &[konnect_ipc::IpcPadDefinition {
+            number: "1".to_string(),
+            pad_type: "smd".to_string(),
+            shape: "rect".to_string(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            size_x: 1.0,
+            size_y: 1.0,
+            drill_x: None,
+            drill_y: None,
+            drill_oval: false,
+            layers: vec!["F.Cu".to_string()],
+            roundrect_ratio: 0.0,
+        }],
+        &[konnect_ipc::IpcGraphicDefinition::Poly {
+            points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],
+            layer: "F.SilkS".to_string(),
+            width: 0.12,
+            filled: false,
+        }],
+        &konnect_ipc::IpcFieldPlacement::default(),
+        10.0,
+        10.0,
+        0.0,
+        "F.Cu",
+    )
+    .unwrap();
 
     let mut fp = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
     for child in &mut fp.definition.as_mut().unwrap().items {
@@ -982,6 +980,14 @@ fn pad_at(number: &str, x_mm: f64, y_mm: f64, net: &str) -> prost_types::Any {
                 code: None,
                 name: net.to_string(),
             }),
+            pad_stack: Some(kiapi::board::types::PadStack {
+                layers: vec![
+                    kiapi::board::types::BoardLayer::BlFCu as i32,
+                    kiapi::board::types::BoardLayer::BlFPaste as i32,
+                    kiapi::board::types::BoardLayer::BlFMask as i32,
+                ],
+                ..Default::default()
+            }),
             ..Default::default()
         },
         "kiapi.board.types.Pad",
@@ -1064,8 +1070,50 @@ fn footprint_pads_come_back_in_board_coordinates_with_their_nets() {
     assert_eq!(pads[0].x, 101.155);
     assert_eq!(pads[0].y, 66.11);
     assert_eq!(pads[0].net, "/VBUS");
+    assert_eq!(pads[0].layers, vec!["F.Cu", "F.Paste", "F.Mask"]);
     // KiCad names no net on an unconnected pad; "" is that, not a read failure.
     assert_eq!(pads[1].net, "");
+}
+
+#[test]
+fn an_unreadable_live_pad_is_reported_instead_of_silently_dropped() {
+    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads(
+        "U1",
+        vec![prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.Pad".to_string(),
+            value: vec![0xff],
+        }],
+    )]);
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+
+    let error = client
+        .get_footprint_pads_in(document, "U1")
+        .expect_err("malformed pad data must fail the read");
+    assert!(error.to_string().contains("unreadable pad"), "{error:#}");
+}
+
+#[test]
+fn a_live_pad_without_a_position_is_reported_instead_of_fabricated_at_zero() {
+    let pad = builders::pack_any(
+        &kiapi::board::types::Pad {
+            number: "1".to_string(),
+            ..Default::default()
+        },
+        "kiapi.board.types.Pad",
+    );
+    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads("U1", vec![pad])]);
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+
+    let error = client
+        .get_footprint_pads_in(document, "U1")
+        .expect_err("missing coordinates must fail the read");
+    assert!(error.to_string().contains("has no position"), "{error:#}");
 }
 
 #[test]
