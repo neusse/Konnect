@@ -79,7 +79,7 @@ requests**, down from 40 and 26 in the August 21 backlog.
 ### Public contract changes the companion must know
 
 The [v0.8.0 release notes](https://github.com/mixelpixx/Konnect/releases/tag/v0.8.0)
-record 19 toolsets, 204 registered tools, and 210 total tools.
+record `toolset_count: 19`, 204 registered tools, and 210 total tools.
 
 - New tool: `repair_corrupted_footprints`.
 - `get_schematic_view` is now a hard response change: structured JSON with
