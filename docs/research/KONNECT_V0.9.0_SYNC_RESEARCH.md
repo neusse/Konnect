@@ -28,7 +28,7 @@ requirement.
   release.”**
 - The complete [v0.8.0...v0.9.0 comparison](https://github.com/mixelpixx/Konnect/compare/v0.8.0...v0.9.0)
   contains 36 commits and 37 changed files.
-- The tag exposes **19 toolsets, 206 registered tools and 212 total tools**.
+- The tag exposes **`toolset_count: 19`, 206 registered tools and 212 total tools**.
 - Current upstream `main` is [17 commits past v0.9.0](https://github.com/mixelpixx/Konnect/compare/v0.9.0...main),
   across 46 changed files, and exposes **20 toolsets, 210 registered tools and
   216 total tools**.
