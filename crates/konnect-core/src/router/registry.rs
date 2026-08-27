@@ -86,9 +86,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "placement",
-        description: "Placement quality: score the current placement with named deductions; placers land next",
+        description: "Placement quality and automation: score with named deductions, plan decoupling rows and BGA fanouts, first placement, force-directed refinement",
         category: "pcb",
-        tool_count: 1,
+        tool_count: 5,
     },
     ToolsetMeta {
         name: "pcb_export",
