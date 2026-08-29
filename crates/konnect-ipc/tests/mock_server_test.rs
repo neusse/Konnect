@@ -443,6 +443,7 @@ fn place_footprint_sends_graphics_children() {
             rotation: 0.0,
             layer: "F.Fab".to_string(),
             size: 0.26,
+            stroke_width_mm: 0.04,
         },
     ];
 
@@ -1025,7 +1026,7 @@ fn footprint_with_pads(reference: &str, pads: Vec<prost_types::Any>) -> prost_ty
     )
 }
 
-fn spawn_kicad_with_footprints(items: Vec<prost_types::Any>) -> MockKicad {
+fn spawn_kicad_holding_items(items: Vec<prost_types::Any>) -> MockKicad {
     spawn_mock(move |request| {
         let message = request.message.expect("request must pack a command");
         if message.type_url.ends_with("GetOpenDocuments") {
@@ -1047,8 +1048,43 @@ fn spawn_kicad_with_footprints(items: Vec<prost_types::Any>) -> MockKicad {
 }
 
 #[test]
+fn a_failed_item_read_is_an_error_not_an_empty_board() {
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_board_response());
+        }
+        if message.type_url.ends_with("GetItems") {
+            let response = kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsDocumentNotFound as i32,
+                items: vec![],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        Some(ok_response())
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+
+    let error = client
+        .get_footprint_pads_in(document, "U1")
+        .expect_err("a failed request must not read as a board with no footprints");
+    assert!(
+        error.to_string().contains("IRS_DOCUMENT_NOT_FOUND"),
+        "the failure must name KiCad's status, got: {error}"
+    );
+}
+
+#[test]
 fn footprint_pads_come_back_in_board_coordinates_with_their_nets() {
-    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads(
+    let mock = spawn_kicad_holding_items(vec![footprint_with_pads(
         "U1",
         vec![
             pad_at("A4", 101.155, 66.11, "/VBUS"),
@@ -1077,7 +1113,7 @@ fn footprint_pads_come_back_in_board_coordinates_with_their_nets() {
 
 #[test]
 fn an_unreadable_live_pad_is_reported_instead_of_silently_dropped() {
-    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads(
+    let mock = spawn_kicad_holding_items(vec![footprint_with_pads(
         "U1",
         vec![prost_types::Any {
             type_url: "type.googleapis.com/kiapi.board.types.Pad".to_string(),
@@ -1104,7 +1140,7 @@ fn a_live_pad_without_a_position_is_reported_instead_of_fabricated_at_zero() {
         },
         "kiapi.board.types.Pad",
     );
-    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads("U1", vec![pad])]);
+    let mock = spawn_kicad_holding_items(vec![footprint_with_pads("U1", vec![pad])]);
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
         .find_open_board(std::path::Path::new("test.kicad_pcb"))
@@ -1118,7 +1154,7 @@ fn a_live_pad_without_a_position_is_reported_instead_of_fabricated_at_zero() {
 
 #[test]
 fn a_footprint_absent_from_the_live_board_reads_as_none() {
-    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads(
+    let mock = spawn_kicad_holding_items(vec![footprint_with_pads(
         "U1",
         vec![pad_at("1", 1.0, 2.0, "GND")],
     )]);
@@ -1183,5 +1219,107 @@ fn pad_reads_target_the_named_board_among_several_open() {
     assert_eq!(
         addressed, "target.kicad_pcb",
         "a read must answer about the requested board, not the first open one"
+    );
+}
+
+fn kiid(value: &str) -> kiapi::common::types::Kiid {
+    kiapi::common::types::Kiid {
+        value: value.to_string(),
+    }
+}
+
+#[test]
+fn board_graphics_come_back_with_their_kind_layer_and_identifier() {
+    let mut segment = builders::board_segment("Edge.Cuts", 0.05, 0.0, 0.0, 100.0, 0.0);
+    segment.id = Some(kiid("edge-top"));
+    let mut text = builders::board_text("F.SilkS", "REV A", 10.0, 20.0, 1.0, 0.0, false);
+    text.id = Some(kiid("silk-text"));
+
+    // One request asks for four object types, so KiCad answers with a single
+    // mixed list. protobuf decoding is lenient enough to turn the text into an
+    // empty shape, so the reader has to dispatch on the type_url.
+    let mock = spawn_kicad_holding_items(vec![
+        builders::pack_any(&segment, "kiapi.board.types.BoardGraphicShape"),
+        builders::pack_any(&text, "kiapi.board.types.BoardText"),
+    ]);
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+
+    let graphics = client
+        .get_board_graphics_in(document)
+        .expect("graphics read");
+
+    assert_eq!(graphics.len(), 2, "the text must be read once, as text");
+    assert_eq!(graphics[0].uuid, "edge-top");
+    assert_eq!(graphics[0].kind, "line");
+    assert_eq!(graphics[0].layer, "Edge.Cuts");
+    assert_eq!(
+        graphics[0].origin.as_ref().map(|p| (p.x, p.y)),
+        Some((0.0, 0.0))
+    );
+    assert_eq!(graphics[1].uuid, "silk-text");
+    assert_eq!(graphics[1].kind, "text");
+    assert_eq!(graphics[1].layer, "F.SilkS");
+    assert_eq!(
+        graphics[1].origin.as_ref().map(|p| (p.x, p.y)),
+        Some((10.0, 20.0))
+    );
+}
+
+#[test]
+fn deletes_target_the_named_board_among_several_open() {
+    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured_in_mock = captured.clone();
+
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let response = kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![
+                    doc_for("other-project.kicad_pcb"),
+                    doc_for("target.kicad_pcb"),
+                ],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )));
+        }
+        if message.type_url.ends_with("DeleteItems") {
+            let request =
+                kiapi::common::commands::DeleteItems::decode(message.value.as_slice()).unwrap();
+            record_doc(&captured_in_mock, &request.header);
+            let response = kiapi::common::commands::DeleteItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                deleted_items: vec![],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.DeleteItemsResponse",
+            )));
+        }
+        Some(ok_response())
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(std::path::Path::new("target.kicad_pcb"))
+        .expect("target.kicad_pcb is open");
+    client
+        .delete_items_in(document, vec!["edge-top".to_string()])
+        .expect("delete");
+
+    let addressed = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the delete carried a document");
+    assert_eq!(
+        addressed, "target.kicad_pcb",
+        "a delete must act on the requested board, not the first open one"
     );
 }
