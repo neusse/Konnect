@@ -216,6 +216,61 @@ fn unpack_any<M: Message + Default>(any: &prost_types::Any) -> Result<M> {
     M::decode(any.value.as_slice()).context("Failed to decode protobuf Any body")
 }
 
+/// Decode an item only when it carries `type_name`. protobuf decoding is
+/// lenient — a `BoardText` body decodes as a `BoardGraphicShape` without
+/// error, yielding an item with no geometry and an empty UUID — so the
+/// type_url is what says which message this is.
+fn decode_as<M: Message + Default>(item: &prost_types::Any, type_name: &str) -> Option<M> {
+    if !item.type_url.ends_with(type_name) {
+        return None;
+    }
+    M::decode(item.value.as_slice()).ok()
+}
+
+/// A KIID's textual value, or `""` when KiCad sent an item without one.
+fn kiid_value(id: Option<kiapi::common::types::Kiid>) -> String {
+    id.map(|id| id.value).unwrap_or_default()
+}
+
+fn point_in_mm(point: kiapi::common::types::Vector2) -> IpcVector2 {
+    IpcVector2 {
+        x: nm_to_mm(point.x_nm),
+        y: nm_to_mm(point.y_nm),
+    }
+}
+
+/// The normalized kind name and first defining point of a graphic shape.
+fn shape_kind_and_origin(
+    shape: Option<&kiapi::common::types::GraphicShape>,
+) -> (&'static str, Option<IpcVector2>) {
+    use kiapi::common::types::graphic_shape::Geometry;
+    use kiapi::common::types::poly_line_node::Geometry as NodeGeometry;
+
+    let Some(geometry) = shape.and_then(|s| s.geometry.as_ref()) else {
+        return ("shape", None);
+    };
+    match geometry {
+        Geometry::Segment(segment) => ("line", segment.start.map(point_in_mm)),
+        Geometry::Rectangle(rectangle) => ("rect", rectangle.top_left.map(point_in_mm)),
+        Geometry::Arc(arc) => ("arc", arc.start.map(point_in_mm)),
+        Geometry::Circle(circle) => ("circle", circle.center.map(point_in_mm)),
+        Geometry::Polygon(polygon) => (
+            "poly",
+            polygon
+                .polygons
+                .first()
+                .and_then(|p| p.outline.as_ref())
+                .and_then(|outline| outline.nodes.first())
+                .and_then(|node| match node.geometry.as_ref() {
+                    Some(NodeGeometry::Point(point)) => Some(point_in_mm(*point)),
+                    Some(NodeGeometry::Arc(arc)) => arc.start.map(point_in_mm),
+                    None => None,
+                }),
+        ),
+        Geometry::Bezier(bezier) => ("curve", bezier.start.map(point_in_mm)),
+    }
+}
+
 fn unpack_required<M: Message + Default>(
     response: Option<prost_types::Any>,
     command_name: &str,
@@ -519,10 +574,6 @@ impl KiCadIpcClient {
         self.find_open_board(requested).map(|_| ())
     }
 
-    fn make_header(&self) -> Result<kiapi::common::types::ItemHeader> {
-        Ok(header_for(self.get_board_document()?))
-    }
-
     /// Get all nets on the board.
     pub fn get_nets(&self) -> Result<Vec<IpcNet>> {
         self.get_nets_in(self.get_board_document()?)
@@ -564,14 +615,32 @@ impl KiCadIpcClient {
         document: kiapi::common::types::DocumentSpecifier,
         item_type: kiapi::common::types::KiCadObjectType,
     ) -> Result<Vec<prost_types::Any>> {
+        self.get_items_of_types_in(document, &[item_type])
+    }
+
+    /// As [`Self::get_items_in`], asking for several types at once.
+    ///
+    /// `GetItems.types` is repeated, and every `send_command` dials a fresh NNG
+    /// socket, so one request for four types costs a quarter of what four
+    /// requests do against a KiCad that may be mid-refill. Items come back in
+    /// KiCad's own order, not grouped by type — callers dispatch on
+    /// `type_url`.
+    pub fn get_items_of_types_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        item_types: &[kiapi::common::types::KiCadObjectType],
+    ) -> Result<Vec<prost_types::Any>> {
         let header = header_for(document);
         let cmd = kiapi::common::commands::GetItems {
             header: Some(header),
-            types: vec![item_type as i32],
+            types: item_types.iter().map(|t| *t as i32).collect(),
         };
         let response_any = self.send_command(&cmd, "kiapi.common.commands.GetItems")?;
         if let Some(any) = response_any {
             let resp: kiapi::common::commands::GetItemsResponse = unpack_any(&any)?;
+            // Without this a failed request is indistinguishable from an empty
+            // board, and one failure now zeroes every type in the batch.
+            ensure_item_request_ok(resp.status, "item retrieval")?;
             Ok(resp.items)
         } else {
             Ok(vec![])
@@ -798,6 +867,20 @@ impl KiCadIpcClient {
         if ids.is_empty() {
             return Ok(());
         }
+        self.delete_items_in(self.get_board_document()?, ids)
+    }
+
+    /// As [`Self::delete_items`], targeting a specific open document — so a
+    /// path-bearing request deletes from the board it names, not from whichever
+    /// board KiCad lists first.
+    pub fn delete_items_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        ids: Vec<String>,
+    ) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         let expected_count = ids.len();
         let mut expected_ids = ids
             .iter()
@@ -806,7 +889,7 @@ impl KiCadIpcClient {
         if expected_ids.len() != expected_count {
             anyhow::bail!("delete request contains duplicate item identifiers");
         }
-        let header = self.make_header()?;
+        let header = header_for(document);
         let cmd = kiapi::common::commands::DeleteItems {
             header: Some(header),
             item_ids: ids
@@ -1066,6 +1149,76 @@ impl KiCadIpcClient {
             found = Some(pads);
         }
         Ok(found)
+    }
+
+    /// Read the board's graphics — shapes, text, textboxes, and dimensions —
+    /// from a specific open document.
+    ///
+    /// Reference images are not included: KiCad 10's `ReferenceImage` message
+    /// is an empty placeholder, so the API cannot name one, let alone identify
+    /// it for deletion.
+    pub fn get_board_graphics_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<IpcGraphic>> {
+        use kiapi::board::types as board;
+        use kiapi::common::types::KiCadObjectType as Kot;
+
+        let items = self.get_items_of_types_in(
+            document,
+            &[
+                Kot::KotPcbShape,
+                Kot::KotPcbText,
+                Kot::KotPcbTextbox,
+                Kot::KotPcbDimension,
+            ],
+        )?;
+
+        let mut graphics = Vec::new();
+        for item in &items {
+            let graphic = if let Some(shape) =
+                decode_as::<board::BoardGraphicShape>(item, "kiapi.board.types.BoardGraphicShape")
+            {
+                let (kind, origin) = shape_kind_and_origin(shape.shape.as_ref());
+                IpcGraphic {
+                    uuid: kiid_value(shape.id),
+                    kind: kind.to_string(),
+                    layer: layer_enum_to_name(shape.layer).to_string(),
+                    origin,
+                }
+            } else if let Some(text) =
+                decode_as::<board::BoardText>(item, "kiapi.board.types.BoardText")
+            {
+                IpcGraphic {
+                    uuid: kiid_value(text.id),
+                    kind: "text".to_string(),
+                    layer: layer_enum_to_name(text.layer).to_string(),
+                    origin: text.text.and_then(|t| t.position).map(point_in_mm),
+                }
+            } else if let Some(textbox) =
+                decode_as::<board::BoardTextBox>(item, "kiapi.board.types.BoardTextBox")
+            {
+                IpcGraphic {
+                    uuid: kiid_value(textbox.id),
+                    kind: "textbox".to_string(),
+                    layer: layer_enum_to_name(textbox.layer).to_string(),
+                    origin: textbox.textbox.and_then(|t| t.top_left).map(point_in_mm),
+                }
+            } else if let Some(dimension) =
+                decode_as::<board::Dimension>(item, "kiapi.board.types.Dimension")
+            {
+                IpcGraphic {
+                    uuid: kiid_value(dimension.id),
+                    kind: "dimension".to_string(),
+                    layer: layer_enum_to_name(dimension.layer).to_string(),
+                    origin: dimension.text.and_then(|t| t.position).map(point_in_mm),
+                }
+            } else {
+                continue;
+            };
+            graphics.push(graphic);
+        }
+        Ok(graphics)
     }
 
     /// Read the title block of a specific open document.
@@ -2265,15 +2418,17 @@ fn build_graphic_child(
             rotation: text_rotation,
             layer,
             size,
+            stroke_width_mm,
         } => {
             let (tx, ty) = xf(*position);
             builders::pack_any(
-                &builders::board_text(
+                &builders::board_text_with_stroke_width(
                     layer,
                     text,
                     tx,
                     ty,
                     *size,
+                    *stroke_width_mm,
                     readable_text_angle(text_rotation + rotation),
                     false,
                 ),
@@ -2454,6 +2609,7 @@ mod footprint_graphics_tests {
                 rotation: 0.0,
                 layer: "F.Fab".to_string(),
                 size: 0.5,
+                stroke_width_mm: 0.075,
             },
         ];
         let fp = build(&graphics, 100.0, 50.0, 90.0);
@@ -2518,6 +2674,7 @@ mod footprint_graphics_tests {
             rotation: 0.0,
             layer: "F.Fab".to_string(),
             size: 0.5,
+            stroke_width_mm: 0.075,
         }];
         let fp = build(&graphics, 0.0, 0.0, 180.0);
         let texts = texts(&fp);
@@ -2669,6 +2826,7 @@ mod footprint_graphics_tests {
                 rotation: 0.0,
                 layer: "Dwgs.User".to_string(),
                 size: 1.0,
+                stroke_width_mm: 0.15,
             },
         ];
         let any = KiCadIpcClient::build_footprint_item(

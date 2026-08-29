@@ -6,9 +6,12 @@
 //! the file is the last save, so it disagrees with the IPC-backed writers here
 //! whenever KiCad holds unsaved edits.
 
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
+use crate::tools::{
+    get_path, opt_str_list, require_f64, require_str, with_ipc_classified, ToolContext, ToolDef,
+};
 use konnect_ipc::builders;
 use konnect_sexp::{
     parser::{parse_sexp, SexpNode},
@@ -237,7 +240,7 @@ where
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
     let requested = board_path.to_path_buf();
-    match crate::tools::pcb_components::with_ipc_classified(addr, move |c| {
+    match crate::tools::with_ipc_classified(addr, move |c| {
         c.ensure_board_is_active(&requested)?;
         f(c)
     })
@@ -268,10 +271,8 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
     what: &str,
 ) -> anyhow::Result<Option<CallToolResult>> {
     let requested = board_path.to_path_buf();
-    match crate::tools::pcb_components::with_ipc_classified(addr, move |c| {
-        c.ensure_board_is_active(&requested)
-    })
-    .await?
+    match crate::tools::with_ipc_classified(addr, move |c| c.ensure_board_is_active(&requested))
+        .await?
     {
         Ok(()) => Ok(Some(CallToolResult::error(format!(
             "KiCAD currently holds this board open, and a {what} written to the file would \
@@ -375,6 +376,133 @@ pub(crate) fn zone_schema() -> serde_json::Value {
         },
         "required": ["board", "net_name", "layer", "points"]
     })
+}
+
+// ─── Board graphics ───────────────────────────────────────────────────────────
+
+/// The graphic kinds `delete_graphics` names, in the vocabulary both the live
+/// and the file reader answer in.
+///
+/// `shape` is the live path's fallback for a shape KiCad sends with no
+/// geometry (`konnect_ipc::client::shape_kind_and_origin`); it is in the list
+/// so that everything the tool can *report* is also something a `types` filter
+/// can *select* — otherwise such an item would be undeletable by kind.
+const GRAPHIC_KINDS: [&str; 10] = [
+    "line",
+    "rect",
+    "arc",
+    "circle",
+    "poly",
+    "curve",
+    "shape",
+    "text",
+    "textbox",
+    "dimension",
+];
+
+/// The kind name for a board file's top-level graphic block, or `None` for
+/// anything that is not a graphic — footprints, zones, tracks, the setup
+/// block. `(image …)` is deliberately absent: KiCad 10's `ReferenceImage`
+/// message is an empty placeholder, so the live path cannot see one and
+/// deleting it from the file only would make the two paths disagree.
+fn graphic_kind(tag: &str) -> Option<&'static str> {
+    Some(match tag {
+        "gr_line" => "line",
+        "gr_rect" => "rect",
+        "gr_arc" => "arc",
+        "gr_circle" => "circle",
+        "gr_poly" => "poly",
+        "gr_curve" => "curve",
+        "gr_text" => "text",
+        "gr_text_box" => "textbox",
+        "dimension" => "dimension",
+        _ => return None,
+    })
+}
+
+/// The head tag of a `(tag …)` block, without parsing it.
+fn block_tag(block: &str) -> Option<&str> {
+    let after_paren = block.strip_prefix('(')?;
+    let end = after_paren
+        .find(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .unwrap_or(after_paren.len());
+    Some(&after_paren[..end])
+}
+
+/// A graphic read out of a board file, with the byte range to cut to delete it.
+struct FileGraphic {
+    uuid: String,
+    kind: &'static str,
+    layer: String,
+    origin: Option<(f64, f64)>,
+    /// Byte range of the block including its leading whitespace, so deleting
+    /// it leaves no blank line behind.
+    span: (usize, usize),
+}
+
+/// The first defining point of a graphic block: a segment's `start`, a
+/// circle's `center`, a text's `at`, or a polygon's first vertex.
+fn block_origin(node: &SexpNode) -> Option<(f64, f64)> {
+    for tag in ["start", "center", "at"] {
+        if let Some(point) = node.find(tag) {
+            if let (Some(x), Some(y)) = (point.get_f64(1), point.get_f64(2)) {
+                return Some((x, y));
+            }
+        }
+    }
+    let xy = node.find("pts")?.find("xy")?;
+    Some((xy.get_f64(1)?, xy.get_f64(2)?))
+}
+
+/// Every top-level graphic in a board file, in file order.
+///
+/// Only direct children of `(kicad_pcb …)` count: a `gr_line` inside a
+/// footprint belongs to that footprint, and this tool must never cut one out.
+fn read_file_graphics(content: &str) -> Vec<FileGraphic> {
+    find_direct_child_blocks(content, "kicad_pcb")
+        .into_iter()
+        .filter_map(|(start, end)| {
+            // Read the head tag out of the slice before parsing: a board's
+            // top-level blocks are overwhelmingly footprints, segments, vias,
+            // and zones, and building an AST for each of those just to throw
+            // it away parses most of the file for nothing.
+            let kind = graphic_kind(block_tag(&content[start..end])?)?;
+            let node = parse_sexp(&content[start..end]).ok()?;
+            Some(FileGraphic {
+                uuid: node.find_str("uuid").unwrap_or_default().to_string(),
+                kind,
+                layer: node.find_str("layer").unwrap_or_default().to_string(),
+                origin: block_origin(&node),
+                span: find_block_with_leading_whitespace(content, start).unwrap_or((start, end)),
+            })
+        })
+        .collect()
+}
+
+/// The `delete_graphics` filter: a graphic matches when it satisfies every
+/// filter given (unset filters match everything).
+#[derive(Clone)]
+struct GraphicFilter {
+    uuids: Option<Vec<String>>,
+    kinds: Option<Vec<String>>,
+    layer: Option<String>,
+}
+
+impl GraphicFilter {
+    fn matches(&self, uuid: &str, kind: &str, layer: &str) -> bool {
+        self.uuids
+            .as_ref()
+            .is_none_or(|wanted| wanted.iter().any(|w| w == uuid))
+            && self
+                .kinds
+                .as_ref()
+                .is_none_or(|wanted| wanted.iter().any(|w| w == kind))
+            && self.layer.as_ref().is_none_or(|wanted| wanted == layer)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.uuids.is_none() && self.kinds.is_none() && self.layer.is_none()
+    }
 }
 
 // ─── S-expression format helpers ──────────────────────────────────────────────
@@ -604,7 +732,10 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "set_board_size",
-            "Set the PCB board outline to a rectangle of the given dimensions on the Edge.Cuts layer.",
+            "Add a rectangular board outline of the given dimensions on the Edge.Cuts layer. \
+             This appends: on a board that already has an outline it leaves two overlapping \
+             rectangles and a DRC failure, so resizing means calling \
+             delete_graphics(layer='Edge.Cuts') first.",
             json!({
                 "type": "object",
                 "properties": {
@@ -688,7 +819,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_board_outline",
-            "Add a rectangular board outline on Edge.Cuts, optionally using circular rounded corners.",
+            "Add a rectangular board outline on Edge.Cuts, optionally using circular rounded \
+             corners. This appends: on a board that already has an outline it leaves two \
+             overlapping rectangles and a DRC failure, so replacing one means calling \
+             delete_graphics(layer='Edge.Cuts') first.",
             json!({
                 "type": "object",
                 "properties": {
@@ -702,6 +836,43 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "x1", "y1", "x2", "y2"]
             }),
             |args, ctx| async move { handle_add_board_outline(args, ctx).await }
+        ),
+        tool!(
+            "delete_graphics",
+            "Delete board graphics — lines, rectangles, arcs, circles, polygons, curves, text, \
+             text boxes, and dimensions — that match every filter given. At least one of \
+             'uuids', 'layer', or 'types' is required; 'dry_run' lists what would go without \
+             deleting anything, and the UUIDs it reports can be passed straight back as 'uuids'. \
+             Footprints, zones, tracks, vias, and graphics belonging to a footprint are never \
+             touched, and neither are reference images (KiCad's API cannot identify one). \
+             This is how a board outline is resized: add_board_outline and set_board_size \
+             append, so calling one twice without deleting the old Edge.Cuts graphics first \
+             leaves two overlapping outlines. Acts on the board open in KiCad when it is \
+             reachable, else on the file — 'source' says which.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":   { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "layer":   { "type": "string", "description": "Only graphics on this layer (e.g. 'Edge.Cuts')" },
+                    "uuids": {
+                        "type": "array",
+                        "description": "Only graphics with these UUIDs",
+                        "items": { "type": "string" }
+                    },
+                    "types": {
+                        "type": "array",
+                        "description": "Only graphics of these kinds",
+                        "items": { "type": "string", "enum": GRAPHIC_KINDS }
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "List the matches without deleting them",
+                        "default": false
+                    }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_delete_graphics(args, ctx).await }
         ),
         tool!(
             "add_mounting_hole",
@@ -1415,6 +1586,155 @@ async fn handle_add_board_outline(
     })))
 }
 
+fn graphic_json(
+    uuid: &str,
+    kind: &str,
+    layer: &str,
+    origin: Option<(f64, f64)>,
+) -> serde_json::Value {
+    json!({
+        "uuid": uuid,
+        "type": kind,
+        "layer": layer,
+        "x": origin.map(|(x, _)| x),
+        "y": origin.map(|(_, y)| y),
+    })
+}
+
+async fn handle_delete_graphics(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let uuids = match opt_str_list(args, "uuids") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let kinds = match opt_str_list(args, "types") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let layer = args["layer"].as_str().map(str::to_string);
+    let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+
+    if let Some(unknown) = kinds
+        .iter()
+        .flatten()
+        .find(|kind| !GRAPHIC_KINDS.contains(&kind.as_str()))
+    {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "types".to_string(),
+                reason: format!("unknown graphic type '{unknown}'"),
+            },
+            format!(
+                "Unknown graphic type '{unknown}'. Valid types: {}.",
+                GRAPHIC_KINDS.join(", ")
+            ),
+        ));
+    }
+
+    let filter = GraphicFilter {
+        uuids,
+        kinds,
+        layer,
+    };
+    // An unfiltered call would wipe every graphic on the board. That is never
+    // what a caller means by omitting the arguments, so it has to be spelled
+    // out — layer by layer, or by UUID.
+    if filter.is_empty() {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "filter".to_string(),
+                reason: "at least one of 'uuids', 'layer', or 'types' is required".to_string(),
+            },
+            "delete_graphics needs a filter: pass 'layer' (e.g. 'Edge.Cuts'), 'uuids', \
+             or 'types'. Run it with dry_run to see what a filter would match."
+                .to_string(),
+        ));
+    }
+
+    // The board KiCad holds first. The fallback gate is the typed transport
+    // classification: only when the request never reached a live KiCad is it
+    // safe to edit the board file, since a file edited behind a live editor is
+    // silently overwritten on its next save.
+    let ipc_board = board_path.clone();
+    let ipc_filter = filter.clone();
+    let attempt = with_ipc_classified(ctx.config.ipc_address.clone(), move |c| {
+        let document = c.find_open_board(&ipc_board)?;
+        let matched: Vec<konnect_ipc::IpcGraphic> = c
+            .get_board_graphics_in(document.clone())?
+            .into_iter()
+            .filter(|g| ipc_filter.matches(&g.uuid, &g.kind, &g.layer))
+            .collect();
+        if !dry_run {
+            if let Some(anonymous) = matched.iter().find(|g| g.uuid.is_empty()) {
+                anyhow::bail!(
+                    "KiCad returned a {} on {} with no identifier, so it cannot be deleted; \
+                     nothing was deleted",
+                    anonymous.kind,
+                    anonymous.layer
+                );
+            }
+            c.delete_items_in(document, matched.iter().map(|g| g.uuid.clone()).collect())?;
+        }
+        Ok(matched)
+    })
+    .await?;
+
+    let (graphics, source) = match attempt {
+        Ok(matched) => (
+            matched
+                .iter()
+                .map(|g| {
+                    graphic_json(
+                        &g.uuid,
+                        &g.kind,
+                        &g.layer,
+                        g.origin.as_ref().map(|p| (p.x, p.y)),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            "ipc",
+        ),
+        Err(konnect_ipc::IpcFailure::Rejected(message)) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCad rejected the deletion over IPC: {message}. \
+                 The board file was not modified — KiCad is reachable and may hold this \
+                 board open, so editing the file directly could be silently overwritten."
+            )))
+        }
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+            let content = std::fs::read_to_string(&board_path)?;
+            let matched: Vec<FileGraphic> = read_file_graphics(&content)
+                .into_iter()
+                .filter(|g| filter.matches(&g.uuid, g.kind, &g.layer))
+                .collect();
+            let graphics = matched
+                .iter()
+                .map(|g| graphic_json(&g.uuid, g.kind, &g.layer, g.origin))
+                .collect::<Vec<_>>();
+
+            if !dry_run && !matched.is_empty() {
+                let edits = matched
+                    .iter()
+                    .map(|g| SexpEdit::delete(g.span.0, g.span.1))
+                    .collect();
+                write_atomic(&board_path, &apply_edits(content, edits))?;
+            }
+            (graphics, "file")
+        }
+    };
+
+    Ok(CallToolResult::json(&json!({
+        "count": graphics.len(),
+        "deleted": if dry_run { 0 } else { graphics.len() },
+        "dry_run": dry_run,
+        "graphics": graphics,
+        "source": source
+    })))
+}
+
 async fn handle_add_mounting_hole(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1851,21 +2171,25 @@ mod layers_block_tests {
     }
 }
 
+/// Shared scaffolding for this module's tests: a `ToolContext` pointed at a
+/// given IPC address, and a mock KiCad that answers `GetOpenDocuments` with
+/// one board and delegates every other command to the test.
 #[cfg(test)]
-mod svg_logo_tests {
-    use super::*;
+mod board_mock {
     use crate::router::ToolRouter;
-    use crate::tools::ServerConfig;
+    use crate::tools::{ServerConfig, ToolContext};
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
     use std::sync::Arc;
 
-    fn test_ctx() -> ToolContext {
+    /// An empty `address` classifies as transport-unreachable, which is the
+    /// file-editing path — no live KiCad needed.
+    pub fn ctx_talking_to(address: String) -> ToolContext {
         ToolContext::new(
-            // Deliberately empty ipc_address: with_ipc fails fast against it,
-            // exercising the file-fallback path without needing live KiCAD.
             ServerConfig {
                 kicad_cli: String::new(),
                 kicad_binary: String::new(),
-                ipc_address: String::new(),
+                ipc_address: address,
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
@@ -1873,6 +2197,79 @@ mod svg_logo_tests {
             },
             Arc::new(ToolRouter::new()),
         )
+    }
+
+    /// A rep0 endpoint playing a KiCad that holds `board` open. `respond`
+    /// answers the commands the test cares about and returns `None` for the
+    /// rest; the socket, the envelope, and the `GetOpenDocuments` answer are
+    /// handled here so each test only writes its own command arms.
+    pub fn spawn_kicad_holding_board(
+        board: &std::path::Path,
+        respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
+    ) -> String {
+        use nng::options::Options;
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("tcp://127.0.0.1:{port}");
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        socket.listen(&url).expect("mock listen");
+
+        let board = board.to_string_lossy().to_string();
+        std::thread::spawn(move || {
+            while let Ok(message) = socket.recv() {
+                let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
+                let command = request.message.expect("a command");
+                let body = if command.type_url.ends_with("GetOpenDocuments") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![kiapi::common::types::DocumentSpecifier {
+                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                                project: None,
+                                identifier: Some(
+                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                        board.clone(),
+                                    ),
+                                ),
+                            }],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else {
+                    respond(&command)
+                };
+                let response = kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: body,
+                };
+                if socket
+                    .send(nng::Message::from(response.encode_to_vec().as_slice()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        url
+    }
+}
+
+#[cfg(test)]
+mod svg_logo_tests {
+    use super::board_mock::ctx_talking_to;
+    use super::*;
+
+    fn test_ctx() -> ToolContext {
+        ctx_talking_to(String::new())
     }
 
     fn blank_board() -> &'static str {
@@ -1969,26 +2366,315 @@ mod svg_logo_tests {
     }
 }
 
+/// `add_board_outline` and `set_board_size` only ever appended, so an outline
+/// was write-once: a second call left two overlapping rectangles and a DRC
+/// failure, and shrinking a board meant deleting the old edges by hand in
+/// KiCad. `delete_graphics` is the missing delete verb.
+#[cfg(test)]
+mod delete_graphics_tests {
+    use super::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use super::*;
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+    use std::sync::{Arc, Mutex};
+
+    /// Tab-indented like KiCad 10's own writer, with a graphic *inside* a
+    /// footprint that no filter may ever reach.
+    const BOARD: &str = "(kicad_pcb\n\
+        \t(version 20260206)\n\
+        \t(paper \"A4\")\n\
+        \t(gr_line\n\t\t(start 0 0)\n\t\t(end 100 0)\n\t\t(layer \"Edge.Cuts\")\n\t\t(uuid \"edge-top\")\n\t)\n\
+        \t(gr_line\n\t\t(start 100 0)\n\t\t(end 100 60)\n\t\t(layer \"Edge.Cuts\")\n\t\t(uuid \"edge-right\")\n\t)\n\
+        \t(gr_text \"REV A\"\n\t\t(at 10 10 0)\n\t\t(layer \"F.SilkS\")\n\t\t(uuid \"silk-text\")\n\t)\n\
+        \t(gr_circle\n\t\t(center 5 5)\n\t\t(end 7 5)\n\t\t(layer \"F.SilkS\")\n\t\t(uuid \"silk-dot\")\n\t)\n\
+        \t(footprint \"R_0402\"\n\t\t(at 20 20)\n\
+        \t\t(gr_line\n\t\t\t(start 0 0)\n\t\t\t(end 1 0)\n\t\t\t(layer \"Edge.Cuts\")\n\t\t\t(uuid \"inside-footprint\")\n\t\t)\n\
+        \t\t(uuid \"fp1\")\n\t)\n\
+        \t(zone (net 1) (layer \"F.Cu\") (uuid \"zone1\"))\n\
+        )\n";
+
+    async fn delete_graphics(
+        ctx: &ToolContext,
+        args: serde_json::Value,
+    ) -> (serde_json::Value, bool) {
+        let result = handle_delete_graphics(&args, ctx)
+            .await
+            .expect("handler should succeed");
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        (serde_json::from_str(&body).unwrap(), result.is_error)
+    }
+
+    fn offline() -> ToolContext {
+        ctx_talking_to(String::new())
+    }
+
+    fn board_file() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, BOARD).unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn clearing_edge_cuts_leaves_the_rest_of_the_board() {
+        let (_dir, board) = board_file();
+
+        let (body, is_error) = delete_graphics(
+            &offline(),
+            json!({
+                "board": board.to_str().unwrap(),
+                "layer": "Edge.Cuts"
+            }),
+        )
+        .await;
+
+        assert!(!is_error, "{body}");
+        assert_eq!(body["deleted"], json!(2));
+        assert_eq!(body["source"], json!("file"));
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert!(!updated.contains("edge-top"));
+        assert!(!updated.contains("edge-right"));
+        // A footprint's own graphics are the footprint's, whatever layer they
+        // claim — cutting one out would corrupt the part.
+        assert!(updated.contains("inside-footprint"));
+        assert!(updated.contains("silk-text"));
+        assert!(updated.contains("zone1"));
+        parse_sexp(&updated).expect("the board still parses");
+    }
+
+    /// The whole point of the tool: place an outline, clear it, place a
+    /// smaller one, and end up with exactly one rectangle.
+    #[tokio::test]
+    async fn an_outline_can_be_replaced_by_clearing_it_first() {
+        let (_dir, board) = board_file();
+        let ctx = offline();
+        let args = json!({ "board": board.to_str().unwrap() });
+
+        delete_graphics(
+            &ctx,
+            json!({ "board": board.to_str().unwrap(), "layer": "Edge.Cuts" }),
+        )
+        .await;
+        let mut outline = args.clone();
+        outline["x1"] = json!(0.0);
+        outline["y1"] = json!(0.0);
+        outline["x2"] = json!(50.0);
+        outline["y2"] = json!(30.0);
+        handle_add_board_outline(&outline, &ctx).await.unwrap();
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        let edges = read_file_graphics(&updated)
+            .into_iter()
+            .filter(|g| g.layer == "Edge.Cuts")
+            .count();
+        assert_eq!(edges, 4, "one rectangle, not two overlapping ones");
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_reports_the_matches_and_changes_nothing() {
+        let (_dir, board) = board_file();
+
+        let (body, is_error) = delete_graphics(
+            &offline(),
+            json!({
+                "board": board.to_str().unwrap(),
+                "layer": "Edge.Cuts",
+                "dry_run": true
+            }),
+        )
+        .await;
+
+        assert!(!is_error, "{body}");
+        assert_eq!(body["count"], json!(2));
+        assert_eq!(body["deleted"], json!(0));
+        assert_eq!(body["graphics"][0]["uuid"], json!("edge-top"));
+        assert_eq!(body["graphics"][0]["type"], json!("line"));
+        assert_eq!(body["graphics"][0]["x"], json!(0.0));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+    }
+
+    #[tokio::test]
+    async fn a_uuid_filter_deletes_exactly_that_graphic() {
+        let (_dir, board) = board_file();
+
+        let (body, _) = delete_graphics(
+            &offline(),
+            json!({
+                "board": board.to_str().unwrap(),
+                "uuids": ["silk-text"]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["deleted"], json!(1));
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert!(!updated.contains("silk-text"));
+        assert!(updated.contains("silk-dot"));
+    }
+
+    #[tokio::test]
+    async fn filters_combine() {
+        let (_dir, board) = board_file();
+
+        let (body, _) = delete_graphics(
+            &offline(),
+            json!({
+                "board": board.to_str().unwrap(),
+                "layer": "F.SilkS",
+                "types": ["circle"]
+            }),
+        )
+        .await;
+
+        assert_eq!(body["deleted"], json!(1));
+        assert_eq!(body["graphics"][0]["uuid"], json!("silk-dot"));
+        assert!(std::fs::read_to_string(&board)
+            .unwrap()
+            .contains("silk-text"));
+    }
+
+    /// Omitting every filter would wipe the board's artwork, which no caller
+    /// means by leaving the arguments out.
+    #[tokio::test]
+    async fn a_call_with_no_filter_is_refused() {
+        let (_dir, board) = board_file();
+
+        let (body, is_error) =
+            delete_graphics(&offline(), json!({ "board": board.to_str().unwrap() })).await;
+
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], json!("invalid_argument"));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_type_names_the_valid_ones() {
+        let (_dir, board) = board_file();
+
+        let (body, is_error) = delete_graphics(
+            &offline(),
+            json!({
+                "board": board.to_str().unwrap(),
+                "types": ["gr_line"]
+            }),
+        )
+        .await;
+
+        assert!(is_error);
+        assert_eq!(body["error"]["kind"], json!("invalid_argument"));
+        assert!(body["message"].as_str().unwrap().contains("line, rect"));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+    }
+
+    /// A KiCad holding `board` with `shapes` (uuid, layer) on it, recording
+    /// every UUID a DeleteItems request asks for.
+    fn spawn_kicad_with_shapes(
+        board: &std::path::Path,
+        shapes: Vec<(&'static str, &'static str)>,
+        deleted: Arc<Mutex<Vec<String>>>,
+    ) -> String {
+        spawn_kicad_holding_board(board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                let items = shapes
+                    .iter()
+                    .map(|(uuid, layer)| {
+                        let mut shape =
+                            konnect_ipc::builders::board_segment(layer, 0.05, 0.0, 0.0, 10.0, 0.0);
+                        shape.id = Some(kiapi::common::types::Kiid {
+                            value: uuid.to_string(),
+                        });
+                        konnect_ipc::builders::pack_any(
+                            &shape,
+                            "kiapi.board.types.BoardGraphicShape",
+                        )
+                    })
+                    .collect();
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items,
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ))
+            } else if command.type_url.ends_with("DeleteItems") {
+                let delete =
+                    kiapi::common::commands::DeleteItems::decode(command.value.as_slice()).unwrap();
+                deleted
+                    .lock()
+                    .unwrap()
+                    .extend(delete.item_ids.iter().map(|id| id.value.clone()));
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::DeleteItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        deleted_items: vec![],
+                    },
+                    "kiapi.common.commands.DeleteItemsResponse",
+                ))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The live board wins over the file, the same way the writers in this
+    /// toolset act on the board KiCad holds.
+    #[tokio::test]
+    async fn a_live_board_is_edited_over_ipc_and_the_file_is_left_alone() {
+        let (_dir, board) = board_file();
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let address = spawn_kicad_with_shapes(
+            &board,
+            vec![("live-edge", "Edge.Cuts"), ("live-silk", "F.SilkS")],
+            deleted.clone(),
+        );
+        let ctx = ctx_talking_to(address);
+
+        let (body, is_error) = delete_graphics(
+            &ctx,
+            json!({ "board": board.to_str().unwrap(), "layer": "Edge.Cuts" }),
+        )
+        .await;
+
+        assert!(!is_error, "{body}");
+        assert_eq!(body["source"], json!("ipc"));
+        assert_eq!(body["deleted"], json!(1));
+        assert_eq!(*deleted.lock().unwrap(), vec!["live-edge".to_string()]);
+        // The file is the last save; KiCad owns the board, so it stays as-is.
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+    }
+
+    #[tokio::test]
+    async fn a_filter_matching_nothing_deletes_nothing() {
+        let (_dir, board) = board_file();
+
+        let (body, is_error) = delete_graphics(
+            &offline(),
+            json!({
+                "board": board.to_str().unwrap(),
+                "layer": "B.SilkS"
+            }),
+        )
+        .await;
+
+        assert!(!is_error, "{body}");
+        assert_eq!(body["count"], json!(0));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+    }
+}
+
 #[cfg(test)]
 mod net_count_tests {
+    use super::board_mock::ctx_talking_to;
     use super::*;
-    use crate::router::ToolRouter;
-    use crate::tools::ServerConfig;
-    use std::sync::Arc;
 
     fn test_ctx() -> ToolContext {
-        ToolContext::new(
-            ServerConfig {
-                kicad_cli: String::new(),
-                kicad_binary: String::new(),
-                ipc_address: String::new(),
-                project_dir: None,
-                jlcpcb_db_path: None,
-                auto_load_toolsets: false,
-                eager_toolsets: false,
-            },
-            Arc::new(ToolRouter::new()),
-        )
+        ctx_talking_to(String::new())
     }
 
     async fn net_count_of(board: &str) -> i64 {
@@ -2770,31 +3456,13 @@ mod board_size_tests {
 /// and net_count 0 for a board KiCad was showing fully populated.
 #[cfg(test)]
 mod board_info_source_tests {
+    use super::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
     use super::*;
-    use crate::router::ToolRouter;
-    use crate::tools::ServerConfig;
     use konnect_ipc::gen::kiapi;
-    use prost::Message;
-    use std::sync::Arc;
 
     /// A board saved before anything was placed on it: the empty stub the
     /// file-only reader kept reporting.
     const EMPTY_STUB: &str = "(kicad_pcb\n\t(version 20260206)\n\t(paper \"A3\")\n)\n";
-
-    fn ctx_talking_to(address: String) -> ToolContext {
-        ToolContext::new(
-            ServerConfig {
-                kicad_cli: String::new(),
-                kicad_binary: String::new(),
-                ipc_address: address,
-                project_dir: None,
-                jlcpcb_db_path: None,
-                auto_load_toolsets: false,
-                eager_toolsets: false,
-            },
-            Arc::new(ToolRouter::new()),
-        )
-    }
 
     /// A KiCad holding `board` open with `layers` enabled, `copper` of them
     /// copper, and `nets` real nets — none of it saved to the file.
@@ -2808,91 +3476,45 @@ mod board_info_source_tests {
         copper: u32,
         nets: usize,
     ) -> String {
-        use nng::options::Options;
-
-        let port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let url = format!("tcp://127.0.0.1:{port}");
-        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
-        socket
-            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
-            .unwrap();
-        socket.listen(&url).expect("mock listen");
-
-        let board = board.to_string_lossy().to_string();
-        std::thread::spawn(move || {
-            while let Ok(message) = socket.recv() {
-                let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
-                let command = request.message.expect("a command");
-                let body = if command.type_url.ends_with("GetOpenDocuments") {
-                    Some(konnect_ipc::builders::pack_any(
-                        &kiapi::common::commands::GetOpenDocumentsResponse {
-                            documents: vec![kiapi::common::types::DocumentSpecifier {
-                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-                                project: None,
-                                identifier: Some(
-                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                        board.clone(),
-                                    ),
-                                ),
-                            }],
-                        },
-                        "kiapi.common.commands.GetOpenDocumentsResponse",
-                    ))
-                } else if command.type_url.ends_with("GetTitleBlockInfo") {
-                    Some(konnect_ipc::builders::pack_any(
-                        &kiapi::common::types::TitleBlockInfo {
-                            title: "Live title".to_string(),
-                            revision: "B".to_string(),
-                            ..Default::default()
-                        },
-                        "kiapi.common.types.TitleBlockInfo",
-                    ))
-                } else if command.type_url.ends_with("GetBoardEnabledLayers") {
-                    Some(konnect_ipc::builders::pack_any(
-                        &kiapi::board::commands::BoardEnabledLayersResponse {
-                            copper_layer_count: copper,
-                            layers: (0..layers as i32).collect(),
-                        },
-                        "kiapi.board.commands.BoardEnabledLayersResponse",
-                    ))
-                } else if command.type_url.ends_with("GetNets") {
-                    Some(konnect_ipc::builders::pack_any(
-                        &kiapi::board::commands::NetsResponse {
-                            nets: std::iter::once(kiapi::board::types::Net {
-                                code: Some(kiapi::board::types::NetCode { value: 0 }),
-                                name: String::new(),
-                            })
-                            .chain((1..=nets).map(|index| kiapi::board::types::Net {
-                                code: Some(kiapi::board::types::NetCode {
-                                    value: index as i32,
-                                }),
-                                name: format!("N{index}"),
-                            }))
-                            .collect(),
-                        },
-                        "kiapi.board.commands.NetsResponse",
-                    ))
-                } else {
-                    None
-                };
-                let response = kiapi::common::ApiResponse {
-                    status: Some(kiapi::common::ApiResponseStatus {
-                        status: kiapi::common::ApiStatusCode::AsOk as i32,
-                        error_message: String::new(),
-                    }),
-                    header: None,
-                    message: body,
-                };
-                let out = nng::Message::from(response.encode_to_vec().as_slice());
-                if socket.send(out).is_err() {
-                    break;
-                }
+        spawn_kicad_holding_board(board, move |command| {
+            if command.type_url.ends_with("GetTitleBlockInfo") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::types::TitleBlockInfo {
+                        title: "Live title".to_string(),
+                        revision: "B".to_string(),
+                        ..Default::default()
+                    },
+                    "kiapi.common.types.TitleBlockInfo",
+                ))
+            } else if command.type_url.ends_with("GetBoardEnabledLayers") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::board::commands::BoardEnabledLayersResponse {
+                        copper_layer_count: copper,
+                        layers: (0..layers as i32).collect(),
+                    },
+                    "kiapi.board.commands.BoardEnabledLayersResponse",
+                ))
+            } else if command.type_url.ends_with("GetNets") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::board::commands::NetsResponse {
+                        nets: std::iter::once(kiapi::board::types::Net {
+                            code: Some(kiapi::board::types::NetCode { value: 0 }),
+                            name: String::new(),
+                        })
+                        .chain((1..=nets).map(|index| kiapi::board::types::Net {
+                            code: Some(kiapi::board::types::NetCode {
+                                value: index as i32,
+                            }),
+                            name: format!("N{index}"),
+                        }))
+                        .collect(),
+                    },
+                    "kiapi.board.commands.NetsResponse",
+                ))
+            } else {
+                None
             }
-        });
-        url
+        })
     }
 
     async fn board_info(board: &std::path::Path, ctx: &ToolContext) -> serde_json::Value {

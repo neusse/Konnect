@@ -70,7 +70,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_board",
         description: "Board outline, layers, zones, mounting holes, board text, SVG logo import",
         category: "pcb",
-        tool_count: 11,
+        tool_count: 12,
     },
     ToolsetMeta {
         name: "pcb_components",
@@ -112,7 +112,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "verification",
         description: "DRC, design rules, layer constraints, clearance checks, KiCAD UI control (ERC is in sch_export)",
         category: "verification",
-        tool_count: 8,
+        tool_count: 10,
     },
     ToolsetMeta {
         name: "config",

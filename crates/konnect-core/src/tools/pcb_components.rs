@@ -9,7 +9,8 @@ use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
 use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite};
 use crate::tools::{
-    get_path, require_array, require_f64, require_str, require_u64, ToolContext, ToolDef,
+    get_path, require_array, require_f64, require_str, require_u64, with_ipc_classified,
+    ToolContext, ToolDef,
 };
 use anyhow::Context;
 use konnect_ipc::client::KiCadIpcClient;
@@ -34,27 +35,6 @@ where
     match tokio::task::spawn_blocking(move || f(&KiCadIpcClient::new(&addr))).await {
         Ok(Ok(r)) => Ok(Ok(r)),
         Ok(Err(e)) => Ok(Err(format!("{e:#}"))),
-        Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
-    }
-}
-
-/// As [`with_ipc`], but classifying a failure as transport-unreachable vs
-/// KiCad-rejected via [`konnect_ipc::IpcFailure`] — the typed gate for the
-/// file-editing fallback (never a text match on the error message).
-pub(crate) async fn with_ipc_classified<T, F>(
-    addr: String,
-    f: F,
-) -> anyhow::Result<Result<T, konnect_ipc::IpcFailure>>
-where
-    T: Send + 'static,
-    F: FnOnce(&KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
-{
-    match tokio::task::spawn_blocking(move || {
-        f(&KiCadIpcClient::new(&addr)).map_err(konnect_ipc::IpcFailure::from_error)
-    })
-    .await
-    {
-        Ok(result) => Ok(result),
         Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
     }
 }
@@ -380,6 +360,14 @@ fn text_size(node: &konnect_sexp::SexpNode) -> f64 {
         .unwrap_or(1.0)
 }
 
+/// Explicit font stroke width, falling back to KiCad's 15%-of-size default.
+fn text_stroke_width(node: &konnect_sexp::SexpNode) -> f64 {
+    node.find("effects")
+        .and_then(|effects| effects.find("font"))
+        .and_then(|font| font.find_f64("thickness"))
+        .unwrap_or_else(|| text_size(node) * 0.15)
+}
+
 /// Text position and angle from `(at x y [rot])`.
 fn text_at(node: &konnect_sexp::SexpNode, kind: &str) -> anyhow::Result<((f64, f64), f64)> {
     let at = node
@@ -522,6 +510,7 @@ pub(crate) fn extract_graphic_definitions(
             rotation,
             layer: graphic_layer(text, "fp_text")?,
             size: text_size(text),
+            stroke_width_mm: text_stroke_width(text),
         });
     }
     for property in footprint.find_all("property") {
@@ -546,6 +535,7 @@ pub(crate) fn extract_graphic_definitions(
             rotation,
             layer,
             size: text_size(property),
+            stroke_width_mm: text_stroke_width(property),
         });
     }
     Ok(graphics)

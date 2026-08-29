@@ -260,6 +260,35 @@ macro_rules! tool {
     }};
 }
 
+// ─── IPC helpers ──────────────────────────────────────────────────────────────
+
+/// Run `f` against KiCad's IPC API, classifying a failure as
+/// transport-unreachable vs KiCad-rejected via [`konnect_ipc::IpcFailure`].
+///
+/// This is the typed gate for the file-editing fallback — never a text match
+/// on the error message — and it is shared rather than copied per toolset:
+/// the toolsets' plain `with_ipc` helpers have already drifted from each
+/// other, and this is the one decision (is it safe to edit a board file behind
+/// a live KiCad?) whose copies must not.
+pub async fn with_ipc_classified<T, F>(
+    address: String,
+    f: F,
+) -> anyhow::Result<Result<T, konnect_ipc::IpcFailure>>
+where
+    T: Send + 'static,
+    F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || {
+        f(&konnect_ipc::client::KiCadIpcClient::new(&address))
+            .map_err(konnect_ipc::IpcFailure::from_error)
+    })
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
+    }
+}
+
 // ─── Argument helpers ─────────────────────────────────────────────────────────
 
 /// Build a structured `InvalidArgument` CallToolResult. Used by the
@@ -302,6 +331,23 @@ pub fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, CallToolRe
 /// Extract an optional string argument.
 pub fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args[key].as_str()
+}
+
+/// Extract an optional array-of-strings argument: `None` when absent, a
+/// structured `InvalidArgument` error when present but not an array of
+/// strings. Prefer this over `as_array().unwrap_or_default()`, which reports a
+/// malformed argument as an empty list.
+pub fn opt_str_list(args: &Value, key: &str) -> Result<Option<Vec<String>>, CallToolResult> {
+    match &args[key] {
+        Value::Null => Ok(None),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| value.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .map(Some)
+            .ok_or_else(|| invalid_arg(key, "every entry must be a string")),
+        _ => Err(invalid_arg(key, "expected an array of strings")),
+    }
 }
 
 /// Extract a required f64 argument. Returns a structured `InvalidArgument`
@@ -1161,67 +1207,7 @@ fn moved_pin_anchors(
 /// Roots under which KiCAD ships its bundled libraries — the directory that
 /// directly contains `symbols/`, `footprints/` and `3dmodels/`.
 fn kicad_share_roots() -> Vec<std::path::PathBuf> {
-    let mut roots: Vec<std::path::PathBuf> = Vec::new();
-
-    #[cfg(target_os = "windows")]
-    {
-        // Keep these majors in step with the ones find_kicad_library_dirs
-        // reads environment variables for. A major listed there but missing
-        // here is invisible on any machine where KiCad did not export its
-        // variable — which is every machine where Konnect was not launched
-        // by KiCad.
-        for c in [
-            r"C:\KiCad\10.0\share\kicad",
-            r"C:\Program Files\KiCad\10.0\share\kicad",
-            r"C:\KiCad\9.0\share\kicad",
-            r"C:\Program Files\KiCad\9.0\share\kicad",
-            r"C:\KiCad\8.0\share\kicad",
-            r"C:\Program Files\KiCad\8.0\share\kicad",
-        ] {
-            roots.push(std::path::PathBuf::from(c));
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // KiCad on macOS ships its libraries inside the app bundle.
-        roots.push(std::path::PathBuf::from(
-            "/Applications/KiCad/KiCad.app/Contents/SharedSupport",
-        ));
-        roots.push(std::path::PathBuf::from("/usr/local/share/kicad"));
-        // Homebrew (Apple Silicon prefix)
-        roots.push(std::path::PathBuf::from("/opt/homebrew/share/kicad"));
-        if let Ok(home) = std::env::var("HOME") {
-            // Per-user install (KiCad.app dragged into ~/Applications)
-            roots.push(
-                std::path::PathBuf::from(home)
-                    .join("Applications/KiCad/KiCad.app/Contents/SharedSupport"),
-            );
-        }
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        roots.push(std::path::PathBuf::from("/usr/share/kicad"));
-        roots.push(std::path::PathBuf::from("/usr/local/share/kicad"));
-        roots.push(std::path::PathBuf::from("/opt/kicad/share/kicad"));
-        // Flatpak: system-wide and per-user installs
-        roots.push(std::path::PathBuf::from(
-            "/var/lib/flatpak/app/org.kicad.KiCad/current/active/files/share/kicad",
-        ));
-        if let Ok(home) = std::env::var("HOME") {
-            roots.push(
-                std::path::PathBuf::from(&home).join(
-                    ".local/share/flatpak/app/org.kicad.KiCad/current/active/files/share/kicad",
-                ),
-            );
-        }
-        // Snap
-        roots.push(std::path::PathBuf::from(
-            "/snap/kicad/current/usr/share/kicad",
-        ));
-    }
-
-    roots.retain(|p| p.is_dir());
-    roots
+    crate::kicad_install::share_roots()
 }
 
 /// Find directories holding a bundled KiCAD library kind — `"symbols"`,
