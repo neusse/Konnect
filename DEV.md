@@ -94,13 +94,13 @@ Konnect/
 │   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
 │   │           ├── pcb_components.rs # 19 tools (IPC real-time + safe headless single-placement fallback)
 │   │           ├── pcb_footprint_update.rs # library refresh planner + one-commit IPC apply
-│   │           ├── pcb_routing.rs    # 12 tools (traces, vias, nets, netclasses)
-│   │           ├── pcb_export.rs     # 13 tools (Gerber, PDF, 3D, DRC, DXF/GenCAD/IPC-2581/ODB++)
+│   │           ├── pcb_routing.rs    # 15 tools (traces, vias, nets, netclasses, SES import)
+│   │           ├── pcb_export.rs     # 14 tools (Gerber, PDF, 3D, Specctra DSN, DRC, DXF/GenCAD/IPC-2581/ODB++)
 │   │           ├── library.rs        # 17 tools (symbol/footprint library management)
 │   │           ├── footprint_graphics.rs # footprint primitive validation, inspection, and atomic edits
 │   │           ├── footprint_metadata.rs # footprint description, tags, and attribute edits
 │   │           ├── footprint_models.rs # footprint 3D model validation and atomic edits
-│   │           ├── integration.rs    # 8 tools (JLCPCB SQLite, Freerouting discovery, datasheets)
+│   │           ├── integration.rs    # 9 tools (JLCPCB SQLite, Freerouting MCP, datasheets)
 │   │           ├── verification.rs   # 10 tools (DRC, design rules, KiCAD UI)
 │   │           ├── config.rs         # 7 tools (user/project config, design rules)
 │   │           ├── design_review.rs  # 6 tools (decoupling/connection/power/DFM audits)
@@ -146,6 +146,7 @@ Konnect/
 ├── plugin/                           # Python thin launcher (runs inside KiCAD)
 │   ├── __init__.py                   # pcbnew.ActionPlugin — settings dialog (PCB Editor only)
 │   ├── settings_dialog.py            # wxPython settings UI (paths, server control)
+│   ├── native_bridge.py              # authenticated KiCad 10 native Specctra export bridge
 │   └── plugin.json                   # KiCAD 10 IPC plugin manifest
 │
 ├── packaging/
@@ -218,8 +219,15 @@ transaction abandon` escape hatch documented in
 
 ### Plugin Installation
 - **PCM zip** is the correct install method
-- KiCAD installs to: `C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_mixelpixx_konnect\`
+- KiCad installs to: `C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_mixelpixx_konnect\`
 - Both `__init__.py` (SWIG ActionPlugin for PCB editor settings dialog) and `plugin.json` (IPC exec plugin) are included
+- `native_bridge.py` is a KiCad-10-only, opt-in compatibility bridge. It exposes
+  only authenticated status and native Specctra export over an ephemeral
+  loopback port. The caller cannot choose an output path; the plugin owns and
+  removes the temporary artifact. Do not grow it into a general Python RPC
+  surface or use it as the KiCad 11 architecture. The Rust exporter remains
+  the default; callers must explicitly choose `prefer` or `require` to use this
+  compatibility path.
 
 ## Structured Errors
 
@@ -303,7 +311,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 217 tools (223 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 221 tools (227 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is 20 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -378,11 +386,13 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **20 toolsets, 217 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- **20 toolsets, 221 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - Baseline `tools/list`: 20 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 223 tools (217 registered + 6 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 227 tools (221 registered + 6 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
-- **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands. Konnect
-  therefore does not advertise autorouting until it has a real editor bridge; the
-  `check_freerouting` diagnostic still discovers PCM installations and Java.
+- **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands.
+  `export_specctra_dsn` creates a revision-bound routing job from the live
+  editor, `route_specctra_dsn` delegates the route to Freerouting's local native
+  MCP server, and `plan_specctra_ses_import` / `apply_specctra_ses` validate and
+  return the result through one KiCad undo transaction.

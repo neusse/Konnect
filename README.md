@@ -13,7 +13,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**217 tools across 20 on-demand toolsets.** Schematic capture, PCB layout and
+**221 tools across 20 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, reference
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
@@ -70,7 +70,7 @@ through its own S-expression engine with atomic writes (write, fsync, rename), U
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
-**Context economy is a feature.** Exposing all 217 tools to an LLM costs roughly 23K
+**Context economy is a feature.** Exposing all 221 tools to an LLM costs roughly 23K
 tokens of context on every listing. Konnect's router loads a starter kit (~2K
 tokens) and lets the model pull in toolsets on demand — plus built-in observability
 (`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
@@ -105,7 +105,8 @@ The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 | Layer | Mechanism |
 |-------|-----------|
 | Schematic editing | Direct `.kicad_sch` S-expression editing with atomic writes (no KiCAD required) |
-| PCB editing | KiCAD 10 IPC API (NNG + protobuf) — real-time and undo-aware; single-footprint placement has a safe headless fallback |
+| PCB editing | KiCad 10 IPC API (NNG + protobuf) — real-time and undo-aware; single-footprint placement has a safe headless fallback |
+| Specctra routing | Revision-bound Rust DSN export, local Freerouting MCP routing, and strict one-transaction SES import; an authenticated KiCad 10 native-export bridge is explicit opt-in |
 | Exports & checks | `kicad-cli` subprocess (Gerber, PDF, ERC, DRC, …) |
 | Transport | MCP JSON-RPC over stdio (default), or Streamable HTTP (`transport = "http"` / `"both"`) |
 
@@ -125,6 +126,24 @@ The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 
 Verify: open the **PCB Editor** → **Tools → External Plugins** → you should see
 **Konnect**.
+
+For KiCad 10, the Konnect settings dialog also offers an optional **native
+Specctra bridge**. When enabled, `export_specctra_dsn` can ask the active PCB
+Editor to generate its native DSN while Konnect still binds the export to the
+exact IPC snapshot and creates the strict reverse manifest used during SES
+import. The bridge is local-only, authenticated, disabled by default, and not
+the KiCad 11 integration path. Konnect uses its Rust exporter by default;
+`native_bridge_mode: "prefer"` enables fallback to Rust when the bridge is
+unavailable, while `"require"` refuses instead.
+
+For end-to-end autorouting, run `check_freerouting`, then
+`export_specctra_dsn` → `route_specctra_dsn` →
+`plan_specctra_ses_import` / `apply_specctra_ses`. Readiness reports engine
+discovery, native-MCP compatibility, and complete bridge availability
+separately. The owned Java child is loopback-only and is reaped on success,
+failure, timeout, or cancellation. The first supported profile preserves fixed
+straight tracks and through vias; unlocked routing, arcs, zones, and unsupported
+geometry are rejected before mutation.
 
 ### Build from source
 

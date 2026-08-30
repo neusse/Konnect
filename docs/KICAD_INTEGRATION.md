@@ -60,10 +60,31 @@ schematic parity. `verification.rs`, `pcb_export.rs`, `design_review.rs`, and
 `manufacturing.rs` consume that complete result; unavailable categories or a
 failed CLI run cannot be treated as a clean board.
 
-Freerouting remains usable through its KiCad ActionPlugin, but Konnect does not
-currently have a safe DSN/SES bridge. The `autoroute` behavior in
-`tools/integration.rs` reports that limitation instead of claiming KiCad removed
-CLI commands that never existed.
+Konnect's Freerouting bridge keeps the KiCad and routing responsibilities
+separate: `export_specctra_dsn` snapshots the live board and writes a
+revision-bound DSN job, `route_specctra_dsn` drives the discovered local JAR
+through Freerouting's native headless MCP server, and
+`plan_specctra_ses_import` / `apply_specctra_ses` validate and apply the result
+through one KiCad undo transaction. Board data stays local, output files are
+created without replacement, and the Freerouting child process is bounded and
+owned by Konnect.
+
+On KiCad 10, `export_specctra_dsn` can optionally use the legacy Python
+ActionPlugin as a deliberately narrow native-export bridge. The plugin calls
+KiCad's own `pcbnew.ExportSpecctraDSN` on the UI thread and returns a
+plugin-owned temporary file over an authenticated loopback endpoint. Rust
+still captures the immutable IPC snapshot, rejects a board revision change,
+checks that the native DSN has the same components, pads, nets, layers, and
+routing rules, and writes the revision-bound reverse manifest. The temporary
+file is consumed and deleted.
+
+The `native_bridge_mode` tool argument controls selection: `prefer` (the default)
+uses a running bridge and otherwise falls back to the Rust DSN exporter,
+`require` fails if native export cannot be used, and `disable` uses Rust only.
+Native export is disabled in the plugin settings by default. This bridge is a
+KiCad 10 compatibility path, not a substitute for the executable IPC plugin or
+the KiCad 11 architecture; strict SES planning and atomic IPC apply never pass
+through Python.
 
 ## Configuration
 
@@ -82,8 +103,9 @@ CLI commands that never existed.
 
 ## Plugin, Viewer, And Packaging
 
-`plugin` is a thin Python KiCad integration layer that launches/configures the
-Rust server included in a PCM bundle. The standalone viewer in
+`plugin` contains the legacy KiCad 10 Python ActionPlugin for settings/server
+control and the optional native Specctra bridge. `plugin.json` declares the
+separate executable IPC integration that is the forward path. The standalone viewer in
 `crates/schematic-viewer` watches schematic files and renders through
 `kicad-cli`; it is built and tested separately from the Rust workspace.
 

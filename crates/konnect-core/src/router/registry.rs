@@ -80,9 +80,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_routing",
-        description: "Traces, vias, copper pours, net classes, differential pairs",
+        description: "Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import",
         category: "pcb",
-        tool_count: 13,
+        tool_count: 15,
     },
     ToolsetMeta {
         name: "placement",
@@ -92,9 +92,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_export",
-        description: "Gerber, PDF, SVG, 3D model, BOM, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++",
+        description: "Gerber, PDF, SVG, 3D model, BOM, Specctra DSN, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++",
         category: "pcb",
-        tool_count: 13,
+        tool_count: 14,
     },
     ToolsetMeta {
         name: "library",
@@ -104,9 +104,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "integration",
-        description: "JLCPCB parts database, Freerouting installation discovery, datasheet URLs",
+        description: "JLCPCB parts database, local Freerouting MCP routing, datasheet URLs",
         category: "integration",
-        tool_count: 8,
+        tool_count: 9,
     },
     ToolsetMeta {
         name: "verification",
