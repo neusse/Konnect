@@ -13,13 +13,13 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **20 toolsets** organized into 10 categories
-- **221 registered tools** + **6 always-visible meta-tools** = **227 total**
+- **221 registered tools** + **7 always-visible meta-tools** = **228 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
 ## Meta-tools (always visible)
 
-Six tools, grouped into *discovery/routing* and *observability*.
+Seven tools, grouped into *discovery/routing*, *observability*, and *runtime diagnostics*.
 
 ### Discovery / routing
 
@@ -37,6 +37,12 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_recent_calls` | Last N tool calls (newest first) — `call_id`, tool, toolset, duration, status (ok/error/not_found), `error_kind`. The LLM's debug log. Default limit 20, max 100. |
 | `server_stats` | Uptime, total/error call counts, per-tool totals + errors, and the JSONL log path. |
 
+### Runtime diagnostics
+
+| Tool | Purpose |
+|------|---------|
+| `get_installation_info` | Report the serving build version and commit, executable path, verified install source, on-disk binary version, KiCad CLI version, redacted IPC endpoint, proven stale-process evidence, and platform-specific restart guidance. |
+
 ---
 
 ## Project
@@ -50,7 +56,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `create_project` | Create a new KiCAD project at the given path. Creates the directory, a blank `.kicad_pro`, empty `.kicad_sch`, and blank `.kicad_pcb`; refuses to replace any existing project file. |
 | `open_project` | List PCB documents open in the running KiCad UI and optionally check a specific `.kicad_pro` or `.kicad_pcb` path over IPC. |
 | `save_project` | Save the currently open PCB board file via KiCAD IPC. Requires KiCAD to be running with IPC enabled. |
-| `get_project_info` | Read project metadata from a `.kicad_pro` file. Returns name, schematic/PCB paths, last-modified times. |
+| `get_project_info` | Read project metadata from a `.kicad_pro` file. Returns name, schematic/PCB paths, last-modified time, project-file format version, and the generator versions recorded by the sibling design files. |
 | `rename_project` | Rename the `.kicad_pro`/`.kicad_sch`/`.kicad_pcb`/`.kicad_prl` files *and* the internal references that carry the old name. Renaming the files alone makes KiCad treat the design as unannotated, losing every reference designator, because each symbol instance stores `(project "name")`. Supports `dry_run`. |
 | `snapshot_project` | Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. Useful before major edits. |
 | `open_schematic_viewer` | Launch the live schematic viewer (SVG with auto-refresh on file change). Use after placing components so the user can see changes in real time. |
@@ -67,7 +73,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 |------|-------------|
 | `create_schematic` | Create a new blank `.kicad_sch` schematic file, on A4 unless another paper size is given. Use `set_schematic_page` to change it later. |
 | `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
-| `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid. |
+| `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid, preserves every saved hierarchy instance, and reports committed-file readback. Refuses stale instance metadata before writing. |
 | `delete_schematic_component` | Remove a component and all of its placed units by reference designator. |
 | `edit_schematic_component` | Update shared fields consistently across every placed unit of a component. |
 | `get_schematic_component` | Get shared properties and every placed unit's position for a component. |
@@ -102,7 +108,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `rotate_schematic_label` | Rotate a net label to a new angle and update its justify direction. |
 | `move_labels_by_offset` | Move all labels matching a net name by a given X/Y offset. |
 | `batch_rotate_labels` | Rotate multiple labels by net name in a single file read/write cycle. |
-| `add_power_symbol` | Add a power symbol (VCC, GND, etc.). Auto-numbers the internal `#PWR` reference to the lowest number free on the sheet. |
+| `add_power_symbol` | Add a power symbol (VCC, GND, etc.). Auto-numbers the internal `#PWR` reference to the lowest number free on the sheet. Preserves every saved hierarchy instance and reports committed-file readback; refuses stale instance metadata before writing. |
 | `add_no_connect` | Add a no-connect flag (X marker) to an unconnected pin endpoint. |
 | `delete_no_connect` | Remove a no-connect flag at a given position. |
 | `batch_delete_no_connect` | Delete multiple no-connect flags in a single file read/write cycle. |
@@ -162,7 +168,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_schematic_layout` | Return component positions and transformed drawing/pin bounds (excluding free text), reporting unresolved geometry; optionally include wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
-| `batch_place_components` | Place multiple symbols from KiCAD libraries in a single file read/write cycle. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
+| `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Preserves every saved hierarchy instance and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. |
 
 ### `sch_export` · 10 tools
@@ -263,7 +269,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `plan_specctra_ses_import` | Strictly validate a Freerouting SES against its revision-bound manifest and the exact live board, returning every planned route item and the preserved locked-track/via inventory without mutation. |
 | `apply_specctra_ses` | Preserve the manifest-bound locked straight tracks and through vias, apply a validated SES through KiCad IPC as one undo transaction, verify post-commit IPC read-back, create a separate candidate board, and report direct KiCad DRC evidence (including whether it is clean). |
 | `add_copper_pour` | Alias of `add_zone`, kept for compatibility: same arguments, same defaults, same IPC-first behaviour. (Its `min_width` default was 0.25 and is now 0.2, matching `add_zone` and KiCad.) |
-| `delete_trace` | Delete a trace segment identified by its UUID via KiCAD IPC. |
+| `delete_trace` | Delete one observed trace segment by UUID via KiCad IPC. Refuses non-trace or stale UUIDs before deletion, targets the requested board, and reports the observed preimage only after readback proves the segment is absent. |
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
 | `modify_trace` | Modify a trace segment by deleting and re-adding it with new parameters. |
@@ -409,12 +415,12 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `audit_decoupling` | Audit schematic connectivity between IC power nets and decoupling capacitors; does not measure PCB placement distance. |
-| `audit_connections` | Check for common connection mistakes: missing pull-ups on I2C/reset, missing series resistors on LEDs, floating inputs, shorted outputs. |
-| `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. |
+| `audit_decoupling` | Audit schematic connectivity between IC power nets and decoupling capacitors; does not measure PCB placement distance. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_connections` | Check for common connection mistakes: missing pull-ups on I2C/reset, missing series resistors on LEDs, floating inputs, shorted outputs. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
 | `audit_manufacturing` | DFM checks for the configured fab house: component spacing, silkscreen overlap, via-in-pad, acid traps, board-outline issues. |
 | `run_design_review` | Run all available audit checks across every reachable schematic sheet and produce a consolidated report with status, coverage, and diagnostics. Returns `INCOMPLETE` rather than approval when coverage is partial or failed. |
-| `check_bom_health` | Analyze the BOM for supply-chain risks: parts with no MPN, lifecycle warnings, low stock, unavailable from preferred distributors. |
+| `check_bom_health` | Analyze the BOM for supply-chain risks: parts with no MPN, lifecycle warnings, low stock, unavailable from preferred distributors. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
 
 ---
 

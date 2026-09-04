@@ -1157,46 +1157,34 @@ fn global_sym_lib_table() -> PathBuf {
     super::kicad_config_dir().join("sym-lib-table")
 }
 
-/// Directory of the nearest ancestor of `file` that holds a `.kicad_pro`,
-/// falling back to the file's own directory when it belongs to no project — a
-/// loose schematic keeps resolving against the tables beside it.
+/// Directory of the structurally proven project that owns `file`, falling back
+/// to the file's own directory when it belongs to no project — a loose
+/// schematic keeps resolving against the tables beside it.
 ///
 /// The project file is found by scanning for the extension rather than by name:
 /// a sheet's filename says nothing about what the project is called.
 ///
-/// A library table sitting beside `file` ends the search before it starts. The
-/// ancestor walk is unbounded, so without that it can leave the file's own
-/// directory and latch onto an unrelated `.kicad_pro` further up — a project
-/// nested inside another project's folder, or a stray file in a shared parent —
-/// and then resolve every library against the wrong `KIPRJMOD`. A directory
-/// carrying its own `sym-lib-table` or `fp-lib-table` is stating where its
-/// libraries come from, and that is the more specific answer.
-pub(crate) fn project_root_for(file: &Path) -> Option<PathBuf> {
-    let start = file.parent()?;
+/// A library table sitting beside `file` is the most specific answer. An
+/// ancestor project is accepted only when its parsed root schematic reaches
+/// this file. Unproven or multiple owners produce the existing structured
+/// conflict, naming the schematic directory and all candidate roots (#189).
+pub(crate) fn project_root_for(
+    file: &Path,
+) -> Result<Option<PathBuf>, crate::tools::SchematicTargetError> {
+    let Some(start) = file.parent() else {
+        return Ok(None);
+    };
     if holds_lib_table(start) {
-        return Some(start.to_path_buf());
+        return Ok(Some(start.to_path_buf()));
     }
-    start
-        .ancestors()
-        .find(|dir| holds_kicad_pro(dir))
-        .map(Path::to_path_buf)
-        .or_else(|| Some(start.to_path_buf()))
+    Ok(crate::tools::resolve_schematic_ownership(file)?
+        .and_then(|ownership| ownership.project_file.parent().map(Path::to_path_buf))
+        .or_else(|| Some(start.to_path_buf())))
 }
 
 /// Whether `dir` carries a library table of its own.
 fn holds_lib_table(dir: &Path) -> bool {
     dir.join("sym-lib-table").is_file() || dir.join("fp-lib-table").is_file()
-}
-
-/// Whether `dir` contains a `.kicad_pro`. An unreadable directory holds none.
-fn holds_kicad_pro(dir: &Path) -> bool {
-    std::fs::read_dir(dir).is_ok_and(|entries| {
-        entries.flatten().any(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("kicad_pro"))
-        })
-    })
 }
 
 /// Symbol libraries resolved as KiCad does: project `sym-lib-table` (shadowing
@@ -1228,8 +1216,8 @@ impl KiCadSymbolSource {
     /// hierarchical sheet under `<proj>/sheets/` therefore still resolves
     /// against `<proj>/sym-lib-table`: KiCad anchors `KIPRJMOD` at the project,
     /// not at the sheet.
-    pub(crate) fn for_file(file: &Path) -> Self {
-        Self::new(project_root_for(file))
+    pub(crate) fn for_file(file: &Path) -> Result<Self, crate::tools::SchematicTargetError> {
+        Ok(Self::new(project_root_for(file)?))
     }
 
     /// Project entries first so they shadow same-nickname global ones.
@@ -7293,19 +7281,16 @@ mod symbol_source_tests {
         let proj = tempfile::tempdir().unwrap();
         let file = proj.path().join("parts.kicad_sym");
         std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
-        std::fs::write(proj.path().join("board.kicad_pro"), "{}\n").unwrap();
+        let (_, child) = crate::tools::schematic_target_tests::native_deep_project(proj.path());
         std::fs::write(
             proj.path().join("sym-lib-table"),
             "(sym_lib_table\n  (version 7)\n  (lib (name \"MyLib\") (type \"KiCad\") (uri \"${KIPRJMOD}/parts.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
         )
         .unwrap();
 
-        let sheets = proj.path().join("sheets");
-        std::fs::create_dir_all(&sheets).unwrap();
-        let child = sheets.join("child.kicad_sch");
-        std::fs::write(&child, "(kicad_sch)\n").unwrap();
-
-        let candidates = KiCadSymbolSource::for_file(&child).candidates("MyLib");
+        let candidates = KiCadSymbolSource::for_file(&child)
+            .unwrap()
+            .candidates("MyLib");
         assert!(
             candidates.contains(&file),
             "a sub-sheet must see the project table at the root, got {candidates:?}"
@@ -7327,7 +7312,9 @@ mod symbol_source_tests {
         let sch = dir.path().join("loose.kicad_sch");
         std::fs::write(&sch, "(kicad_sch)\n").unwrap();
 
-        let candidates = KiCadSymbolSource::for_file(&sch).candidates("Loose");
+        let candidates = KiCadSymbolSource::for_file(&sch)
+            .unwrap()
+            .candidates("Loose");
         assert!(
             candidates.contains(&file),
             "a projectless schematic must still use the table beside it, got {candidates:?}"
@@ -7366,7 +7353,9 @@ mod symbol_source_tests {
         let sch = inner.join("nested.kicad_sch");
         std::fs::write(&sch, "(kicad_sch)\n").unwrap();
 
-        let candidates = KiCadSymbolSource::for_file(&sch).candidates("Shared");
+        let candidates = KiCadSymbolSource::for_file(&sch)
+            .unwrap()
+            .candidates("Shared");
         assert!(
             candidates.contains(&want),
             "the table beside the schematic must win, got {candidates:?}"
@@ -7383,7 +7372,7 @@ mod symbol_source_tests {
     #[test]
     fn a_bare_relative_schematic_keeps_an_empty_project_dir() {
         assert_eq!(
-            project_root_for(Path::new("board.kicad_sch")),
+            project_root_for(Path::new("board.kicad_sch")).unwrap(),
             Some(PathBuf::new())
         );
     }

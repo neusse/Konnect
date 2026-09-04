@@ -2154,7 +2154,7 @@ mod layers_block_tests {
 /// given IPC address, and a mock KiCad that answers `GetOpenDocuments` with
 /// one board and delegates every other command to the test.
 #[cfg(test)]
-mod board_mock {
+pub(crate) mod board_mock {
     use crate::router::ToolRouter;
     use crate::tools::{ServerConfig, ToolContext};
     use konnect_ipc::gen::kiapi;
@@ -2244,7 +2244,7 @@ mod board_mock {
 
 #[cfg(test)]
 mod board_session_safety_tests {
-    use super::board_mock::ctx_talking_to;
+    use super::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
     use super::*;
     use konnect_ipc::gen::kiapi;
     use prost::Message;
@@ -2341,6 +2341,77 @@ mod board_session_safety_tests {
             .unwrap();
 
         assert!(matches!(outcome, BoardWrite::File));
+    }
+
+    #[tokio::test]
+    async fn file_only_guard_refuses_the_exact_open_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let before = std::fs::read(&board).unwrap();
+        let ctx = ctx_talking_to(spawn_kicad_holding_board(&board, |_| None));
+
+        let result = refuse_if_board_open_in_kicad(&ctx, &board, "test edit")
+            .await
+            .unwrap()
+            .expect("the exact open board must refuse file mutation");
+
+        assert!(result.is_error);
+        let text = super::mounting_hole_tests::result_text(&result);
+        assert!(text.contains("test edit"), "{text}");
+        assert!(text.contains("currently holds this board open"), "{text}");
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn file_only_guard_allows_a_different_open_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let requested = super::mounting_hole_tests::blank_board(dir.path());
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&other, "").unwrap();
+        let ctx = ctx_talking_to(spawn_kicad_holding_board(&other, |_| None));
+
+        let result = refuse_if_board_open_in_kicad(&ctx, &requested, "test edit")
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "an unrelated open board must not block the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_only_guard_allows_an_unseen_board_when_ipc_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let ctx = ctx_talking_to(String::new());
+
+        let result = refuse_if_board_open_in_kicad(&ctx, &board, "test edit")
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn file_only_guard_matches_an_equivalent_board_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let equivalent = board
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(board.file_name().unwrap());
+        let ctx = ctx_talking_to(spawn_kicad_holding_board(&board, |_| None));
+
+        let result = refuse_if_board_open_in_kicad(&ctx, &equivalent, "test edit")
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_some(),
+            "equivalent path spelling must identify the open board"
+        );
     }
 
     #[tokio::test]

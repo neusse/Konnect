@@ -4,7 +4,7 @@
 //! round-trip parsing.  Pin coordinate math still delegates to
 //! `konnect_sexp::geometry::transform_pin`.
 
-use crate::mcp::protocol::CallToolResult;
+use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{
     find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, reembed_lib_symbols,
@@ -14,15 +14,19 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     commit_command,
     geometry::snap_point,
-    parse_sexp,
+    parse_sexp, prepare_command,
     schematic::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
         pin_outward_direction, read_schematic,
     },
-    writer::{apply_edits, read_consistent, write_atomic_if_unchanged, write_new_atomic, SexpEdit},
-    ItemId, SchematicCommand,
+    writer::{
+        apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged,
+        write_new_atomic, SexpEdit,
+    },
+    ItemAnchor, ItemId, SchematicCommand, SexpError,
 };
 use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -81,7 +85,9 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "add_schematic_component",
             "Add a symbol from a KiCAD library to the schematic. The symbol is snapped \
-             to the 1.27mm schematic grid. Specify position in schematic mm coordinates.",
+             to the 1.27mm schematic grid. Preserves every saved hierarchy instance, reports \
+             committed-file readback, and refuses stale instance metadata before writing. \
+             Specify position in schematic mm coordinates.",
             json!({
                 "type": "object",
                 "properties": {
@@ -545,14 +551,22 @@ async fn handle_add_schematic_component(
     // whose path doesn't resolve. On a child sheet both differ from this
     // file's own stem and uuid, which is what left hierarchical designs
     // unannotated (#204).
-    let context = crate::tools::sheet_instance_context(&sch_path, &mut sch);
-    let instance_path = context.instance_path.clone();
-    let project_name = context.project_name.clone();
+    let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
+        Ok(context) => context,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    if let Err(error) = crate::tools::validate_sheet_instance_state(&sch_path, &sch, &context) {
+        return Ok(error.into_tool_result());
+    }
+    let source = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
 
-    let result = match place_one_component(
+    let uuid = match place_one_component(
         &mut sch,
-        &instance_path,
-        &project_name,
+        &context.instance_paths,
+        &context.project_name,
         &lib_id,
         x,
         y,
@@ -560,9 +574,9 @@ async fn handle_add_schematic_component(
         ref_str,
         value,
         unit,
-        &crate::tools::library::KiCadSymbolSource::for_file(&sch_path),
+        &source,
     ) {
-        Ok(v) => v,
+        Ok(uuid) => uuid,
         Err(e) => return Ok(e),
     };
 
@@ -572,8 +586,12 @@ async fn handle_add_schematic_component(
     // KiCad's netlister treats it as unconnected. Runs after the write because
     // it re-reads the saved file; `place_one_component` stays pure so the batch
     // path can do one junction pass for the whole batch instead of one per part.
-    let mut result = result;
     let junctions = crate::tools::add_pin_midwire_junctions(&sch_path, ref_str)?;
+    let committed = cse::Schematic::load(&sch_path)?;
+    let mut result = match placed_component_readback(&sch_path, &committed, &uuid, &context) {
+        Ok(result) => result,
+        Err(error) => return Ok(error),
+    };
     result["junctions_added"] = json!(junctions
         .iter()
         .map(|(x, y)| json!({ "x": x, "y": y }))
@@ -588,7 +606,7 @@ async fn handle_add_schematic_component(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn place_one_component(
     sch: &mut cse::Schematic,
-    instance_path: &str,
+    instance_paths: &[String],
     project_name: &str,
     lib_id: &str,
     x: f64,
@@ -598,7 +616,7 @@ pub(crate) fn place_one_component(
     value: Option<&str>,
     unit: u32,
     src: &dyn cse::library::SymbolLibrarySource,
-) -> Result<serde_json::Value, CallToolResult> {
+) -> Result<String, CallToolResult> {
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
     let val_str = value.unwrap_or(lib_id.split(':').next_back().unwrap_or("?"));
@@ -689,18 +707,88 @@ pub(crate) fn place_one_component(
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
-    sym.set_instance_path(project_name, instance_path, reference, unit);
+    for instance_path in instance_paths {
+        sym.set_instance_path(project_name, instance_path, reference, unit);
+    }
 
     let uuid = sym.uuid.clone();
     sch.add_symbol(sym);
 
+    Ok(uuid)
+}
+
+/// Build a placement response only from the committed schematic that was read
+/// back after the write. The UUID is the mutation's stable identity; requested
+/// coordinates, fields, and hierarchy paths are never echoed as proof.
+pub(crate) fn placed_component_readback(
+    sch_path: &std::path::Path,
+    committed: &cse::Schematic,
+    uuid: &str,
+    context: &crate::tools::SheetInstanceContext,
+) -> Result<serde_json::Value, CallToolResult> {
+    if !super::same_schematic_document(sch_path, committed.filepath()) {
+        return Err(crate::tools::SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: "placement readback came from a different schematic".to_string(),
+        }
+        .into_tool_result());
+    }
+    if let Err(error) = crate::tools::validate_sheet_instance_state(sch_path, committed, context) {
+        return Err(error.into_tool_result());
+    }
+    let Some(symbol) = committed.symbols.iter().find(|symbol| symbol.uuid == uuid) else {
+        return Err(crate::tools::SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!("placed symbol UUID '{uuid}' is absent from post-write readback"),
+        }
+        .into_tool_result());
+    };
+    let Some(reference) = symbol.reference() else {
+        return Err(crate::tools::SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!(
+                "placed symbol UUID '{}' has no Reference in post-write readback",
+                symbol.uuid
+            ),
+        }
+        .into_tool_result());
+    };
+    let Some(value) = symbol.value_str() else {
+        return Err(crate::tools::SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!(
+                "placed symbol UUID '{}' has no Value in post-write readback",
+                symbol.uuid
+            ),
+        }
+        .into_tool_result());
+    };
+    let observed_instances = symbol.instance_paths();
+    let Some((project, _)) = observed_instances.first() else {
+        return Err(crate::tools::SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!("placed symbol UUID '{uuid}' has no project in post-write readback"),
+        }
+        .into_tool_result());
+    };
+    let mut instance_paths = observed_instances
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
+    instance_paths.sort();
+
     Ok(json!({
-        "added": lib_id,
+        "schematic": committed.filepath().display().to_string(),
+        "added": symbol.lib_id,
         "reference": reference,
-        "value": val_str,
-        "x": x, "y": y,
-        "unit": unit,
-        "uuid": uuid
+        "value": value,
+        "x": symbol.at.x,
+        "y": symbol.at.y,
+        "rotation": symbol.at.rotation.unwrap_or(0.0),
+        "unit": symbol.unit,
+        "uuid": symbol.uuid,
+        "project": project,
+        "instance_paths": instance_paths
     }))
 }
 
@@ -714,24 +802,521 @@ async fn handle_delete_schematic_component(
         Err(e) => return Ok(e),
     };
 
-    let mut sch = cse::Schematic::load(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let plan = match plan_component_deletion(&sch_path, &content, &reference) {
+        Ok(plan) => plan,
+        Err(error) => return Ok(error.into_result()),
+    };
+    let outcome = match commit_component_deletion(&sch_path, plan)? {
+        Ok(outcome) => outcome,
+        Err(refusal) => return Ok(refusal),
+    };
+    let unit_uuids = outcome
+        .units_by_reference
+        .get(&reference)
+        .cloned()
+        .unwrap_or_default();
 
-    let before = sch.symbols.len();
-    sch.symbols
-        .retain(|symbol| symbol.reference() != Some(reference.as_str()));
-    let deleted_units = before - sch.symbols.len();
-    if deleted_units == 0 {
-        Ok(CallToolResult::error(format!(
-            "Component '{}' not found in schematic",
-            reference
-        )))
-    } else {
-        sch.overwrite()?;
-        Ok(CallToolResult::json(&json!({
-            "deleted": reference,
-            "deleted_units": deleted_units
-        })))
+    Ok(CallToolResult::json(&json!({
+        "deleted": reference,
+        "deleted_units": unit_uuids.len(),
+        "deleted_unit_uuids": unit_uuids,
+        "removed_no_connects_count": outcome.marker_uuids.len(),
+        "removed_no_connect_uuids": outcome.marker_uuids,
+        "junctions_added_count": outcome.added_junctions.len(),
+        "junctions_added_uuids": outcome.added_junctions,
+        "junctions_pruned_count": outcome.pruned_junctions.len(),
+        "junctions_pruned_uuids": outcome.pruned_junctions
+    })))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct IndexedSchematicItem {
+    pub(crate) kind: String,
+    source: String,
+}
+
+pub(crate) struct ComponentDeletePlan {
+    command: SchematicCommand,
+    before_items: BTreeMap<String, IndexedSchematicItem>,
+    unit_uuids: Vec<String>,
+    units_by_reference: BTreeMap<String, Vec<String>>,
+    marker_uuids: Vec<String>,
+    item_uuids: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ComponentDeleteOutcome {
+    pub(crate) units_by_reference: BTreeMap<String, Vec<String>>,
+    pub(crate) marker_uuids: Vec<String>,
+    pub(crate) item_uuids: Vec<String>,
+    pub(crate) added_junctions: Vec<String>,
+    pub(crate) pruned_junctions: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ComponentDeleteTargetError {
+    Ambiguous {
+        target: String,
+        candidates: Vec<String>,
+    },
+    Stale {
+        target: String,
+        reason: String,
+    },
+}
+
+impl ComponentDeleteTargetError {
+    fn stale(path: &std::path::Path, reason: impl Into<String>) -> Self {
+        Self::Stale {
+            target: path.display().to_string(),
+            reason: reason.into(),
+        }
     }
+
+    fn from_sexp(path: &std::path::Path, error: SexpError) -> Self {
+        Self::stale(path, error.to_string())
+    }
+
+    pub(crate) fn into_result(self) -> CallToolResult {
+        match self {
+            Self::Ambiguous { target, candidates } => {
+                let reason = format!(
+                    "more than one schematic item identifies the target: {}",
+                    candidates.join(", ")
+                );
+                CallToolResult::error_kind(
+                    ToolErrorKind::StaleTarget {
+                        target: target.clone(),
+                        reason: reason.clone(),
+                    },
+                    format!("cannot safely delete from {target}: {reason}"),
+                )
+            }
+            Self::Stale { target, reason } => CallToolResult::error_kind(
+                ToolErrorKind::StaleTarget {
+                    target: target.clone(),
+                    reason: reason.clone(),
+                },
+                format!("cannot safely delete from {target}: {reason}"),
+            ),
+        }
+    }
+}
+
+pub(crate) fn indexed_uuid_items(
+    path: &std::path::Path,
+    content: &str,
+) -> Result<BTreeMap<String, IndexedSchematicItem>, ComponentDeleteTargetError> {
+    let ranges = find_direct_child_blocks(content, "kicad_sch");
+    if ranges.is_empty() {
+        return Err(ComponentDeleteTargetError::stale(
+            path,
+            "the kicad_sch root is missing or malformed",
+        ));
+    }
+    let mut items = BTreeMap::new();
+    for (start, end) in ranges {
+        let node = parse_sexp(&content[start..end])
+            .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
+        let Some(uuid) = node.find_str("uuid") else {
+            continue;
+        };
+        let item = IndexedSchematicItem {
+            kind: node.head().unwrap_or("unknown").to_owned(),
+            source: content[start..end].to_owned(),
+        };
+        if let Some(previous) = items.insert(uuid.to_owned(), item) {
+            return Err(ComponentDeleteTargetError::Ambiguous {
+                target: format!("schematic UUID {uuid}"),
+                candidates: vec![previous.kind, node.head().unwrap_or("unknown").to_owned()],
+            });
+        }
+    }
+    Ok(items)
+}
+
+fn dedup_points(points: impl IntoIterator<Item = (f64, f64)>) -> Vec<(f64, f64)> {
+    let mut unique = Vec::new();
+    for point in points {
+        if !unique
+            .iter()
+            .any(|&(x, y)| konnect_sexp::geometry::points_coincident(x, y, point.0, point.1, 0.01))
+        {
+            unique.push(point);
+        }
+    }
+    unique
+}
+
+fn plan_component_deletion(
+    path: &std::path::Path,
+    content: &str,
+    reference: &str,
+) -> Result<ComponentDeletePlan, ComponentDeleteTargetError> {
+    plan_component_deletions(path, content, &[reference.to_owned()])
+}
+
+pub(crate) fn plan_component_deletions(
+    path: &std::path::Path,
+    content: &str,
+    references: &[String],
+) -> Result<ComponentDeletePlan, ComponentDeleteTargetError> {
+    plan_component_and_item_deletions(path, content, references, &[])
+}
+
+pub(crate) fn plan_component_and_item_deletions(
+    path: &std::path::Path,
+    content: &str,
+    references: &[String],
+    item_uuids: &[String],
+) -> Result<ComponentDeletePlan, ComponentDeleteTargetError> {
+    let references = references.iter().cloned().collect::<BTreeSet<_>>();
+    let mut item_uuids = item_uuids.to_vec();
+    item_uuids.sort();
+    item_uuids.dedup();
+    if references.is_empty() && item_uuids.is_empty() {
+        return Err(ComponentDeleteTargetError::stale(
+            path,
+            "no schematic items were selected",
+        ));
+    }
+    let reference_label = if references.is_empty() {
+        "selected items".to_owned()
+    } else {
+        references.iter().cloned().collect::<Vec<_>>().join(", ")
+    };
+    let tree =
+        parse_sexp(content).map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
+    let before_items = indexed_uuid_items(path, content)?;
+    for uuid in &item_uuids {
+        if !before_items.contains_key(uuid) {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!("schematic item UUID {uuid} is not present"),
+            ));
+        }
+    }
+    let instances = extract_symbol_instances(&tree);
+    let selected = instances
+        .iter()
+        .filter(|instance| references.contains(&instance.reference))
+        .collect::<Vec<_>>();
+    let found = selected
+        .iter()
+        .map(|instance| instance.reference.clone())
+        .collect::<BTreeSet<_>>();
+    if let Some(missing) = references.difference(&found).next() {
+        return Err(ComponentDeleteTargetError::stale(
+            path,
+            format!("component {missing} is not present"),
+        ));
+    }
+
+    let mut by_unit: BTreeMap<(String, u32), Vec<String>> = BTreeMap::new();
+    let mut units_by_reference: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut unit_uuids = Vec::new();
+    for instance in &selected {
+        let uuid = instance.uuid.clone().ok_or_else(|| {
+            ComponentDeleteTargetError::stale(
+                path,
+                format!(
+                    "component {} unit {} has no UUID",
+                    instance.reference, instance.unit
+                ),
+            )
+        })?;
+        if before_items
+            .get(&uuid)
+            .is_none_or(|item| item.kind != "symbol")
+        {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!("UUID {uuid} no longer identifies a top-level symbol"),
+            ));
+        }
+        by_unit
+            .entry((instance.reference.clone(), instance.unit))
+            .or_default()
+            .push(uuid.clone());
+        units_by_reference
+            .entry(instance.reference.clone())
+            .or_default()
+            .push(uuid.clone());
+        unit_uuids.push(uuid);
+    }
+    if let Some(((reference, unit), uuids)) = by_unit.iter().find(|(_, uuids)| uuids.len() > 1) {
+        return Err(ComponentDeleteTargetError::Ambiguous {
+            target: format!("component {reference} unit {unit}"),
+            candidates: uuids.clone(),
+        });
+    }
+    for uuids in units_by_reference.values_mut() {
+        uuids.sort();
+        uuids.dedup();
+    }
+    unit_uuids.sort();
+    unit_uuids.dedup();
+    if unit_uuids.len() != selected.len() {
+        return Err(ComponentDeleteTargetError::Ambiguous {
+            target: format!("components {reference_label}"),
+            candidates: unit_uuids,
+        });
+    }
+
+    // Require every placed symbol's library definition to resolve before
+    // deciding marker ownership or junction validity. Unknown pins are stale
+    // state, not evidence that no pin remains at a coordinate.
+    let grouped = if selected.is_empty() {
+        Vec::new()
+    } else {
+        let grouped = crate::tools::placed_pins_by_reference(&tree);
+        if grouped.len() != instances.len() {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                "one or more placed symbols have unresolved library pin geometry",
+            ));
+        }
+        grouped
+    };
+    let selected_ids = unit_uuids.iter().cloned().collect::<BTreeSet<_>>();
+    let mut affected = Vec::new();
+    let mut remaining = Vec::new();
+    for (instance, pins) in grouped {
+        let points = pins
+            .into_iter()
+            .map(|(pin, transform)| pin_endpoint(&pin, transform));
+        if instance
+            .uuid
+            .as_ref()
+            .is_some_and(|uuid| selected_ids.contains(uuid))
+        {
+            affected.extend(points);
+        } else {
+            remaining.extend(points);
+        }
+    }
+    let affected = dedup_points(affected);
+    let remaining = dedup_points(remaining);
+
+    let mut marker_uuids = Vec::new();
+    for (start, end) in find_direct_child_blocks(content, "kicad_sch") {
+        let node = parse_sexp(&content[start..end])
+            .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
+        if node.head() != Some("no_connect") {
+            continue;
+        }
+        let Some((x, y, _)) = konnect_sexp::schematic::parse_at(&node) else {
+            continue;
+        };
+        let attached = affected
+            .iter()
+            .any(|&(px, py)| konnect_sexp::geometry::points_coincident(x, y, px, py, 0.01));
+        let still_owned = remaining
+            .iter()
+            .any(|&(px, py)| konnect_sexp::geometry::points_coincident(x, y, px, py, 0.01));
+        if attached && !still_owned {
+            let uuid = node.find_str("uuid").ok_or_else(|| {
+                ComponentDeleteTargetError::stale(
+                    path,
+                    format!("attached no-connect at ({x}, {y}) has no UUID"),
+                )
+            })?;
+            marker_uuids.push(uuid.to_owned());
+        }
+    }
+    marker_uuids.sort();
+    marker_uuids.dedup();
+
+    let initial_uuid_set = unit_uuids
+        .iter()
+        .chain(&marker_uuids)
+        .chain(&item_uuids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let initial_ids = initial_uuid_set
+        .into_iter()
+        .map(ItemId::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
+    let initial = SchematicCommand::delete_items(content, initial_ids, "prepare component delete")
+        .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
+    let candidate = prepare_command(path, content, &initial)
+        .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?
+        .0;
+    let (reconciled, _, _) = crate::tools::sch_wiring::reconcile_junctions_at(candidate, &affected);
+
+    let after_items = indexed_uuid_items(path, &reconciled)?;
+    let before_ids = before_items.keys().cloned().collect::<BTreeSet<_>>();
+    let after_ids = after_items.keys().cloned().collect::<BTreeSet<_>>();
+    let removed = before_ids
+        .difference(&after_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    let added = after_ids
+        .difference(&before_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    let modified = before_ids
+        .intersection(&after_ids)
+        .filter(|uuid| before_items[*uuid].source != after_items[*uuid].source)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut changes = Vec::new();
+    if !removed.is_empty() {
+        let command = SchematicCommand::delete_items(
+            content,
+            removed
+                .iter()
+                .map(|uuid| ItemId::new(uuid.clone()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?,
+            format!("delete {reference_label} and dependent markers"),
+        )
+        .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
+        changes.extend(command.changes);
+    }
+    for uuid in added {
+        let command = SchematicCommand::insert_item(
+            content,
+            after_items[&uuid].source.clone(),
+            ItemAnchor::EndOfDocument,
+            format!("restore junction after deleting {reference_label}"),
+        )
+        .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
+        changes.extend(command.changes);
+    }
+    for uuid in modified {
+        let command = SchematicCommand::replace_item(
+            content,
+            ItemId::new(uuid.clone())
+                .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?,
+            after_items[&uuid].source.clone(),
+            format!("reconcile {uuid} after deleting {reference_label}"),
+        )
+        .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
+        changes.extend(command.changes);
+    }
+    let command = SchematicCommand::from_changes(
+        content,
+        format!("delete components {reference_label}"),
+        changes,
+    )
+    .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?
+    .requiring_unchanged_document();
+    let prepared = prepare_command(path, content, &command)
+        .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?
+        .0;
+    if parse_sexp(&prepared).ok() != parse_sexp(&reconciled).ok() {
+        return Err(ComponentDeleteTargetError::stale(
+            path,
+            "the structural command cannot represent every dependent connectivity edit",
+        ));
+    }
+
+    Ok(ComponentDeletePlan {
+        command,
+        before_items,
+        unit_uuids,
+        units_by_reference,
+        marker_uuids,
+        item_uuids,
+    })
+}
+
+pub(crate) fn commit_component_deletion(
+    path: &std::path::Path,
+    plan: ComponentDeletePlan,
+) -> anyhow::Result<Result<ComponentDeleteOutcome, CallToolResult>> {
+    if let Err(error) = commit_command(path, &plan.command) {
+        if let Some(refusal) = component_delete_commit_refusal(path, &error) {
+            return Ok(Err(refusal));
+        }
+        return Err(error.into());
+    }
+
+    let committed = read_consistent(path)?;
+    let after_items = match indexed_uuid_items(path, &committed) {
+        Ok(items) => items,
+        Err(error) => return Ok(Err(error.into_result())),
+    };
+    let after_tree = match parse_sexp(&committed) {
+        Ok(tree) => tree,
+        Err(error) => {
+            return Ok(Err(
+                ComponentDeleteTargetError::from_sexp(path, error).into_result()
+            ));
+        }
+    };
+    for reference in plan.units_by_reference.keys() {
+        let remaining = extract_symbol_instances(&after_tree)
+            .into_iter()
+            .filter(|instance| instance.reference == *reference)
+            .count();
+        if remaining != 0 {
+            return Ok(Err(ComponentDeleteTargetError::stale(
+                path,
+                format!("post-write readback still contains {remaining} unit(s) of {reference}"),
+            )
+            .into_result()));
+        }
+    }
+    for uuid in plan
+        .unit_uuids
+        .iter()
+        .chain(&plan.marker_uuids)
+        .chain(&plan.item_uuids)
+    {
+        if after_items.contains_key(uuid) {
+            return Ok(Err(ComponentDeleteTargetError::stale(
+                path,
+                format!("post-write readback still contains deleted item UUID {uuid}"),
+            )
+            .into_result()));
+        }
+    }
+
+    let before_junctions = plan
+        .before_items
+        .iter()
+        .filter_map(|(uuid, item)| (item.kind == "junction").then_some(uuid.clone()))
+        .collect::<BTreeSet<_>>();
+    let after_junctions = after_items
+        .iter()
+        .filter_map(|(uuid, item)| (item.kind == "junction").then_some(uuid.clone()))
+        .collect::<BTreeSet<_>>();
+    let pruned_junctions = before_junctions
+        .difference(&after_junctions)
+        .cloned()
+        .collect::<Vec<_>>();
+    let added_junctions = after_junctions
+        .difference(&before_junctions)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    Ok(Ok(ComponentDeleteOutcome {
+        units_by_reference: plan.units_by_reference,
+        marker_uuids: plan.marker_uuids,
+        item_uuids: plan.item_uuids,
+        added_junctions,
+        pruned_junctions,
+    }))
+}
+
+fn component_delete_commit_refusal(
+    path: &std::path::Path,
+    error: &SexpError,
+) -> Option<CallToolResult> {
+    let reason = match error {
+        SexpError::Conflict { .. } => "the schematic changed after deletion was planned",
+        SexpError::ItemConflict { reason, .. } => reason,
+        SexpError::KiCadEditorLocked { .. } => {
+            "KiCad owns the schematic; use a live editor mutation or close the document"
+        }
+        _ => return None,
+    };
+    Some(ComponentDeleteTargetError::stale(path, reason).into_result())
 }
 
 /// Properties this tool exposes as first-class parameters. Routing one of them
@@ -1842,7 +2427,10 @@ async fn handle_update_symbols_from_library(
     let mut unchanged = Vec::new();
     let mut pins_moved = Vec::new();
     let mut errors = Vec::new();
-    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
     let outcomes = reembed_lib_symbols(&mut content, &lib_ids, allow_pin_moves, &src);
     for (lib_id, outcome) in lib_ids.iter().zip(outcomes) {
         match outcome {
@@ -2060,7 +2648,10 @@ async fn handle_replace_component(
         .map(|instance| instance.unit)
         .collect();
 
-    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
     let embedded_unit_count = parsed
         .find("lib_symbols")
         .and_then(|libraries| {
@@ -2393,6 +2984,68 @@ mod tests {
             !written.contains("(path \"/CHILDUUID\""),
             "the child's own uuid must not be the whole path:\n{written}"
         );
+    }
+
+    #[tokio::test]
+    async fn placement_refuses_ambiguous_project_ownership_without_writing() {
+        let outer = tempfile::tempdir().unwrap();
+        let nested = outer.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(outer.path().join("outer.kicad_pro"), "{}").unwrap();
+        std::fs::write(nested.join("inner.kicad_pro"), "{}").unwrap();
+        let root = |root_uuid: &str, sheet_uuid: &str, child: &str| {
+            format!(
+                r#"(kicad_sch
+	(version 20250610)
+	(generator "eeschema")
+	(uuid "{root_uuid}")
+	(paper "A4")
+	(lib_symbols)
+	(sheet
+		(at 20 20)
+		(size 40 20)
+		(uuid "{sheet_uuid}")
+		(property "Sheetname" "Child" (at 20 19.365 0))
+		(property "Sheetfile" "{child}" (at 20 40.635 0))
+	)
+	(sheet_instances (path "/" (page "1")))
+)
+"#,
+            )
+        };
+        std::fs::write(
+            outer.path().join("outer.kicad_sch"),
+            root("outer-root", "outer-path", "nested/child.kicad_sch"),
+        )
+        .unwrap();
+        std::fs::write(
+            nested.join("inner.kicad_sch"),
+            root("inner-root", "inner-path", "child.kicad_sch"),
+        )
+        .unwrap();
+        let child = nested.join("child.kicad_sch");
+        std::fs::write(&child, crate::tools::blank_schematic_template()).unwrap();
+        let before = std::fs::read(&child).unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": child.display().to_string(),
+                "lib_id": "Device:R",
+                "reference": "R1",
+                "x": 100.0,
+                "y": 100.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("conflict")
+        );
+        assert_eq!(std::fs::read(&child).unwrap(), before);
     }
 
     /// A standalone sheet — no project file, no parent — keeps the old
@@ -4110,6 +4763,223 @@ mod move_connected_tests {
             text.contains("move_schematic_component"),
             "must name the working alternative: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod component_delete_connectivity_tests {
+    use super::*;
+    use crate::mcp::{error::extract_error_kind, protocol::ToolContent};
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    const CONNECTIVITY: &str = include_str!("../../tests/fixtures/junction_reconcile.kicad_sch");
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("delete.kicad_sch");
+        std::fs::write(&path, content).unwrap();
+        (directory, path)
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "{result:?}");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn has_junction(content: &str, x: f64, y: f64) -> bool {
+        let tree = parse_sexp(content).unwrap();
+        konnect_sexp::schematic::extract_junctions(&tree)
+            .iter()
+            .any(|&(jx, jy)| konnect_sexp::geometry::points_coincident(x, y, jx, jy, 0.01))
+    }
+
+    #[tokio::test]
+    async fn deleting_a_pin_only_dot_prunes_it_but_preserves_an_unrelated_wire_t() {
+        let (_directory, path) = fixture(CONNECTIVITY);
+        let result = handle_delete_schematic_component(
+            &json!({ "schematic": path, "reference": "R1" }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        let response = body(&result);
+
+        assert_eq!(response["deleted_units"], 1);
+        assert_eq!(response["junctions_pruned_count"], 1);
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(!has_junction(&committed, 120.65, 139.7));
+        assert!(
+            has_junction(&committed, 120.65, 170.18),
+            "the two-wire T remains justified independently of R1"
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_no_connect_is_removed_and_unrelated_marker_survives() {
+        let unrelated = "\t(no_connect\n\t\t(at 250 250)\n\t\t(uuid \"unrelated-marker\")\n\t)\n";
+        let closing = CONNECTIVITY.rfind("\n)").unwrap();
+        let original = format!(
+            "{}{unrelated}{}",
+            &CONNECTIVITY[..closing + 1],
+            &CONNECTIVITY[closing + 1..]
+        );
+        assert!(original.contains("unrelated-marker"));
+        let (_directory, path) = fixture(&original);
+        let result = handle_delete_schematic_component(
+            &json!({ "schematic": path, "reference": "R3" }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        let response = body(&result);
+
+        assert_eq!(response["removed_no_connects_count"], 1);
+        assert_eq!(
+            response["removed_no_connect_uuids"][0],
+            "3f9dbc19-858e-4bf8-b937-b169159de4c8"
+        );
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(!committed.contains("3f9dbc19-858e-4bf8-b937-b169159de4c8"));
+        assert!(committed.contains("unrelated-marker"));
+    }
+
+    #[tokio::test]
+    async fn attached_no_connect_survives_when_a_remaining_pin_shares_the_point() {
+        let original =
+            CONNECTIVITY.replace("\t\t(at 120.65 135.89 0)\n", "\t\t(at 190.5 196.85 0)\n");
+        assert_ne!(original, CONNECTIVITY);
+        let (_directory, path) = fixture(&original);
+        let result = handle_delete_schematic_component(
+            &json!({ "schematic": path, "reference": "R3" }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        let response = body(&result);
+
+        assert_eq!(response["removed_no_connects_count"], 0);
+        let committed = std::fs::read_to_string(&path).unwrap();
+        assert!(committed.contains("3f9dbc19-858e-4bf8-b937-b169159de4c8"));
+    }
+
+    #[tokio::test]
+    async fn missing_reference_is_structured_stale_and_does_not_write() {
+        let (_directory, path) = fixture(CONNECTIVITY);
+        let result = handle_delete_schematic_component(
+            &json!({ "schematic": path, "reference": "R404" }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), CONNECTIVITY);
+    }
+
+    #[tokio::test]
+    async fn unresolved_pin_geometry_is_stale_and_does_not_write() {
+        let original = "(kicad_sch\n  (version 20260306)\n  (uuid \"root\")\n  (lib_symbols)\n  (symbol\n    (lib_id \"Missing:Part\")\n    (at 10 10 0)\n    (unit 1)\n    (uuid \"missing-lib\")\n    (property \"Reference\" \"U1\")\n  )\n)\n";
+        let (_directory, path) = fixture(original);
+        let result = handle_delete_schematic_component(
+            &json!({ "schematic": path, "reference": "U1" }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn attached_marker_without_uuid_is_stale_and_does_not_write() {
+        let original =
+            CONNECTIVITY.replace("\t\t(uuid \"3f9dbc19-858e-4bf8-b937-b169159de4c8\")\n", "");
+        assert_ne!(original, CONNECTIVITY);
+        let (_directory, path) = fixture(&original);
+        let result = handle_delete_schematic_component(
+            &json!({ "schematic": path, "reference": "R3" }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn duplicate_reference_and_unit_is_stale_and_does_not_write() {
+        let original = CONNECTIVITY.replacen(
+            "(property \"Reference\" \"R3\"",
+            "(property \"Reference\" \"R1\"",
+            1,
+        );
+        let (_directory, path) = fixture(&original);
+        let result = handle_delete_schematic_component(
+            &json!({ "schematic": path, "reference": "R1" }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn stale_revision_refuses_the_prepared_delete_without_overwriting() {
+        let (_directory, path) = fixture(CONNECTIVITY);
+        let plan = plan_component_deletion(&path, CONNECTIVITY, "R1").unwrap();
+        let newer = CONNECTIVITY.replace("(paper \"A4\")", "(paper \"A3\")");
+        assert_ne!(newer, CONNECTIVITY);
+        std::fs::write(&path, &newer).unwrap();
+
+        let error = commit_command(&path, &plan.command).unwrap_err();
+        let refusal = component_delete_commit_refusal(&path, &error).unwrap();
+        assert_eq!(
+            extract_error_kind(&refusal).as_deref(),
+            Some("stale_target")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), newer);
+    }
+
+    #[tokio::test]
+    async fn kicad_lock_is_structured_stale_and_preserves_the_file() {
+        let (_directory, path) = fixture(CONNECTIVITY);
+        let lock = path.with_file_name(format!(
+            "~{}.lck",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&lock, "locked").unwrap();
+        let result = handle_delete_schematic_component(
+            &json!({ "schematic": path, "reference": "R1" }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), CONNECTIVITY);
     }
 }
 

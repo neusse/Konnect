@@ -47,6 +47,32 @@ The queue is only legible if claims are visible.
 - Priority labels `P0`/`P1`/`P2` and `area:*` labels are how the queue is read
   at a glance. Keep them current.
 
+## Branches and the PR queue
+
+The detailed contributor workflow is in
+[docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md](docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md).
+Maintainers apply these queue rules:
+
+- Independent changes use independent branches from current `main`.
+- Contribution branches start from the latest `main`, not a release tag, except
+  for an explicitly requested release-line backport.
+- A dependent series exposes one mergeable step at a time. Deeper work stays in
+  the contributor's fork or remains draft against an agreed upstream base; it
+  must not appear as several ready, cumulative PRs against an unchanged `main`.
+- After a prerequisite merges, the author reconstructs the next PR from current
+  `main` with only its unique commits. A previous green run on a cumulative head
+  is obsolete.
+- A PR with copied prerequisites, a stale base, or unresolved conflicts is not
+  ready for final review. Maintainers may return it to draft and request a clean
+  reconstruction rather than repeatedly resolving contributor branch history.
+- A short-lived `integration/<topic>` branch requires maintainer agreement on
+  scope, ownership, synchronization, evidence, terminal issue closure, and an
+  expiry. Child PRs receive focused review and CI before one final integration PR
+  is merged to `main`. Unrelated work continues on `main`.
+
+These rules protect review quality without requiring every related change to be
+one large PR. The unit of review remains one focused outcome.
+
 ## Releases
 
 - **Never hand-edit tool counts.** `cargo xtask fix-doc-counts` rewrites them

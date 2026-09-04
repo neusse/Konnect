@@ -3,138 +3,201 @@
 Where Konnect is going, in the order the work actually depends on itself.
 No dates — items ship when they survive verification. Opening an issue is the
 best way to influence priority; several of the largest items below exist
-because a contributor measured something we hadn't.
+because a contributor measured something we had not.
 
-This revision (post-v0.7.0) is built in large part on
+This roadmap reflects `upstream/main` after v0.11.0. Release notes describe
+what shipped in a particular version; this file describes the remaining user
+outcomes, their dependencies, and the evidence required to call them complete.
+The priorities are informed by
 [@neusse's improvement backlog](https://github.com/mixelpixx/Konnect/discussions/165)
-and his benchmark work (discussions
-[#239](https://github.com/mixelpixx/Konnect/discussions/239),
-[#295](https://github.com/mixelpixx/Konnect/discussions/295),
-[#224](https://github.com/mixelpixx/Konnect/discussions/224)) — hands-on,
-evidence-first evaluations that found what CI could not. If you want to work
-on any item here, say so on its issue; design agreement first, then one
-focused PR.
+and benchmark reports
+([#239](https://github.com/mixelpixx/Konnect/discussions/239),
+[#295](https://github.com/mixelpixx/Konnect/discussions/295), and
+[#224](https://github.com/mixelpixx/Konnect/discussions/224)).
 
 ## 1. Truth and write-safety (the standing doctrine)
 
 Every response field derives from the **result**, never from the request. A
 verdict without evidence is `INCOMPLETE`, never approval. Fixtures come from
-real KiCAD output. These rules are enforced by tests
-(`doc_tool_counts.rs`, `schema_parameter_usage.rs`, `schema_migrations.rs`)
-and documented in [docs/DEVELOPING_TOOLS.md](docs/DEVELOPING_TOOLS.md); every
-new tool must satisfy them.
+real KiCad output. New guards must be neutralized once to prove their regression
+tests fail, and an unavailable check is `BLOCKED`, never a silent pass.
 
-Open work in this theme:
+Current Priority 0 work:
+- **Exact live-board identity**
+  ([#384](https://github.com/mixelpixx/Konnect/issues/384),
+  [#390](https://github.com/mixelpixx/Konnect/pull/390)) — bind each generic
+  IPC operation to the exact typed document selected for the request. This is
+  the foundation for later editor navigation.
+- **Fail-closed open-board classification**
+  ([#426](https://github.com/mixelpixx/Konnect/issues/426)) — if any open PCB
+  document path cannot be resolved, refuse direct-file mutation instead of
+  treating the requested board as safely closed. Rebuild PR #407 on current
+  `main` with negative and live-KiCad evidence.
+- **Cold-start stale-board evidence**
+  ([#385](https://github.com/mixelpixx/Konnect/issues/385),
+  [#391](https://github.com/mixelpixx/Konnect/pull/391)) — after exact board
+  binding lands, use only the requested board's KiCad lock as a conservative
+  write veto. Lock absence is never positive proof that a file fallback is safe.
+- **Committed schematic readback**
+  ([#387](https://github.com/mixelpixx/Konnect/issues/387),
+  [#394](https://github.com/mixelpixx/Konnect/pull/394)) — rebuild the final
+  stacked change on current `main` so mutation responses report committed state.
+- **Authoritative DRC sequencing**
+  ([#408](https://github.com/mixelpixx/Konnect/issues/408)) — refill zones and
+  establish save/read ordering before reporting DRC evidence.
+- **Physical clearance truth**
+  ([#410](https://github.com/mixelpixx/Konnect/issues/410)) — report copper and
+  pad clearance rather than footprint-origin distance.
+- **Type-safe PCB deletion**
+  ([#412](https://github.com/mixelpixx/Konnect/issues/412)) — a trace operation
+  must not delete a via or zone merely because its UUID exists.
 
-- **Stale-board detection** ([#240](https://github.com/mixelpixx/Konnect/issues/240)) —
-  after KiCAD dies, the next closed-board call cannot tell that from "KiCAD
-  was never running." Lock files become supporting evidence, not sole
-  authority. Depends on a document-answering IPC mock
-  ([#241](https://github.com/mixelpixx/Konnect/issues/241)) so refusal
-  branches finally get shared test coverage.
-- **Project and library-table targeting**
-  ([#189](https://github.com/mixelpixx/Konnect/issues/189)) — ambiguity in
-  the ancestor walk fails with a structured error instead of guessing an
-  unrelated project.
+Completed foundations include structured required-argument validation,
+lossless zone and footprint parsing, proven project ownership (#189),
+process-lifetime stale-board refusal (#240), non-mutating startup (#242),
+verified fresh export artifacts (#252), and structural replacement of the
+remaining indentation-sensitive schematic scans (#84).
+
+## 2. Schematic correctness and editability
+
+- **Bus-aware connectivity**
+  ([#328](https://github.com/mixelpixx/Konnect/issues/328)) — extend the shared
+  connectivity model through buses and bus entries without treating visual
+  contact as electrical proof.
+- **Move the connected region**
+  ([#315](https://github.com/mixelpixx/Konnect/issues/315)) — move symbols,
+  wires, labels, and junctions as one verified closure instead of leaving wires
+  behind or reporting an unobserved success.
+- **Editable component metadata**
+  ([#258](https://github.com/mixelpixx/Konnect/issues/258),
+  [#360](https://github.com/mixelpixx/Konnect/issues/360), and
+  [#415](https://github.com/mixelpixx/Konnect/issues/415)) — support custom
+  fields, carry useful catalog metadata into placed symbols, and expose DNP
+  state through a result-verified contract.
+- **Diff-preserving writes**
+  ([#210](https://github.com/mixelpixx/Konnect/issues/210)) — avoid rewriting
+  an entire sheet's formatting for a local edit.
+
+Multi-unit read behavior (#182), junction maintenance on move/delete (#120),
+hierarchical ownership, sheet-instance placement, and connectivity-preserving
+component deletion are complete on `main`.
+
+## 3. PCB analysis, placement, and imported designs
+
+- **Pad geometry in inspection results**
+  ([#409](https://github.com/mixelpixx/Konnect/issues/409)) — expose observed
+  pad size, shape, and rotation so placement and clearance reasoning does not
+  have to guess.
+- **Placement intent without false positives**
+  ([#411](https://github.com/mixelpixx/Konnect/issues/411)) — distinguish a
+  connector/interface filter capacitor from misplaced IC decoupling using
+  narrow, testable evidence.
+- **Footprint-owned mechanical geometry**
+  ([#351](https://github.com/mixelpixx/Konnect/issues/351) and
+  [#413](https://github.com/mixelpixx/Konnect/issues/413)) — recognize valid
+  footprint-owned outlines and cutouts during analysis and DRC classification.
+  Automatic destructive promotion remains deferred to a coherent import-
+  normalization workflow.
+- **Placed-footprint 3D models**
+  ([#305](https://github.com/mixelpixx/Konnect/issues/305)) — add a safe model
+  editing contract after the current footprint-library refresh work is stable.
+- **Exact graphic selection**
+  ([#225](https://github.com/mixelpixx/Konnect/issues/225)) — address one
+  footprint graphic without using its layer as an ambiguous selector.
+
+## 4. Autorouting: complete the supported workflow
+
+The native Freerouting bridge is now implemented. The supported sequence is:
+
+1. `check_freerouting`
+2. `export_specctra_dsn`
+3. `route_specctra_dsn`
+4. `plan_specctra_ses_import`
+5. `apply_specctra_ses`
+
+Konnect exports a revision-bound DSN and manifest, drives the discovered local
+Freerouting JAR through its headless MCP server, validates the returned SES,
+and applies it through KiCad IPC with committed readback and DRC evidence. The
+former `autoroute` contract and the implementation gap tracked by #253/#337 are
+closed.
+
+Remaining work is operational evidence rather than another routing API:
+exercise this sequence in the real-KiCad release benchmark, retain the known
+geometry limitations in release notes, and expand the KiCad-authored fixture
+corpus when a real board exposes an unsupported construct.
+
+## 5. IPC context and semantic editor navigation
+
+- **Socket discovery and provenance**
+  ([#382](https://github.com/mixelpixx/Konnect/pull/382) and
+  [#419](https://github.com/mixelpixx/Konnect/issues/419)) — settle startup
+  discovery first, then report which configuration and IPC source actually
+  controlled the running process.
+- **Open a requested editor context**
+  ([#256](https://github.com/mixelpixx/Konnect/issues/256)) — launch a specific
+  board and return the exact observed IPC endpoint instead of assuming one.
+- **Semantic Navigation MVP**
+  ([#395](https://github.com/mixelpixx/Konnect/issues/395)) — after #390,
+  introduce the approved five-operation sequence for state, selection,
+  resolution, verified selection mutation, and read-only cross-probe resolution.
+  Activation/reveal is deferred until a supported KiCad API can execute and
+  verify it; raw actions and UI automation are not the product contract.
+
+## 6. Client, workflow, and guidance compatibility
+
+The compact client surface and eager-toolset documentation closed the immediate
+VS Code and Linux client reports (#325 and #233). Keep testing clients that do
+not refresh `tools/list`, and preserve independent Claude and Codex guidance
+review paths.
+
+The bundled skills and agents must teach the same evidence hierarchy as the
+tools: KiCad ERC/DRC outrank summaries, one owner controls a live board,
+Freerouting follows the supported five-step sequence, and custom parts require
+a physical pin map. Advanced library-generation controls
+([#296](https://github.com/mixelpixx/Konnect/issues/296)) should extend that
+workflow without making prompts a substitute for validation.
+
+## 7. Platform and KiCad-forward
+
 - **Server lifecycle ownership**
-  ([#103](https://github.com/mixelpixx/Konnect/issues/103)) and a
-  non-mutating startup
-  ([#242](https://github.com/mixelpixx/Konnect/issues/242)) — a server
-  process must not reinstall configuration as a side effect of launching.
+  ([#103](https://github.com/mixelpixx/Konnect/issues/103)) — track and reap
+  only servers whose owning launcher is gone; do not kill another live session
+  or an independently managed MCP server.
+- **KiCad 11 readiness**
+  ([#257](https://github.com/mixelpixx/Konnect/issues/257)) — replace every
+  remaining SWIG-dependent ActionPlugin responsibility before the bindings are
+  removed, with tested IPC or executable-plugin equivalents.
+- **KiCad compatibility regressions**
+  ([#406](https://github.com/mixelpixx/Konnect/issues/406)) — reproduce the
+  reported interactive-router layer behavior with a controlled plugin/no-plugin
+  matrix before changing code.
+- **macOS distribution**
+  ([#131](https://github.com/mixelpixx/Konnect/issues/131), then
+  [#154](https://github.com/mixelpixx/Konnect/issues/154)) — establish signed,
+  stable artifacts before adding a Homebrew tap.
 
-## 2. Schematic correctness
+Per-user Windows discovery (#254) is complete. Official KiCad PCM publication
+remains a distribution objective after release identity and lifecycle behavior
+are stable.
 
-- **Multi-unit symbols** ([#182](https://github.com/mixelpixx/Konnect/issues/182)) —
-  the read half now flows through the shared `ConnectivityIndex`
-  ([#323](https://github.com/mixelpixx/Konnect/pull/323)); the mutation half
-  ([#273](https://github.com/mixelpixx/Konnect/pull/273)) lands next after a
-  rebase onto the index.
-- **Connectivity on move and delete**
-  ([#120](https://github.com/mixelpixx/Konnect/issues/120)) — junction
-  creation/pruning when things move. This is also the prerequisite for a real
-  `move_connected`
-  ([#315](https://github.com/mixelpixx/Konnect/issues/315)), which currently
-  refuses rather than pretending.
-- **Remaining indentation-sensitive scans**
-  ([#84](https://github.com/mixelpixx/Konnect/issues/84)) — replace the last
-  literal-string probes with structural parsing.
+## 8. The quality flywheel
 
-## 3. Autorouting: a real Freerouting bridge
-
-The single biggest capability gap. KiCad 10's CLI never had Specctra
-DSN/SES, so Konnect's old `autoroute` could only fail; it was removed rather
-than faked ([#253](https://github.com/mixelpixx/Konnect/issues/253)).
-
-The agreed direction is @neusse's design from #253: **drive a standalone
-Freerouting JAR directly** — DSN export, route, SES import, editor refresh —
-with discovery reporting *engine found* and *bridge available* as separate
-facts, and PCM-installed JARs discovered on every platform. Board identity
-validation and atomic SES import are requirements, not options. Design is
-agreed; implementation is open for whoever claims it on #253.
-
-## 4. Client compatibility
-
-The dynamic-toolset architecture (small starter kit, `load_toolset` on
-demand) assumes MCP clients either expose many tools or re-fetch after
-`tools/list_changed`. Two reports show real clients violating both
-assumptions: VS Code Copilot caps callable tools
-([#325](https://github.com/mixelpixx/Konnect/issues/325)) and a Linux client
-never re-fetched ([#233](https://github.com/mixelpixx/Konnect/issues/233)).
-
-Planned: a **compact tool surface mode** (a few generic call/help tools
-proxying the full catalog — credit @simachines' working prototype in #325),
-MCP `resources/` exposure of the tool directory, and documenting
-`eager_toolsets` per client. The 200-tool catalog is a feature; falling over
-on real clients is not.
-
-## 5. Workflow and skills layer
-
-@neusse's benchmark-driven proposals in
-[#295](https://github.com/mixelpixx/Konnect/discussions/295): an evidence
-hierarchy the bundled skills teach (KiCad's own DRC/ERC outrank Konnect's
-own summaries), single-owner rules for the live board, Freerouting-first PCB
-flow, and a physical pin-map requirement before custom-part creation. Gated
-on the tool surface stabilizing (v0.8.0); invited as skill-layer PRs.
-
-## 6. Platform and KiCad-forward
-
-- **KiCad 11 readiness** ([#257](https://github.com/mixelpixx/Konnect/issues/257)) —
-  the SWIG `pcbnew` bindings the legacy ActionPlugin uses are **removed in
-  KiCad 11**; the executable IPC plugin is the replacement path and needs its
-  lifecycle/settings parity planned *before* KiCad 11 ships. The one item
-  here with a deadline.
-- **macOS signing/notarization**
-  ([#131](https://github.com/mixelpixx/Konnect/issues/131)), then Homebrew
-  ([#154](https://github.com/mixelpixx/Konnect/issues/154)) once artifact
-  identity is stable.
-- **Per-user Windows installs**
-  ([#254](https://github.com/mixelpixx/Konnect/issues/254)) — discovery must
-  find `%LOCALAPPDATA%\Programs\KiCad`.
-- **KiCAD PCM publication** — submit to the official addon repository.
-
-## 7. The quality flywheel
-
-What keeps the rest honest:
-
-- **End-to-end benchmarks against reality.** @neusse's konnect-codex runs
-  found silent corruption, fail-open verdicts, and contract gaps that 900+
-  unit tests missed. A re-run against each minor release is part of the
-  release rhythm now, and the standing invitation is open.
-- **Live-test honesty** ([#221](https://github.com/mixelpixx/Konnect/issues/221)) —
-  fix the stale CI claims and the rotation-readback flake.
-- **A real-KiCAD fixture corpus** — boards and footprints saved by KiCAD
-  itself (tabs, CRLF, `ki_fp_filters`, positionless properties), so no
-  fixture can share the code's wrong assumption again.
-- The catalogue-wide guards stay: doc counts, schema-parameter usage, and
-  schema migrations are all swept by CI on every PR.
+- Repair the live-test contract
+  ([#221](https://github.com/mixelpixx/Konnect/issues/221)): documentation must
+  name a real job, and the KiCad-authored fixture must pass the test it claims.
+- Run the full local gate after every merge, then the real-KiCad E2E, live IPC
+  tests, and end-to-end benchmark before a release.
+- Grow a real-KiCad fixture corpus for every parser and transform boundary.
+- Keep issue-to-PR closure accounting explicit: partial PRs use `Part of #N`;
+  exactly one terminal PR uses `Closes #N` after satisfying all acceptance.
+- Keep generated tool counts authoritative through `cargo xtask fix-doc-counts`.
 
 ## Done (eras, not items)
 
-- ~~v0.1–v0.3~~ — full toolset surface across schematic, PCB, library,
-  export; three-platform PCM packaging; HTTP transport; hierarchical sheets.
-- ~~v0.4–v0.5~~ — atomic `update_pcb_from_schematic`; footprint graphics
-  authoring and board-side editing; client-scoped installs.
-- ~~v0.6–v0.7~~ — the truth-and-safety arc: required-argument enforcement,
-  the layer-crash fix, sync corruption fixed with post-apply read-back,
-  DRC-evidence-gated review verdicts, honest autoroute removal, and the
-  developer docs set ([docs/](docs/DEVELOPER_OVERVIEW.md)).
+- ~~v0.1-v0.3~~ — broad schematic, PCB, library, export, transport, and
+  cross-platform packaging foundations.
+- ~~v0.4-v0.7~~ — atomic PCB transfer, footprint graphics, client-scoped
+  installs, and the first truth-and-safety enforcement arc.
+- ~~v0.8-v0.11~~ — structured installation provenance, project ownership,
+  hierarchical schematic correctness, executable guidance evidence, the native
+  Specctra/Freerouting bridge, and safer stale-file fallback behavior.

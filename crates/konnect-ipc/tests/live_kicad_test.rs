@@ -274,6 +274,56 @@ fn adding_a_via_actually_creates_it_on_the_board() {
     );
 }
 
+/// #412 live gate: `delete_trace` must identify a real trace on the requested
+/// board before sending the generic KiCad `DeleteItems` command, then prove
+/// that exact trace is absent from live readback. The test creates its own
+/// disposable segment so it does not consume fixture routing.
+#[test]
+#[ignore = "requires a running KiCad GUI with its IPC API enabled and a disposable open board"]
+fn verified_trace_delete_round_trips_through_live_kicad() {
+    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
+        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let client = KiCadIpcClient::new(socket);
+    let net = client
+        .get_nets()
+        .expect("net list query failed")
+        .into_iter()
+        .find(|net| !net.name.is_empty())
+        .expect("the live fixture must contain a named net");
+    let before: std::collections::HashSet<String> = client
+        .get_tracks(None, None)
+        .expect("initial trace query failed")
+        .into_iter()
+        .map(|track| track.uuid)
+        .collect();
+
+    client
+        .add_track(&net.name, "F.Cu", 0.25, 120.0, 125.0, 130.0, 125.0)
+        .expect("temporary trace creation failed");
+    let created = client
+        .get_tracks(None, None)
+        .expect("created trace readback failed")
+        .into_iter()
+        .find(|track| !before.contains(&track.uuid))
+        .expect("KiCad did not return the newly created trace");
+
+    let deleted = client
+        .delete_trace_segment_verified(Path::new(&board), &created.uuid)
+        .expect("verified trace deletion failed")
+        .expect("the created UUID was not observed as a trace");
+    assert_eq!(deleted.uuid, created.uuid);
+    assert!(
+        client
+            .get_tracks(None, None)
+            .expect("final trace readback failed")
+            .iter()
+            .all(|track| track.uuid != created.uuid),
+        "deleted trace remains in live KiCad"
+    );
+    client.save_board().expect("final board save failed");
+}
+
 /// `add_zone` over IPC, end to end: create, read the zone back out of KiCad,
 /// and delete it again.
 ///

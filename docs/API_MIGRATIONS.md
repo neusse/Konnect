@@ -3,6 +3,79 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: type-safe trace deletion (minor release)
+
+`delete_trace` now accepts only a UUID observed in the requested live board's
+trace-segment inventory. Via, zone, graphic, footprint, missing, and stale UUIDs
+return `stale_target` before `DeleteItems` is sent. A successful call reads the
+same board again and refuses success if the segment remains.
+
+The existing `deleted_uuid` field remains, but it is now derived from the
+observed segment rather than echoed from the request. Results add
+`deleted_type: "trace_segment"`, the observed net/layer/width/endpoints under
+`preimage`, and `postcondition: "absent_from_trace_readback"`. No argument or
+tool was renamed or removed.
+
+## Unreleased: connectivity-safe component deletion (minor release)
+
+`delete_schematic_component`, `batch_delete`, and
+`batch_delete_schematic_components` now resolve a complete logical component
+before writing, remove only no-connect markers owned exclusively by deleted
+pins, and reconcile junctions only at affected pin endpoints. Wires and labels
+remain, matching KiCad's plain-delete behavior. Selecting one placed-unit UUID
+through `batch_delete` deletes every placed unit of that reference.
+
+The existing single-delete fields (`deleted`, `deleted_units`) and batch fields
+(`deleted_count`, `deleted`, `errors`) remain. Single-delete results add
+`deleted_unit_uuids`, plus count-and-UUID evidence for removed no-connects and
+added or pruned junctions. Batch results add `deleted_components` (including
+each reference's observed unit count and UUIDs), `deleted_item_uuids`, and the
+same connectivity evidence fields. These values come from reloading the
+committed schematic rather than echoing requested selectors.
+
+Missing, protected, duplicate, malformed, stale, wrong-document, or
+editor-locked targets refuse with the existing `stale_target` kind before a
+write when Konnect cannot prove a unique safe deletion. A post-write readback
+that still observes a selected reference or UUID also returns `stale_target`;
+inspect and reload the saved schematic before retrying because that refusal can
+follow a committed write. This additive response change is planned for the next
+minor release; no tool or argument was renamed or removed.
+
+## Unreleased: complete schematic placement instances (minor release)
+
+`add_schematic_component`, `batch_place_components`, and `add_power_symbol`
+preserve every instance path when the saved root reuses a child schematic.
+Existing inputs and response fields remain. Placement results now include
+`schematic`, `project`, `instance_paths`, and observed symbol fields (`uuid`,
+`added`, `reference`, `value`, `x`, `y`, `rotation`, `unit`). Batch results put
+these fields in each `placed` entry; power placement retains `added_power` and
+`junctions_added`. Values come from reloading the committed file.
+
+Missing, foreign, duplicate, malformed, or obsolete saved instance paths,
+references, or units return `stale_target` with `target` and `reason` before
+placement writes. Repair the saved hierarchy and its complete symbol instance
+metadata before retrying. Ambiguous
+project ownership continues to use the existing `conflict` kind from #189.
+If post-write readback cannot verify the target or symbol, `stale_target` may
+follow a committed write: inspect/reload the file before retrying to avoid a
+duplicate placement. This observes saved files only and does not claim an
+atomic snapshot of the complete hierarchy or unsaved editor state.
+
+See [Schematic project ownership](PROJECT_OWNERSHIP.md#placement-instance-validation)
+for the acceptance matrix and limits. This additive response change is planned
+for the next minor release; no tool or argument was renamed or removed.
+
+## Unreleased: schematic ownership conflicts (minor release)
+
+Symbol-loading operations and ERC root detection now refuse unproven or ambiguous
+ancestor project ownership with the existing `conflict` kind. Previously, some
+of these cases silently inherited unrelated libraries or treated the schematic
+as projectless. `error.paths` names the schematic directory and every candidate
+root. Restore the saved hierarchy or separate the independent document from the
+unrelated project before retrying. Loose schematics with no candidate project
+and adjacent library-table authority remain supported. See
+[Schematic project ownership](PROJECT_OWNERSHIP.md) for the behavior and limits.
+
 ## Unreleased: Rust Specctra export is the default
 
 `export_specctra_dsn.native_bridge_mode` now defaults to `disable`, so an

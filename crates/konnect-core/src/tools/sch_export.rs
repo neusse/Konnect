@@ -4,21 +4,20 @@
 //! `export_netlist_summary` and `fix_connectivity` operate directly on
 //! S-expression file content so they work without a running KiCAD instance.
 
-use crate::mcp::protocol::CallToolResult;
+use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{get_path, placed_pins, placed_pins_by_reference, ToolContext, ToolDef};
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
+    parser::{parse_sexp, SexpNode},
     schematic::{
         extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
         pin_endpoint, read_schematic,
     },
-    writer::{
-        apply_edits, find_block_with_leading_whitespace, write_atomic_if_unchanged, SexpEdit,
-    },
+    writer::{apply_edits, find_direct_child_blocks, write_atomic_if_unchanged, SexpEdit},
+    SexpError,
 };
 use serde_json::json;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::cli;
@@ -611,7 +610,11 @@ async fn handle_run_erc(
     let sch_path = get_path(args, "schematic")?;
     let min_severity = args["severity"].as_str().unwrap_or("warning");
 
-    if let Some(root) = owning_project_root(&sch_path) {
+    let owning_root = match owning_project_root(&sch_path) {
+        Ok(root) => root,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    if let Some(root) = owning_root {
         // Structured, not free text: a caller can react to `invalid_argument`
         // on `schematic` by retrying against the named root, which is exactly
         // what the message says to do.
@@ -726,8 +729,7 @@ async fn handle_fix_connectivity(
         snap_targets.push((w.x2, w.y2));
     }
 
-    let mut fixes: Vec<serde_json::Value> = Vec::new();
-    let mut file_edits: Vec<SexpEdit> = Vec::new();
+    let mut fixes = Vec::new();
 
     for w in &wires {
         for (is_start, (px, py)) in &[(true, (w.x1, w.y1)), (false, (w.x2, w.y2))] {
@@ -752,65 +754,403 @@ async fn handle_fix_connectivity(
                 continue; // T-junction — already connected
             }
 
-            // Look for a near-miss snap target within snap_tol
-            let near = snap_targets.iter().find(|(tx, ty)| {
+            // A geometric near miss is still ambiguous when two distinct
+            // destinations are in range. Refuse instead of depending on file
+            // order to choose one.
+            let mut raw_near = Vec::new();
+            for &(tx, ty) in &snap_targets {
                 let dist = ((px - tx).powi(2) + (py - ty).powi(2)).sqrt();
-                dist > exact_tol && dist <= snap_tol
-            });
-
-            if let Some(&(tx, ty)) = near {
-                fixes.push(json!({
-                    "wire_uuid": w.uuid,
-                    "endpoint": if *is_start { "start" } else { "end" },
-                    "from": { "x": px, "y": py },
-                    "to":   { "x": tx, "y": ty }
-                }));
-
-                if !dry_run {
-                    // Find the wire block by UUID and replace the coordinate
-                    if let Some(uuid_str) = &w.uuid {
-                        let uuid_pat = format!(r#"(uuid "{uuid_str}")"#);
-                        if let Some(uuid_pos) = content.find(&uuid_pat) {
-                            let before = &content[..uuid_pos];
-                            if let Some(ws) = before.rfind("\n  (wire").map(|p| p + 1) {
-                                if let Some((wbs, wbe)) =
-                                    find_block_with_leading_whitespace(&content, ws)
-                                {
-                                    let wire_block = &content[wbs..wbe];
-                                    let coord_prefix = if *is_start { "(start " } else { "(end " };
-                                    if let Some(coord_rel) = wire_block.find(coord_prefix) {
-                                        let vals_abs = wbs + coord_rel + coord_prefix.len();
-                                        let close_rel =
-                                            wire_block[coord_rel..].find(')').unwrap_or(0);
-                                        let vals_end = wbs + coord_rel + close_rel;
-                                        file_edits.push(SexpEdit::replace(
-                                            vals_abs,
-                                            vals_end,
-                                            format!("{tx} {ty}"),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
+                let own_other_endpoint = if *is_start {
+                    (w.x2, w.y2)
+                } else {
+                    (w.x1, w.y1)
+                };
+                if dist > exact_tol
+                    && dist <= snap_tol
+                    && !points_coincident(
+                        tx,
+                        ty,
+                        own_other_endpoint.0,
+                        own_other_endpoint.1,
+                        exact_tol,
+                    )
+                {
+                    raw_near.push((tx, ty));
                 }
+            }
+            let near = distinct_geometric_destinations(&raw_near, exact_tol);
+            if near.len() > 1 {
+                let target = format!(
+                    "wire {} {} endpoint at ({px}, {py})",
+                    w.uuid.as_deref().unwrap_or("without UUID"),
+                    if *is_start { "start" } else { "end" }
+                );
+                let candidates = near
+                    .iter()
+                    .map(|(x, y)| format!("({x}, {y})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Ok(stale_connectivity_target(
+                    target,
+                    format!("more than one snap destination was observed: {candidates}"),
+                ));
+            }
+
+            if let Some(&(tx, ty)) = near.first() {
+                let Some(uuid) = &w.uuid else {
+                    let target = format!("wire endpoint at ({px}, {py})");
+                    return Ok(stale_connectivity_target(
+                        target,
+                        "the wire has no UUID and cannot be identified after a concurrent edit",
+                    ));
+                };
+                fixes.push(PlannedWireFix {
+                    uuid: uuid.clone(),
+                    endpoint: if *is_start {
+                        WireEndpoint::Start
+                    } else {
+                        WireEndpoint::End
+                    },
+                    from: (px, py),
+                    to: (tx, ty),
+                });
             }
         }
     }
 
-    let applied_count = if dry_run { 0 } else { file_edits.len() };
-    if applied_count > 0 {
-        let expected = content.clone();
-        let new_content = apply_edits(content, file_edits);
-        write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    // When two loose wire ends see only each other, the independently planned
+    // fixes point in opposite directions. Applying both would merely swap the
+    // coordinates and leave the wires disconnected. Keep the target with the
+    // lexicographically smaller stable item key stationary and move only its
+    // peer onto it.
+    let mut keep = vec![true; fixes.len()];
+    for left in 0..fixes.len() {
+        for right in (left + 1)..fixes.len() {
+            if points_coincident(
+                fixes[left].from.0,
+                fixes[left].from.1,
+                fixes[right].to.0,
+                fixes[right].to.1,
+                exact_tol,
+            ) && points_coincident(
+                fixes[left].to.0,
+                fixes[left].to.1,
+                fixes[right].from.0,
+                fixes[right].from.1,
+                exact_tol,
+            ) {
+                if fixes[left].stable_key() <= fixes[right].stable_key() {
+                    keep[left] = false;
+                } else {
+                    keep[right] = false;
+                }
+            }
+        }
+    }
+    fixes = fixes
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(fix, keep)| keep.then_some(fix))
+        .collect();
+
+    // Resolve every target structurally before constructing a replacement. A
+    // failure refuses the whole operation and leaves the document unchanged.
+    let mut file_edits = Vec::with_capacity(fixes.len());
+    for fix in &fixes {
+        let (start, end) = match wire_endpoint_block(&content, &fix.uuid, fix.endpoint) {
+            Ok(range) => range,
+            Err(error) => return Ok(error.into_result()),
+        };
+        let tag = parse_sexp(&content[start..end])
+            .ok()
+            .and_then(|node| node.head().map(ToOwned::to_owned))
+            .unwrap_or_else(|| "xy".to_owned());
+        file_edits.push(SexpEdit::replace(
+            start,
+            end,
+            format!("({tag} {} {})", fix.to.0, fix.to.1),
+        ));
+    }
+
+    if dry_run || fixes.is_empty() {
+        return Ok(CallToolResult::json(&json!({
+            "fixes_found": fixes.len(),
+            "applied": false,
+            "dry_run": dry_run,
+            "fixes": fixes.iter().map(PlannedWireFix::as_json).collect::<Vec<_>>()
+        })));
+    }
+
+    let new_content = apply_edits(content.clone(), file_edits);
+    if let Err(error) = write_atomic_if_unchanged(&sch_path, &content, &new_content) {
+        if let Some(refusal) = connectivity_write_refusal(&sch_path, &error) {
+            return Ok(refusal);
+        }
+        return Err(error.into());
+    }
+
+    // Never report the requested coordinates as though they were committed.
+    // Reparse the saved document and derive every returned endpoint from it.
+    let (committed, _) = read_schematic(&sch_path)?;
+    let mut observed = Vec::with_capacity(fixes.len());
+    for fix in &fixes {
+        let actual = match observed_wire_endpoint(&committed, &fix.uuid, fix.endpoint) {
+            Ok(point) => point,
+            Err(error) => return Ok(error.into_result()),
+        };
+        if !points_coincident(actual.0, actual.1, fix.to.0, fix.to.1, 1e-9) {
+            return Ok(stale_connectivity_target(
+                format!("wire {} {} endpoint", fix.uuid, fix.endpoint.name()),
+                format!(
+                    "committed readback was ({}, {}) instead of ({}, {})",
+                    actual.0, actual.1, fix.to.0, fix.to.1
+                ),
+            ));
+        }
+        observed.push(json!({
+            "wire_uuid": fix.uuid,
+            "endpoint": fix.endpoint.name(),
+            "from": { "x": fix.from.0, "y": fix.from.1 },
+            "to": { "x": actual.0, "y": actual.1 }
+        }));
     }
 
     Ok(CallToolResult::json(&json!({
-        "fixes_found": fixes.len(),
-        "applied": !dry_run && !fixes.is_empty(),
-        "dry_run": dry_run,
-        "fixes": fixes
+        "fixes_found": observed.len(),
+        "applied": !observed.is_empty(),
+        "dry_run": false,
+        "fixes": observed
     })))
+}
+
+/// Collapse different schematic objects that identify the same geometric
+/// destination. Ambiguity is about coordinates, not how many pins, labels, or
+/// wire endpoints happen to coexist there.
+fn distinct_geometric_destinations(candidates: &[(f64, f64)], tolerance: f64) -> Vec<(f64, f64)> {
+    let mut destinations = Vec::new();
+    for &(x, y) in candidates {
+        if !destinations
+            .iter()
+            .any(|&(dx, dy)| points_coincident(x, y, dx, dy, tolerance))
+        {
+            destinations.push((x, y));
+        }
+    }
+    destinations
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WireEndpoint {
+    Start,
+    End,
+}
+
+impl WireEndpoint {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::End => "end",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PlannedWireFix {
+    uuid: String,
+    endpoint: WireEndpoint,
+    from: (f64, f64),
+    to: (f64, f64),
+}
+
+impl PlannedWireFix {
+    fn stable_key(&self) -> (&str, &'static str) {
+        (&self.uuid, self.endpoint.name())
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        json!({
+            "wire_uuid": self.uuid,
+            "endpoint": self.endpoint.name(),
+            "from": { "x": self.from.0, "y": self.from.1 },
+            "to": { "x": self.to.0, "y": self.to.1 }
+        })
+    }
+}
+
+#[derive(Debug)]
+enum ConnectivityTargetError {
+    Ambiguous {
+        target: String,
+        candidates: Vec<String>,
+    },
+    Stale {
+        target: String,
+        reason: String,
+    },
+}
+
+impl ConnectivityTargetError {
+    fn into_result(self) -> CallToolResult {
+        match self {
+            Self::Ambiguous { target, candidates } => stale_connectivity_target(
+                target,
+                format!(
+                    "more than one schematic item identifies the target: {}",
+                    candidates.join(", ")
+                ),
+            ),
+            Self::Stale { target, reason } => stale_connectivity_target(target, reason),
+        }
+    }
+}
+
+fn stale_connectivity_target(
+    target: impl Into<String>,
+    reason: impl Into<String>,
+) -> CallToolResult {
+    let target = target.into();
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        ToolErrorKind::StaleTarget {
+            target: target.clone(),
+            reason: reason.clone(),
+        },
+        format!("cannot safely edit {target}: {reason}"),
+    )
+}
+
+fn connectivity_write_refusal(path: &Path, error: &SexpError) -> Option<CallToolResult> {
+    let reason = match error {
+        SexpError::Conflict { .. } => {
+            "the schematic changed after connectivity fixes were planned; reload and retry"
+        }
+        SexpError::KiCadEditorLocked { .. } => {
+            "KiCad owns the schematic; use a live editor mutation or close the document"
+        }
+        _ => return None,
+    };
+    Some(stale_connectivity_target(
+        path.display().to_string(),
+        reason,
+    ))
+}
+
+fn node_uuid(node: &SexpNode) -> Option<&str> {
+    node.find("uuid")
+        .and_then(|uuid| uuid.get(1))
+        .and_then(SexpNode::as_str)
+}
+
+fn wire_block(content: &str, uuid: &str) -> Result<(usize, usize), ConnectivityTargetError> {
+    let target = format!("wire UUID {uuid}");
+    let mut matches = Vec::new();
+    for (start, end) in find_direct_child_blocks(content, "kicad_sch") {
+        let Ok(node) = parse_sexp(&content[start..end]) else {
+            continue;
+        };
+        if node_uuid(&node) == Some(uuid) {
+            matches.push((start, end, node.head().unwrap_or("unknown").to_owned()));
+        }
+    }
+
+    match matches.as_slice() {
+        [] => Err(ConnectivityTargetError::Stale {
+            target,
+            reason: "no top-level schematic item has that UUID".to_owned(),
+        }),
+        [(start, end, kind)] if kind == "wire" => Ok((*start, *end)),
+        [(_, _, kind)] => Err(ConnectivityTargetError::Stale {
+            target,
+            reason: format!("the UUID identifies a {kind}, not a wire"),
+        }),
+        _ => Err(ConnectivityTargetError::Ambiguous {
+            target,
+            candidates: matches
+                .iter()
+                .map(|(start, _, kind)| format!("{kind} at byte {start}"))
+                .collect(),
+        }),
+    }
+}
+
+fn direct_children_with_tag(source: &str, parent: &str, tag: &str) -> Vec<(usize, usize)> {
+    find_direct_child_blocks(source, parent)
+        .into_iter()
+        .filter(|(start, end)| {
+            parse_sexp(&source[*start..*end])
+                .ok()
+                .is_some_and(|node| node.head() == Some(tag))
+        })
+        .collect()
+}
+
+fn wire_endpoint_block(
+    content: &str,
+    uuid: &str,
+    endpoint: WireEndpoint,
+) -> Result<(usize, usize), ConnectivityTargetError> {
+    let (wire_start, wire_end) = wire_block(content, uuid)?;
+    let wire = &content[wire_start..wire_end];
+    let pts = direct_children_with_tag(wire, "wire", "pts");
+    let legacy_start = direct_children_with_tag(wire, "wire", "start");
+    let legacy_end = direct_children_with_tag(wire, "wire", "end");
+    let target = format!("wire UUID {uuid} {} endpoint", endpoint.name());
+
+    if pts.len() == 1 && legacy_start.is_empty() && legacy_end.is_empty() {
+        let (pts_start, pts_end) = pts[0];
+        let pts_source = &wire[pts_start..pts_end];
+        let xy = direct_children_with_tag(pts_source, "pts", "xy");
+        if xy.len() != 2 {
+            return Err(ConnectivityTargetError::Stale {
+                target,
+                reason: format!("expected exactly two xy points, observed {}", xy.len()),
+            });
+        }
+        let (start, end) = xy[match endpoint {
+            WireEndpoint::Start => 0,
+            WireEndpoint::End => 1,
+        }];
+        return Ok((wire_start + pts_start + start, wire_start + pts_start + end));
+    }
+
+    if pts.is_empty() && legacy_start.len() == 1 && legacy_end.len() == 1 {
+        let (start, end) = match endpoint {
+            WireEndpoint::Start => legacy_start[0],
+            WireEndpoint::End => legacy_end[0],
+        };
+        return Ok((wire_start + start, wire_start + end));
+    }
+
+    Err(ConnectivityTargetError::Stale {
+        target,
+        reason: "wire endpoint representation is missing or structurally ambiguous".to_owned(),
+    })
+}
+
+fn observed_wire_endpoint(
+    content: &str,
+    uuid: &str,
+    endpoint: WireEndpoint,
+) -> Result<(f64, f64), ConnectivityTargetError> {
+    let (start, end) = wire_endpoint_block(content, uuid, endpoint)?;
+    let node =
+        parse_sexp(&content[start..end]).map_err(|error| ConnectivityTargetError::Stale {
+            target: format!("wire UUID {uuid} {} endpoint", endpoint.name()),
+            reason: error.to_string(),
+        })?;
+    let x = node
+        .get_f64(1)
+        .ok_or_else(|| ConnectivityTargetError::Stale {
+            target: format!("wire UUID {uuid} {} endpoint", endpoint.name()),
+            reason: "x coordinate is missing".to_owned(),
+        })?;
+    let y = node
+        .get_f64(2)
+        .ok_or_else(|| ConnectivityTargetError::Stale {
+            target: format!("wire UUID {uuid} {} endpoint", endpoint.name()),
+            reason: "y coordinate is missing".to_owned(),
+        })?;
+    Ok((x, y))
 }
 
 #[cfg(test)]
@@ -998,6 +1338,201 @@ mod multi_unit_connectivity_tests {
     }
 }
 
+#[cfg(test)]
+mod connectivity_edit_tests {
+    use super::*;
+    use crate::mcp::error::extract_error_kind;
+    use crate::tools::ServerConfig;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    const KICAD_STRUCTURAL_FIXTURE: &str =
+        include_str!("../../tests/fixtures/structural_scans_kicad10.kicad_sch");
+
+    fn fixture(uuid: Option<&str>, decoy: &str, labels: &str) -> String {
+        let uuid = uuid
+            .map(|uuid| format!("\r\n\t\t(uuid \"{uuid}\")"))
+            .unwrap_or_default();
+        format!(
+            "(kicad_sch\r\n\t(version 20231120)\r\n{decoy}\t(wire\r\n\t\t(pts\r\n\t\t\t(xy 0 0)\r\n\t\t\t(xy 10.04 0)\r\n\t\t)\r\n\t\t(stroke (width 0) (type default)){uuid}\r\n\t)\r\n{labels})\r\n"
+        )
+    }
+
+    fn label(name: &str, x: f64, uuid: &str) -> String {
+        format!("\t(label \"{name}\"\r\n\t\t(at {x} 0 0)\r\n\t\t(uuid \"{uuid}\")\r\n\t)\r\n")
+    }
+
+    async fn run_fix(content: &str) -> (CallToolResult, tempfile::NamedTempFile) {
+        let mut file = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file.flush().unwrap();
+        let context = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_fix_connectivity(
+            &json!({
+                "schematic": file.path().to_str().unwrap(),
+                "snap_tolerance": 0.05,
+                "dry_run": false
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        (result, file)
+    }
+
+    fn response(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text response");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tab_crlf_kicad10_wire_is_edited_structurally_and_read_back() {
+        let decoy = "\t(symbol\r\n\t\t(property \"decoy\" \"nested\"\r\n\t\t\t(uuid \"wire-1\")\r\n\t\t)\r\n\t\t(uuid \"symbol-1\")\r\n\t)\r\n";
+        let original = fixture(Some("wire-1"), decoy, &label("N", 10.0, "label-1"));
+        let (result, file) = run_fix(&original).await;
+
+        assert!(!result.is_error, "{result:?}");
+        let body = response(&result);
+        assert_eq!(body["fixes_found"], 1);
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["fixes"][0]["wire_uuid"], "wire-1");
+        assert_eq!(body["fixes"][0]["endpoint"], "end");
+        assert_eq!(body["fixes"][0]["to"], json!({ "x": 10.0, "y": 0.0 }));
+
+        let committed = std::fs::read_to_string(file.path()).unwrap();
+        assert!(committed.contains("\r\n\t\t\t(xy 0 0)\r\n"));
+        assert!(committed.contains("\r\n\t\t\t(xy 10 0)\r\n"));
+        assert!(committed.contains("(property \"decoy\" \"nested\""));
+        assert_eq!(
+            observed_wire_endpoint(&committed, "wire-1", WireEndpoint::End).unwrap(),
+            (10.0, 0.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn coincident_kicad_pin_and_label_are_one_snap_destination() {
+        let tree = parse_sexp(KICAD_STRUCTURAL_FIXTURE).unwrap();
+        let destination = (190.5, 193.04);
+        assert!(extract_labels(&tree).iter().any(|label| points_coincident(
+            label.x,
+            label.y,
+            destination.0,
+            destination.1,
+            1e-9
+        )));
+        assert!(placed_pins(&tree).into_iter().any(|(pin, transform)| {
+            let endpoint = pin_endpoint(&pin, transform);
+            points_coincident(endpoint.0, endpoint.1, destination.0, destination.1, 1e-9)
+        }));
+
+        let (result, file) = run_fix(KICAD_STRUCTURAL_FIXTURE).await;
+
+        assert!(!result.is_error, "{result:?}");
+        let body = response(&result);
+        assert_eq!(body["fixes_found"], 1);
+        assert_eq!(
+            body["fixes"][0]["wire_uuid"],
+            "11111111-2222-4333-8444-555555555555"
+        );
+        assert_eq!(body["fixes"][0]["to"], json!({ "x": 190.5, "y": 193.04 }));
+        let committed = std::fs::read_to_string(file.path()).unwrap();
+        assert_eq!(
+            observed_wire_endpoint(
+                &committed,
+                "11111111-2222-4333-8444-555555555555",
+                WireEndpoint::Start,
+            )
+            .unwrap(),
+            destination
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_without_uuid_is_a_stale_refusal_and_does_not_write() {
+        let original = fixture(None, "", &label("N", 10.0, "label-1"));
+        let (result, file) = run_fix(&original).await;
+
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn two_distinct_snap_destinations_are_refused_without_writing() {
+        let labels = format!(
+            "{}{}",
+            label("LEFT", 10.0, "label-1"),
+            label("RIGHT", 10.08, "label-2")
+        );
+        let original = fixture(Some("wire-1"), "", &labels);
+        let (result, file) = run_fix(&original).await;
+
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn reciprocal_wire_endpoints_coalesce_to_one_observed_connection() {
+        let original = "(kicad_sch\r\n\t(version 20231120)\r\n\t(wire\r\n\t\t(pts (xy 0 0) (xy 10 0))\r\n\t\t(uuid \"wire-a\")\r\n\t)\r\n\t(wire\r\n\t\t(pts (xy 10.04 0) (xy 20 0))\r\n\t\t(uuid \"wire-b\")\r\n\t)\r\n)\r\n";
+        let (result, file) = run_fix(original).await;
+
+        assert!(!result.is_error, "{result:?}");
+        let body = response(&result);
+        assert_eq!(body["fixes_found"], 1);
+        assert_eq!(body["fixes"][0]["wire_uuid"], "wire-b");
+        assert_eq!(body["fixes"][0]["to"], json!({ "x": 10.0, "y": 0.0 }));
+
+        let committed = std::fs::read_to_string(file.path()).unwrap();
+        let left = observed_wire_endpoint(&committed, "wire-a", WireEndpoint::End).unwrap();
+        let right = observed_wire_endpoint(&committed, "wire-b", WireEndpoint::Start).unwrap();
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn duplicate_top_level_uuid_is_a_stale_refusal() {
+        let content = "(kicad_sch\n  (wire (start 0 0) (end 1 0) (uuid \"dup\"))\n  (wire (start 2 0) (end 3 0) (uuid \"dup\"))\n)";
+        let error = wire_endpoint_block(content, "dup", WireEndpoint::Start).unwrap_err();
+        assert!(matches!(&error, ConnectivityTargetError::Ambiguous { .. }));
+        assert_eq!(
+            extract_error_kind(&error.into_result()).as_deref(),
+            Some("stale_target")
+        );
+    }
+
+    #[test]
+    fn uuid_on_wrong_item_kind_is_stale() {
+        let content =
+            "(kicad_sch\n  (junction (at 1 2) (diameter 0) (color 0 0 0 0) (uuid \"not-wire\"))\n)";
+        let error = wire_endpoint_block(content, "not-wire", WireEndpoint::Start).unwrap_err();
+        assert!(matches!(error, ConnectivityTargetError::Stale { .. }));
+    }
+
+    #[test]
+    fn legacy_endpoint_keeps_its_structural_tag() {
+        let content = "(kicad_sch\n  (wire (start 1 2) (end 3 4) (uuid \"legacy\"))\n)";
+        let (start, end) = wire_endpoint_block(content, "legacy", WireEndpoint::End).unwrap();
+        assert_eq!(&content[start..end], "(end 3 4)");
+        assert_eq!(
+            observed_wire_endpoint(content, "legacy", WireEndpoint::End).unwrap(),
+            (3.0, 4.0)
+        );
+    }
+
+    #[test]
+    fn stale_revision_maps_to_structured_refusal() {
+        let path = Path::new("design.kicad_sch");
+        let error = SexpError::Conflict {
+            path: path.to_path_buf(),
+        };
+        let result = connectivity_write_refusal(path, &error).unwrap();
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+    }
+}
+
 // ─── Project-root detection for ERC ───────────────────────────────────────────
 
 /// The root schematic of the project that owns `file` as a sub-sheet, if any.
@@ -1009,63 +1544,14 @@ mod multi_unit_connectivity_tests {
 /// the invocation rather than the design, and the obvious remedy — registering
 /// the library again — is the wrong one, so the case is worth naming.
 ///
-/// Returns `None` for a schematic that is a root in its own right, one that
-/// belongs to no project, and one that sits beside a project without appearing
-/// in its sheet tree.
-fn owning_project_root(file: &Path) -> Option<PathBuf> {
-    if file.with_extension("kicad_pro").is_file() {
-        return None;
-    }
-    let root = project_root_schematic(&crate::tools::library::project_root_for(file)?)?;
-    if same_file(&root, file) {
-        return None;
-    }
-    let mut visited = HashSet::new();
-    sheet_tree_contains(&root, file, 0, &mut visited).then_some(root)
-}
-
-/// The `<stem>.kicad_sch` beside the single `.kicad_pro` in `dir`. A directory
-/// holding more than one project says nothing definite about which root a loose
-/// sheet belongs to, so it yields nothing rather than a guess.
-fn project_root_schematic(dir: &Path) -> Option<PathBuf> {
-    let mut found: Option<PathBuf> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "kicad_pro") {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(path);
-        }
-    }
-    let sch = found?.with_extension("kicad_sch");
-    sch.is_file().then_some(sch)
-}
-
-/// Whether `target` is reachable as a sheet from `root`. Depth and visited set
-/// guard the same way [`crate::tools::sch_hierarchy::build_hierarchy_node`]
-/// does: a sheet may reference a file that references it back.
-fn sheet_tree_contains(
-    root: &Path,
-    target: &Path,
-    depth: usize,
-    visited: &mut HashSet<PathBuf>,
-) -> bool {
-    if depth > crate::tools::sch_hierarchy::MAX_HIERARCHY_DEPTH {
-        return false;
-    }
-    let canon = canonical(root);
-    if !visited.insert(canon) {
-        return false;
-    }
-    let Ok(sch) = konnect_schematic_editor::Schematic::load(root) else {
-        return false;
-    };
-    let dir = root.parent().unwrap_or_else(|| Path::new("."));
-    sch.sheets.iter().any(|sheet| {
-        let child = dir.join(sheet.file());
-        same_file(&child, target) || sheet_tree_contains(&child, target, depth + 1, visited)
-    })
+/// Returns `None` for a proven root or a loose schematic with no project
+/// candidate. Unproven or ambiguous ownership is a structured conflict.
+fn owning_project_root(file: &Path) -> Result<Option<PathBuf>, crate::tools::SchematicTargetError> {
+    Ok(
+        crate::tools::resolve_schematic_ownership(file)?.and_then(|ownership| {
+            (!same_file(&ownership.root_schematic, file)).then_some(ownership.root_schematic)
+        }),
+    )
 }
 
 /// Path equality that survives `.\foo` versus `foo` and case-insensitive
@@ -1196,7 +1682,7 @@ mod tests {
         let root = root_with_child(tmp.path(), "proj.kicad_sch", "child.kicad_sch");
         let child = blank(tmp.path(), "child.kicad_sch");
 
-        assert_eq!(owning_project_root(&child), Some(root));
+        assert_eq!(owning_project_root(&child).unwrap(), Some(root));
     }
 
     #[test]
@@ -1206,7 +1692,7 @@ mod tests {
         let root = root_with_child(tmp.path(), "proj.kicad_sch", "child.kicad_sch");
         blank(tmp.path(), "child.kicad_sch");
 
-        assert_eq!(owning_project_root(&root), None);
+        assert_eq!(owning_project_root(&root).unwrap(), None);
     }
 
     #[test]
@@ -1214,7 +1700,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let loose = blank(tmp.path(), "loose.kicad_sch");
 
-        assert_eq!(owning_project_root(&loose), None);
+        assert_eq!(owning_project_root(&loose).unwrap(), None);
     }
 
     /// The refusal is a structured `invalid_argument` naming `schematic`, so a
@@ -1263,14 +1749,42 @@ mod tests {
     /// Sitting beside a project is not the same as belonging to it — the file
     /// has to appear in the sheet tree.
     #[test]
-    fn unrelated_neighbour_is_left_alone() {
+    fn unrelated_neighbour_returns_ownership_conflict() {
         let tmp = TempDir::new().unwrap();
         write(tmp.path(), "proj.kicad_pro", "{}");
         root_with_child(tmp.path(), "proj.kicad_sch", "child.kicad_sch");
         blank(tmp.path(), "child.kicad_sch");
         let stranger = blank(tmp.path(), "stranger.kicad_sch");
 
-        assert_eq!(owning_project_root(&stranger), None);
+        let result = owning_project_root(&stranger)
+            .unwrap_err()
+            .into_tool_result();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("conflict")
+        );
+    }
+
+    #[test]
+    fn sibling_project_does_not_bypass_erc_ownership_conflict() {
+        let directory = TempDir::new().unwrap();
+        let (outer, _) = crate::tools::schematic_target_tests::native_project(directory.path());
+        let (inner, _) =
+            crate::tools::schematic_target_tests::native_project(&directory.path().join("nested"));
+        let content = std::fs::read_to_string(&outer).unwrap();
+        std::fs::write(
+            &outer,
+            content.replace(
+                "\"ampli_ht.kicad_sch\"",
+                "\"nested/complex_hierarchy.kicad_sch\"",
+            ),
+        )
+        .unwrap();
+        let result = owning_project_root(&inner).unwrap_err().into_tool_result();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("conflict")
+        );
     }
 
     /// A sheet cycle must not hang the walk.
@@ -1282,6 +1796,12 @@ mod tests {
         root_with_child(tmp.path(), "a.kicad_sch", "proj.kicad_sch");
         let stranger = blank(tmp.path(), "stranger.kicad_sch");
 
-        assert_eq!(owning_project_root(&stranger), None);
+        let result = owning_project_root(&stranger)
+            .unwrap_err()
+            .into_tool_result();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("conflict")
+        );
     }
 }

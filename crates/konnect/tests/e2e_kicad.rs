@@ -139,6 +139,45 @@ fn body(result: &Value) -> Value {
 }
 
 #[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
+fn structural_scan_fixture_reloads_through_real_kicad() {
+    let Some(kicad_cli) = find_kicad_cli() else {
+        panic!("kicad-cli not found — set KICAD_CLI or install KiCAD (this test is e2e-only)");
+    };
+    let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../konnect-core/tests/fixtures/structural_scans_kicad10.kicad_sch");
+    let directory = tempfile::tempdir().unwrap();
+    let schematic = directory.path().join("structural_scans.kicad_sch");
+    std::fs::copy(&source, &schematic).unwrap();
+
+    let upgrade = Command::new(&kicad_cli)
+        .args(["sch", "upgrade", "--force"])
+        .arg(&schematic)
+        .output()
+        .expect("failed to run KiCad schematic upgrade");
+    assert!(
+        upgrade.status.success(),
+        "KiCad could not reload and save the structural fixture: {}",
+        String::from_utf8_lossy(&upgrade.stderr)
+    );
+
+    let netlist = directory.path().join("structural_scans.net");
+    let export = Command::new(&kicad_cli)
+        .args(["sch", "export", "netlist", "--output"])
+        .arg(&netlist)
+        .arg(&schematic)
+        .output()
+        .expect("failed to run KiCad netlist export");
+    assert!(
+        export.status.success(),
+        "KiCad could not export the reloaded structural fixture: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let netlist = std::fs::read_to_string(netlist).expect("KiCad wrote no netlist");
+    assert!(netlist.contains("R1") && netlist.contains("R3"));
+}
+
+#[test]
 #[ignore = "requires kicad-cli + symbol libraries; run via e2e workflow"]
 fn full_design_loop_with_real_kicad() {
     let Some(kicad_cli) = find_kicad_cli() else {

@@ -15,12 +15,17 @@
 //! lookups within a session. Responses carry a `"cached"` field so callers
 //! can see whether a given result came from cache.
 
-use crate::mcp::protocol::CallToolResult;
+use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
-use konnect_sexp::writer::{read_consistent, write_atomic_if_unchanged};
+use konnect_sexp::{
+    command::{commit_command, prepare_command, ItemId, SchematicCommand},
+    parse_sexp,
+    writer::{find_direct_child_blocks, read_consistent},
+    SexpError, SexpNode,
+};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
@@ -838,16 +843,17 @@ async fn handle_enrich_datasheets(
     let read_path = sch_path.clone();
     let content = tokio::task::spawn_blocking(move || read_consistent(&read_path)).await??;
 
-    // Find all LCSC property values in the schematic
-    let mut lcsc_ids: Vec<String> = Vec::new();
-    let mut search = content.as_str();
-    while let Some(pos) = search.find("(property \"LCSC\" \"") {
-        let after = &search[pos + 18..];
-        if let Some(end) = after.find('"') {
-            lcsc_ids.push(after[..end].to_string());
-        }
-        search = &search[pos + 1..];
-    }
+    // Only placed, top-level symbol instances are enrichment targets. Library
+    // definitions, quoted text, and nested decoys must not enter the target
+    // set merely because they contain the same property spelling.
+    let symbols = match validated_datasheet_symbols(&content) {
+        Ok(symbols) => symbols,
+        Err(error) => return Ok(error.into_result()),
+    };
+    let mut lcsc_ids: Vec<String> = symbols
+        .iter()
+        .map(|symbol| symbol.lcsc_id.clone())
+        .collect();
     lcsc_ids.sort();
     lcsc_ids.dedup();
 
@@ -866,8 +872,7 @@ async fn handle_enrich_datasheets(
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let mut enriched = 0usize;
-    let mut new_content = content.clone();
+    let mut urls = HashMap::new();
 
     for lcsc_id in &lcsc_ids {
         let url = format!(
@@ -881,57 +886,378 @@ async fn handle_enrich_datasheets(
                         .pointer("/result/dataManualUrl")
                         .and_then(|v| v.as_str())
                     {
-                        // Find components with this LCSC ID and update their Datasheet property.
-                        // Pattern: find (property "LCSC" "CxxxID") → walk back to symbol block →
-                        // find (property "Datasheet" "...") and replace the URL.
-                        let lcsc_pat = format!(r#"(property "LCSC" "{}")"#, lcsc_id);
-                        let mut search_from = 0usize;
-                        while let Some(lcsc_pos) = new_content[search_from..]
-                            .find(&lcsc_pat)
-                            .map(|i| i + search_from)
-                        {
-                            // Find the enclosing symbol block
-                            let before = &new_content[..lcsc_pos];
-                            if let Some(sym_start) = before.rfind("\n  (symbol") {
-                                let sym_block = &new_content[sym_start..];
-                                // Find Datasheet property within this symbol
-                                let ds_pat = r#"(property "Datasheet" ""#;
-                                if let Some(ds_offset) = sym_block.find(ds_pat) {
-                                    let ds_abs = sym_start + ds_offset + ds_pat.len();
-                                    if let Some(ds_end) = new_content[ds_abs..].find('"') {
-                                        let existing = &new_content[ds_abs..ds_abs + ds_end];
-                                        if overwrite || existing == "~" || existing.is_empty() {
-                                            new_content = format!(
-                                                "{}{}{}",
-                                                &new_content[..ds_abs],
-                                                datasheet_url,
-                                                &new_content[ds_abs + ds_end..]
-                                            );
-                                            enriched += 1;
-                                        }
-                                    }
-                                }
-                            }
-                            search_from = lcsc_pos + 1;
-                        }
+                        urls.insert(lcsc_id.clone(), datasheet_url.to_owned());
                     }
                 }
             }
         }
     }
 
-    // Write back if anything changed
-    if enriched > 0 {
-        write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
-    }
+    let plan = match plan_datasheet_enrichment(&content, &urls, overwrite) {
+        Ok(plan) => plan,
+        Err(error) => return Ok(error.into_result()),
+    };
+
+    let observed_updates = if let Some((command, planned)) = plan {
+        if let Err(error) = commit_command(&sch_path, &command) {
+            if let Some(refusal) = datasheet_commit_refusal(&sch_path, &error) {
+                return Ok(refusal);
+            }
+            return Err(error.into());
+        }
+        let committed = read_consistent(&sch_path)?;
+        match observe_datasheet_updates(&committed, &planned) {
+            Ok(observed) => observed,
+            Err(error) => return Ok(error.into_result()),
+        }
+    } else {
+        Vec::new()
+    };
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "lcsc_ids_found": lcsc_ids.len(),
-            "datasheets_enriched": enriched,
+            "datasheets_enriched": observed_updates.len(),
             "schematic": sch_path.to_str().unwrap_or("")
         }))
         .unwrap(),
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct DatasheetSymbolTarget {
+    uuid: String,
+    reference: String,
+    unit: u32,
+    lcsc_id: String,
+    datasheet: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedDatasheetUpdate {
+    target: DatasheetSymbolTarget,
+    datasheet_url: String,
+}
+
+#[derive(Debug)]
+enum DatasheetTargetError {
+    Ambiguous {
+        target: String,
+        candidates: Vec<String>,
+    },
+    Stale {
+        target: String,
+        reason: String,
+    },
+}
+
+impl DatasheetTargetError {
+    fn stale(target: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::Stale {
+            target: target.into(),
+            reason: reason.into(),
+        }
+    }
+
+    fn from_sexp(target: impl Into<String>, error: SexpError) -> Self {
+        Self::stale(target, error.to_string())
+    }
+
+    fn into_result(self) -> CallToolResult {
+        match self {
+            Self::Ambiguous { target, candidates } => {
+                let reason = format!(
+                    "more than one candidate was observed: {}",
+                    candidates.join(", ")
+                );
+                CallToolResult::error_kind(
+                    ToolErrorKind::StaleTarget {
+                        target: target.clone(),
+                        reason: reason.clone(),
+                    },
+                    format!("cannot safely enrich {target}: {reason}"),
+                )
+            }
+            Self::Stale { target, reason } => CallToolResult::error_kind(
+                ToolErrorKind::StaleTarget {
+                    target: target.clone(),
+                    reason: reason.clone(),
+                },
+                format!("cannot safely enrich {target}: {reason}"),
+            ),
+        }
+    }
+}
+
+fn direct_property_values(node: &SexpNode, name: &str) -> Vec<String> {
+    node.find_all("property")
+        .into_iter()
+        .filter(|property| property.get(1).and_then(SexpNode::as_str) == Some(name))
+        .filter_map(|property| property.get(2).and_then(SexpNode::as_str))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn one_identity_value(
+    values: Vec<String>,
+    field: &str,
+    item: &str,
+) -> Result<String, DatasheetTargetError> {
+    match values.as_slice() {
+        [value] if !value.trim().is_empty() => Ok(value.clone()),
+        [] | [_] => Err(DatasheetTargetError::stale(
+            item,
+            format!("{field} is missing or empty"),
+        )),
+        _ => Err(DatasheetTargetError::Ambiguous {
+            target: format!("{field} on {item}"),
+            candidates: values,
+        }),
+    }
+}
+
+fn validated_datasheet_symbols(
+    content: &str,
+) -> Result<Vec<DatasheetSymbolTarget>, DatasheetTargetError> {
+    let ranges = find_direct_child_blocks(content, "kicad_sch");
+    if ranges.is_empty() {
+        return Err(DatasheetTargetError::stale(
+            "schematic document",
+            "the kicad_sch root is missing or malformed",
+        ));
+    }
+
+    let mut uuid_owners: HashMap<String, Vec<String>> = HashMap::new();
+    let mut symbols = Vec::new();
+    for (start, end) in ranges {
+        let node = parse_sexp(&content[start..end])
+            .map_err(|error| DatasheetTargetError::from_sexp("schematic item", error))?;
+        let kind = node.head().unwrap_or("unknown");
+        if let Some(uuid) = node
+            .find("uuid")
+            .and_then(|uuid| uuid.get(1))
+            .and_then(SexpNode::as_str)
+        {
+            uuid_owners
+                .entry(uuid.to_owned())
+                .or_default()
+                .push(format!("{kind} at byte {start}"));
+        }
+        if kind != "symbol" {
+            continue;
+        }
+
+        let lcsc = direct_property_values(&node, "LCSC");
+        if lcsc.is_empty() {
+            continue;
+        }
+        let item = format!("symbol at byte {start}");
+        let lcsc_id = one_identity_value(lcsc, "LCSC", &item)?;
+        let reference = one_identity_value(
+            direct_property_values(&node, "Reference"),
+            "Reference",
+            &item,
+        )?;
+        let uuid = node
+            .find("uuid")
+            .and_then(|uuid| uuid.get(1))
+            .and_then(SexpNode::as_str)
+            .filter(|uuid| !uuid.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| DatasheetTargetError::stale(&item, "UUID is missing or empty"))?;
+        let units = node.find_all("unit");
+        let unit = match units.as_slice() {
+            [] => 1,
+            [unit] => unit
+                .get(1)
+                .and_then(SexpNode::as_str)
+                .and_then(|unit| unit.parse::<u32>().ok())
+                .filter(|unit| *unit > 0)
+                .ok_or_else(|| DatasheetTargetError::stale(&item, "unit is invalid"))?,
+            _ => {
+                return Err(DatasheetTargetError::Ambiguous {
+                    target: format!("unit on {item}"),
+                    candidates: units
+                        .iter()
+                        .filter_map(|unit| unit.get(1).and_then(SexpNode::as_str))
+                        .map(ToOwned::to_owned)
+                        .collect(),
+                })
+            }
+        };
+        let datasheets = direct_property_values(&node, "Datasheet");
+        let datasheet = match datasheets.as_slice() {
+            [] => None,
+            [value] => Some(value.clone()),
+            _ => {
+                return Err(DatasheetTargetError::Ambiguous {
+                    target: format!("Datasheet on {reference} unit {unit}"),
+                    candidates: datasheets,
+                })
+            }
+        };
+        symbols.push(DatasheetSymbolTarget {
+            uuid,
+            reference,
+            unit,
+            lcsc_id,
+            datasheet,
+        });
+    }
+
+    for symbol in &symbols {
+        if let Some(owners) = uuid_owners
+            .get(&symbol.uuid)
+            .filter(|owners| owners.len() > 1)
+        {
+            return Err(DatasheetTargetError::Ambiguous {
+                target: format!("schematic UUID {}", symbol.uuid),
+                candidates: owners.clone(),
+            });
+        }
+    }
+
+    let mut placed: HashMap<(String, u32), Vec<String>> = HashMap::new();
+    for symbol in &symbols {
+        placed
+            .entry((symbol.reference.clone(), symbol.unit))
+            .or_default()
+            .push(symbol.uuid.clone());
+    }
+    if let Some(((reference, unit), uuids)) = placed.iter().find(|(_, uuids)| uuids.len() > 1) {
+        return Err(DatasheetTargetError::Ambiguous {
+            target: format!("symbol {reference} unit {unit}"),
+            candidates: uuids.clone(),
+        });
+    }
+
+    Ok(symbols)
+}
+
+fn plan_datasheet_enrichment(
+    content: &str,
+    urls: &HashMap<String, String>,
+    overwrite: bool,
+) -> Result<Option<(SchematicCommand, Vec<PlannedDatasheetUpdate>)>, DatasheetTargetError> {
+    let symbols = validated_datasheet_symbols(content)?;
+    let mut edited = content.to_owned();
+    let mut planned = Vec::new();
+    let path = Path::new("datasheet-enrichment.kicad_sch");
+
+    for symbol in symbols {
+        let Some(datasheet_url) = urls.get(&symbol.lcsc_id) else {
+            continue;
+        };
+        let Some(existing) = &symbol.datasheet else {
+            continue;
+        };
+        if (!overwrite && existing != "~" && !existing.is_empty()) || existing == datasheet_url {
+            continue;
+        }
+        let id = ItemId::new(symbol.uuid.clone())
+            .map_err(|error| DatasheetTargetError::from_sexp(&symbol.reference, error))?;
+        let command = SchematicCommand::set_property(
+            &edited,
+            id,
+            "Datasheet",
+            datasheet_url,
+            format!(
+                "enrich datasheet for {} unit {}",
+                symbol.reference, symbol.unit
+            ),
+        )
+        .map_err(|error| DatasheetTargetError::from_sexp(&symbol.reference, error))?;
+        edited = prepare_command(path, &edited, &command)
+            .map_err(|error| DatasheetTargetError::from_sexp(&symbol.reference, error))?
+            .0;
+        planned.push(PlannedDatasheetUpdate {
+            target: symbol,
+            datasheet_url: datasheet_url.clone(),
+        });
+    }
+
+    if planned.is_empty() {
+        return Ok(None);
+    }
+    let ids = planned
+        .iter()
+        .map(|update| ItemId::new(update.target.uuid.clone()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DatasheetTargetError::from_sexp("datasheet targets", error))?;
+    let command = SchematicCommand::replace_items_from_document(
+        content,
+        &edited,
+        ids,
+        "enrich schematic datasheets",
+    )
+    .map_err(|error| DatasheetTargetError::from_sexp("datasheet targets", error))?
+    .requiring_unchanged_document();
+    Ok(Some((command, planned)))
+}
+
+fn observe_datasheet_updates(
+    content: &str,
+    planned: &[PlannedDatasheetUpdate],
+) -> Result<Vec<serde_json::Value>, DatasheetTargetError> {
+    let symbols = validated_datasheet_symbols(content)?;
+    let mut observed = Vec::with_capacity(planned.len());
+    for update in planned {
+        let target = symbols
+            .iter()
+            .find(|symbol| symbol.uuid == update.target.uuid)
+            .ok_or_else(|| {
+                DatasheetTargetError::stale(
+                    format!("symbol UUID {}", update.target.uuid),
+                    "the committed symbol is missing",
+                )
+            })?;
+        if target.reference != update.target.reference
+            || target.unit != update.target.unit
+            || target.lcsc_id != update.target.lcsc_id
+        {
+            return Err(DatasheetTargetError::stale(
+                format!("symbol UUID {}", update.target.uuid),
+                "committed identity differs from the planned reference, unit, or LCSC ID",
+            ));
+        }
+        if target.datasheet.as_deref() != Some(&update.datasheet_url) {
+            return Err(DatasheetTargetError::stale(
+                format!("symbol {} unit {}", target.reference, target.unit),
+                format!(
+                    "committed Datasheet was {:?}, expected {}",
+                    target.datasheet, update.datasheet_url
+                ),
+            ));
+        }
+        observed.push(json!({
+            "uuid": target.uuid,
+            "reference": target.reference,
+            "unit": target.unit,
+            "lcsc_id": target.lcsc_id,
+            "datasheet_url": target.datasheet
+        }));
+    }
+    Ok(observed)
+}
+
+fn datasheet_commit_refusal(path: &Path, error: &SexpError) -> Option<CallToolResult> {
+    let reason = match error {
+        SexpError::Conflict { .. } => "the schematic changed after enrichment was planned",
+        SexpError::ItemConflict { reason, .. } => reason,
+        SexpError::KiCadEditorLocked { .. } => {
+            "KiCad owns the schematic; use a live editor mutation or close the document"
+        }
+        _ => return None,
+    };
+    Some(CallToolResult::error_kind(
+        ToolErrorKind::StaleTarget {
+            target: path.display().to_string(),
+            reason: reason.to_owned(),
+        },
+        format!(
+            "cannot commit datasheet enrichment for {}: {reason}",
+            path.display()
+        ),
     ))
 }
 
@@ -1173,6 +1499,201 @@ fn command_output(output: &std::process::Output) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod datasheet_enrichment_tests {
+    use super::*;
+    use crate::mcp::error::extract_error_kind;
+    use std::io::Write;
+
+    const KICAD_STRUCTURAL_FIXTURE: &str =
+        include_str!("../../tests/fixtures/structural_scans_kicad10.kicad_sch");
+
+    fn symbol(reference: &str, unit: u32, uuid: Option<&str>, lcsc: &str) -> String {
+        let uuid = uuid
+            .map(|uuid| format!("\r\n\t\t(uuid \"{uuid}\")"))
+            .unwrap_or_default();
+        format!(
+            "\t(symbol\r\n\t\t(lib_id \"Device:R\")\r\n\t\t(at 10 20 0)\r\n\t\t(unit {unit})\r\n\t\t(property \"Reference\" \"{reference}\")\r\n\t\t(property \"Datasheet\" \"~\")\r\n\t\t(property \"Notes\" \"decoy\"\r\n\t\t\t(property \"LCSC\" \"C-DECOY\")\r\n\t\t)\r\n\t\t(property \"LCSC\" \"{lcsc}\"){uuid}\r\n\t)\r\n"
+        )
+    }
+
+    fn schematic(body: &str) -> String {
+        format!("(kicad_sch\r\n\t(version 20231120)\r\n{body})\r\n")
+    }
+
+    fn urls(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(id, url)| ((*id).to_owned(), (*url).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn tab_crlf_multi_unit_symbols_update_atomically_and_read_back() {
+        let decoy = "\t(lib_symbols\r\n\t\t(symbol \"decoy\"\r\n\t\t\t(property \"LCSC\" \"C-LIBRARY\")\r\n\t\t)\r\n\t)\r\n";
+        let original = schematic(&format!(
+            "{decoy}{}{}",
+            symbol("U1", 1, Some("unit-1"), "C1"),
+            symbol("U1", 2, Some("unit-2"), "C1")
+        ));
+        let Some((command, planned)) = plan_datasheet_enrichment(
+            &original,
+            &urls(&[("C1", "https://example.com/u1.pdf")]),
+            false,
+        )
+        .unwrap() else {
+            panic!("expected enrichment plan");
+        };
+        assert_eq!(planned.len(), 2);
+
+        let mut file = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        file.write_all(original.as_bytes()).unwrap();
+        file.flush().unwrap();
+        let outcome = commit_command(file.path(), &command).unwrap();
+        assert!(outcome.changed);
+
+        let committed = std::fs::read_to_string(file.path()).unwrap();
+        let observed = observe_datasheet_updates(&committed, &planned).unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0]["reference"], "U1");
+        assert_eq!(observed[0]["unit"], 1);
+        assert_eq!(observed[1]["unit"], 2);
+        assert!(observed
+            .iter()
+            .all(|update| update["datasheet_url"] == "https://example.com/u1.pdf"));
+        assert!(committed.contains("\r\n\t\t(property \"Notes\" \"decoy\"\r\n"));
+        assert!(committed.contains("(property \"LCSC\" \"C-LIBRARY\")"));
+        assert!(committed.contains("(property \"LCSC\" \"C-DECOY\")"));
+    }
+
+    #[test]
+    fn kicad_authored_symbol_is_enriched_structurally_and_read_back() {
+        let Some((command, planned)) = plan_datasheet_enrichment(
+            KICAD_STRUCTURAL_FIXTURE,
+            &urls(&[("C25804", "https://example.com/c25804.pdf")]),
+            false,
+        )
+        .unwrap() else {
+            panic!("expected enrichment plan");
+        };
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].target.reference, "R1");
+
+        let mut file = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        file.write_all(KICAD_STRUCTURAL_FIXTURE.as_bytes()).unwrap();
+        file.flush().unwrap();
+        let outcome = commit_command(file.path(), &command).unwrap();
+        assert!(outcome.changed);
+
+        let committed = std::fs::read_to_string(file.path()).unwrap();
+        let observed = observe_datasheet_updates(&committed, &planned).unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0]["reference"], "R1");
+        assert_eq!(observed[0]["lcsc_id"], "C25804");
+        assert_eq!(
+            observed[0]["datasheet_url"],
+            "https://example.com/c25804.pdf"
+        );
+        parse_sexp(&committed).expect("enriched KiCad fixture must still parse");
+    }
+
+    #[test]
+    fn nested_or_library_lcsc_text_is_not_a_symbol_target() {
+        let content = schematic(
+            "\t(lib_symbols\n\t\t(symbol \"X\" (property \"LCSC\" \"C1\"))\n\t)\n\t(text \"(property LCSC C1)\" (at 0 0) (uuid \"text-1\"))\n",
+        );
+        assert!(validated_datasheet_symbols(&content).unwrap().is_empty());
+        assert!(plan_datasheet_enrichment(
+            &content,
+            &urls(&[("C1", "https://example.com/decoy.pdf")]),
+            false
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn missing_uuid_is_a_stale_target() {
+        let content = schematic(&symbol("R1", 1, None, "C1"));
+        let error = validated_datasheet_symbols(&content).unwrap_err();
+        assert!(matches!(error, DatasheetTargetError::Stale { .. }));
+    }
+
+    #[test]
+    fn duplicate_reference_and_unit_is_a_stale_refusal() {
+        let content = schematic(&format!(
+            "{}{}",
+            symbol("U1", 1, Some("first"), "C1"),
+            symbol("U1", 1, Some("second"), "C2")
+        ));
+        let error = validated_datasheet_symbols(&content).unwrap_err();
+        assert!(matches!(&error, DatasheetTargetError::Ambiguous { .. }));
+        assert_eq!(
+            extract_error_kind(&error.into_result()).as_deref(),
+            Some("stale_target")
+        );
+    }
+
+    #[test]
+    fn duplicate_uuid_is_a_stale_refusal_even_across_item_kinds() {
+        let content = schematic(&format!(
+            "{}\t(junction (at 1 2) (uuid \"shared\"))\r\n",
+            symbol("R1", 1, Some("shared"), "C1")
+        ));
+        let error = validated_datasheet_symbols(&content).unwrap_err();
+        assert!(matches!(&error, DatasheetTargetError::Ambiguous { .. }));
+        assert_eq!(
+            extract_error_kind(&error.into_result()).as_deref(),
+            Some("stale_target")
+        );
+    }
+
+    #[test]
+    fn stale_document_revision_refuses_without_overwriting() {
+        let original = schematic(&symbol("R1", 1, Some("r1"), "C1"));
+        let Some((command, _)) = plan_datasheet_enrichment(
+            &original,
+            &urls(&[("C1", "https://example.com/r1.pdf")]),
+            false,
+        )
+        .unwrap() else {
+            panic!("expected enrichment plan");
+        };
+        let mut file = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        let newer = original.replace("(at 10 20 0)", "(at 11 20 0)");
+        file.write_all(newer.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        let error = commit_command(file.path(), &command).unwrap_err();
+        let refusal = datasheet_commit_refusal(file.path(), &error).unwrap();
+        assert_eq!(
+            extract_error_kind(&refusal).as_deref(),
+            Some("stale_target")
+        );
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), newer);
+    }
+
+    #[test]
+    fn overwrite_policy_and_noop_counts_are_truthful() {
+        let original = schematic(&symbol("R1", 1, Some("r1"), "C1")).replace(
+            "(property \"Datasheet\" \"~\")",
+            "(property \"Datasheet\" \"https://existing.example/r1.pdf\")",
+        );
+        let replacements = urls(&[("C1", "https://new.example/r1.pdf")]);
+        assert!(plan_datasheet_enrichment(&original, &replacements, false)
+            .unwrap()
+            .is_none());
+        assert!(plan_datasheet_enrichment(&original, &replacements, true)
+            .unwrap()
+            .is_some());
+
+        let same = urls(&[("C1", "https://existing.example/r1.pdf")]);
+        assert!(plan_datasheet_enrichment(&original, &same, true)
+            .unwrap()
+            .is_none());
+    }
 }
 
 async fn run_java_command(

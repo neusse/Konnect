@@ -1422,7 +1422,6 @@ impl KiCadIpcClient {
             .filter(|id| !id.is_empty()))
     }
 
-    /// Delete a track by UUID.
     /// One BGA-fanout element: a via and the stub track reaching it.
     pub fn apply_fanout(
         &self,
@@ -1464,6 +1463,48 @@ impl KiCadIpcClient {
         })
     }
 
+    /// Delete one observed trace segment from the requested board.
+    ///
+    /// `DeleteItems` accepts any board-item KIID, so the item must first be
+    /// proven to belong to the requested board's trace set. KiCad 10 commonly
+    /// omits per-item deletion results; a second trace query therefore proves
+    /// the observed segment is gone before this reports success.
+    pub fn delete_trace_segment_verified(
+        &self,
+        requested: &Path,
+        uuid: &str,
+    ) -> Result<Option<IpcTrack>> {
+        let document = self.find_open_board(requested)?;
+        let before = self.get_tracks_in(document.clone(), None, None)?;
+        let Some(track) = before.into_iter().find(|track| track.uuid == uuid) else {
+            return Ok(None);
+        };
+
+        self.delete_items_in(document.clone(), vec![uuid.to_string()])?;
+        let remains = self
+            .get_tracks_in(document, None, None)
+            .with_context(|| {
+                format!(
+                    "KiCad accepted deletion of trace segment '{}' but post-delete read-back failed; the deletion may have committed",
+                    uuid
+                )
+            })?
+            .into_iter()
+            .any(|candidate| candidate.uuid == uuid);
+        if remains {
+            anyhow::bail!(
+                "KiCad accepted deletion of trace segment '{}' but read-back still reports it",
+                uuid
+            );
+        }
+        Ok(Some(track))
+    }
+
+    /// Delete a board item by UUID.
+    ///
+    /// This low-level compatibility helper does not verify an item type or
+    /// postcondition. User-facing trace deletion must use
+    /// [`Self::delete_trace_segment_verified`].
     pub fn delete_track(&self, uuid: &str) -> Result<()> {
         self.delete_items(vec![uuid.to_string()])
     }
@@ -1474,9 +1515,27 @@ impl KiCadIpcClient {
         net_filter: Option<&str>,
         layer_filter: Option<&str>,
     ) -> Result<Vec<IpcTrack>> {
-        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbTrace)?;
+        self.get_tracks_in(self.get_board_document()?, net_filter, layer_filter)
+    }
+
+    /// As [`Self::get_tracks`], targeting one exact open document.
+    pub fn get_tracks_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        net_filter: Option<&str>,
+        layer_filter: Option<&str>,
+    ) -> Result<Vec<IpcTrack>> {
+        let items =
+            self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbTrace)?;
         let mut tracks = Vec::new();
         for item in &items {
+            // KOT_PCB_TRACE is a family selector. KiCad may return vias or
+            // other routing members beside straight Track messages, and
+            // protobuf decoding is permissive enough to accept compatible
+            // bytes under the wrong declared type. Type-check before decode.
+            if !crate::builders::any_is(item, "kiapi.board.types.Track") {
+                continue;
+            }
             if let Ok(track) = kiapi::board::types::Track::decode(item.value.as_slice()) {
                 let net_name = track.net.as_ref().map(|n| n.name.as_str()).unwrap_or("");
                 let layer_name = layer_enum_to_name(track.layer);

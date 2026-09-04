@@ -272,6 +272,7 @@ fn skills_define_the_same_evidence_boundary_as_their_agents() {
 fn manufacturing_guidance_is_contract_bound_and_fail_closed() {
     let manufacture = include_str!("../assets/skills/kicad-manufacture/SKILL.md");
     let jlcpcb = include_str!("../assets/skills/kicad-manufacture/references/jlcpcb-rules.md");
+    let pcb = include_str!("../assets/skills/kicad-pcb/SKILL.md");
     let design_rules = include_str!("../assets/skills/kicad-pcb/references/design-rules.md");
     let trace_width = include_str!("../assets/skills/kicad-pcb/references/trace-width-table.md");
 
@@ -327,6 +328,19 @@ fn manufacturing_guidance_is_contract_bound_and_fail_closed() {
         assert!(
             !jlcpcb.contains(stale_value),
             "JLCPCB reference still caches volatile value `{stale_value}`"
+        );
+    }
+
+    for marker in [
+        "show call syntax only",
+        "not engineering recommendations",
+        "accepted project sizing record",
+        "current fabrication contract",
+        "report the sizing task as `INCOMPLETE`",
+    ] {
+        assert!(
+            pcb.contains(marker),
+            "PCB skill predefined-size example is missing authority marker: {marker}"
         );
     }
 
@@ -649,6 +663,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "get_active_toolsets",
         "get_recent_calls",
         "server_stats",
+        "get_installation_info",
         "auto_load_toolsets",
         "eager_toolsets",
         "kicad_cli",
@@ -697,6 +712,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "unsafe_file_fallback",
         // Structured manufacturing response field, not a callable tool.
         "files_generated",
+        // Structured hierarchy-audit response field, not a callable tool.
+        "sheet_instance_path",
     ];
 
     let mut phantom = Vec::new();

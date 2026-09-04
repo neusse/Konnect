@@ -47,10 +47,14 @@ pub enum ToolErrorKind {
     UnknownTool { tool: String },
     /// A required argument is missing or malformed.
     InvalidArgument { field: String, reason: String },
-    /// A referenced file doesn't exist or can't be read.
+    /// A referenced file or discovery directory doesn't exist or can't be read.
     FileNotFound { path: String },
-    /// A mutation would replace one or more existing filesystem targets.
+    /// A mutation conflicts with filesystem state, or schematic ownership
+    /// cannot be proven uniquely. Paths identify the conflicting evidence.
     Conflict { paths: Vec<String> },
+    /// The caller named a target, but its observed editor or document state
+    /// no longer agrees with the state required to mutate it safely.
+    StaleTarget { target: String, reason: String },
     /// A board was live earlier in this server process, but IPC is now gone;
     /// its saved file may be stale relative to lost editor state.
     UnsafeFileFallback { path: String },
@@ -70,6 +74,7 @@ impl ToolErrorKind {
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::FileNotFound { .. } => "file_not_found",
             Self::Conflict { .. } => "conflict",
+            Self::StaleTarget { .. } => "stale_target",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::HandlerError { .. } => "handler_error",
         }
@@ -169,6 +174,10 @@ mod tests {
             ToolErrorKind::FileNotFound { path: "p".into() },
             ToolErrorKind::Conflict {
                 paths: vec!["p".into()],
+            },
+            ToolErrorKind::StaleTarget {
+                target: "p".into(),
+                reason: "r".into(),
             },
             ToolErrorKind::UnsafeFileFallback { path: "p".into() },
             ToolErrorKind::HandlerError { reason: "r".into() },

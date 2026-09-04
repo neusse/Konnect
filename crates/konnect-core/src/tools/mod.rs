@@ -27,6 +27,8 @@ pub mod sch_export;
 pub mod sch_hierarchy;
 pub mod sch_wiring;
 pub mod schematic_builder;
+#[cfg(test)]
+mod schematic_placement_tests;
 pub mod svg_import;
 pub mod templates;
 pub mod verification;
@@ -1332,101 +1334,919 @@ pub struct SheetInstanceContext {
     pub project_name: String,
     /// `/root-uuid[/sheet-uuid…]`, the path from the root down to this sheet.
     pub instance_path: String,
+    /// Every structurally observed path to this document. A reused child sheet
+    /// has one entry per hierarchy instance; document-wide edits affect all of
+    /// them and must never silently choose the first.
+    pub instance_paths: Vec<String>,
     /// Whether this sheet was reached from a root other than itself.
     pub is_child_sheet: bool,
 }
 
+/// One structurally proven project owner of a schematic file.
+///
+/// Ownership is not inferred from directory ancestry alone. A child sheet is
+/// owned only when a candidate project's root schematic reaches it through
+/// parsed `(sheet (property "Sheetfile" ...))` nodes. This is the authority
+/// bound for the ancestor walk: it may inspect every ancestor so deeply nested
+/// sheets continue to work, but an unrelated project can never win merely by
+/// being higher in the filesystem (#189).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SchematicOwnership {
+    pub project_file: std::path::PathBuf,
+    pub root_schematic: std::path::PathBuf,
+    pub instance_paths: Vec<String>,
+}
+
+/// Candidate projects exist, but unique schematic ownership is not proven.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SchematicTargetError {
+    DiscoveryFailed {
+        directory: std::path::PathBuf,
+        reason: String,
+    },
+    ProjectConflict {
+        target: std::path::PathBuf,
+        roots: Vec<std::path::PathBuf>,
+    },
+    StaleTarget {
+        target: std::path::PathBuf,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for SchematicTargetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DiscoveryFailed { directory, reason } => write!(
+                formatter,
+                "Cannot inspect project candidates in directory '{}': {reason}. \
+                 Ownership was not established; restore directory access before retrying.",
+                directory.display()
+            ),
+            Self::ProjectConflict { target, roots } => write!(
+                formatter,
+                "Cannot establish unique project ownership for schematic '{}' in '{}'. \
+                 Candidate root schematics: {}. Restore the saved sheet hierarchy or \
+                 separate the independent document from unrelated projects before retrying.",
+                target.display(),
+                target
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .display(),
+                roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::StaleTarget { target, reason } => {
+                write!(
+                    formatter,
+                    "schematic '{}' is stale: {reason}",
+                    target.display()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SchematicTargetError {}
+
+impl SchematicTargetError {
+    pub(crate) fn into_tool_result(self) -> CallToolResult {
+        let message = self.to_string();
+        match self {
+            Self::DiscoveryFailed { directory, .. } => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::FileNotFound {
+                    path: directory.display().to_string(),
+                },
+                message,
+            ),
+            Self::ProjectConflict { target, roots } => {
+                let directory = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+                let mut paths = vec![directory.display().to_string()];
+                paths.extend(roots.iter().map(|root| root.display().to_string()));
+                CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::Conflict { paths },
+                    message,
+                )
+            }
+            Self::StaleTarget { target, reason } => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::StaleTarget {
+                    target: target.display().to_string(),
+                    reason: reason.clone(),
+                },
+                format!(
+                    "Schematic '{}' does not match its structurally observed target state: {}.",
+                    target.display(),
+                    reason
+                ),
+            ),
+        }
+    }
+}
+
+/// Resolve the unique project whose parsed sheet hierarchy owns `target`.
+///
+/// Every ancestor `.kicad_pro` is a candidate, independently of whether its
+/// root can be read. Exactly one proven owner resolves normally; no candidates
+/// means a loose schematic. Otherwise missing/incomplete hierarchy evidence,
+/// no owner, or multiple owners produce `conflict` with every candidate root.
+/// The walk has no arbitrary filesystem-depth bound: membership is the bound,
+/// with cycle detection and MAX_HIERARCHY_DEPTH limiting sheet traversal.
+pub(crate) fn resolve_schematic_ownership(
+    target: &std::path::Path,
+) -> Result<Option<SchematicOwnership>, SchematicTargetError> {
+    use std::collections::BTreeSet;
+
+    let Some(start) = target.parent() else {
+        return Ok(None);
+    };
+    // A relative path still belongs to the same filesystem hierarchy. Starting
+    // at its lexical parent alone would stop at cwd and miss higher projects.
+    let scan_start = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| SchematicTargetError::DiscoveryFailed {
+                directory: start.to_path_buf(),
+                reason: error.to_string(),
+            })?
+            .join(start)
+    };
+    let mut project_files = BTreeSet::new();
+    for directory in scan_start.ancestors() {
+        let discovery_error = |error: std::io::Error| SchematicTargetError::DiscoveryFailed {
+            directory: directory.to_path_buf(),
+            reason: error.to_string(),
+        };
+        let entries = std::fs::read_dir(directory).map_err(discovery_error)?;
+        for entry in entries {
+            let entry = entry.map_err(discovery_error)?;
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pro"))
+            {
+                project_files.insert(path);
+            }
+        }
+    }
+
+    let roots = project_files
+        .iter()
+        .map(|path| path.with_extension("kicad_sch"))
+        .collect::<Vec<_>>();
+    let mut owners = Vec::new();
+    let mut complete = true;
+    for project_file in project_files {
+        let root_schematic = project_file.with_extension("kicad_sch");
+        let Ok(root) = konnect_schematic_editor::Schematic::load(&root_schematic) else {
+            complete = false;
+            continue;
+        };
+        let Some(root_uuid) = root.uuid.clone() else {
+            complete = false;
+            continue;
+        };
+
+        let mut instance_paths = Vec::new();
+        if same_schematic_document(&root_schematic, target) {
+            instance_paths.push(format!("/{root_uuid}"));
+        } else {
+            let mut suffix = Vec::new();
+            let mut stack = std::collections::HashSet::new();
+            complete &= collect_sheet_instance_paths(
+                &root_schematic,
+                target,
+                &mut suffix,
+                &mut stack,
+                0,
+                &root_uuid,
+                &mut instance_paths,
+            );
+        }
+        instance_paths.sort();
+        instance_paths.dedup();
+        if !instance_paths.is_empty() {
+            owners.push(SchematicOwnership {
+                project_file,
+                root_schematic,
+                instance_paths,
+            });
+        }
+    }
+
+    owners.sort_by(|left, right| left.root_schematic.cmp(&right.root_schematic));
+    if !roots.is_empty() && (owners.len() != 1 || !complete) {
+        return Err(SchematicTargetError::ProjectConflict {
+            target: target.to_path_buf(),
+            roots,
+        });
+    }
+    Ok(owners.pop())
+}
+
+fn collect_sheet_instance_paths(
+    current: &std::path::Path,
+    target: &std::path::Path,
+    suffix: &mut Vec<String>,
+    stack: &mut std::collections::HashSet<std::path::PathBuf>,
+    depth: usize,
+    root_uuid: &str,
+    found: &mut Vec<String>,
+) -> bool {
+    if depth > crate::tools::sch_hierarchy::MAX_HIERARCHY_DEPTH {
+        return false;
+    }
+    let canonical = canonical_schematic_path(current);
+    if !stack.insert(canonical.clone()) {
+        return true;
+    }
+
+    let mut complete = true;
+    if let Ok(schematic) = konnect_schematic_editor::Schematic::load(current) {
+        let directory = current
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        for sheet in &schematic.sheets {
+            let child = directory.join(sheet.file());
+            suffix.push(sheet.uuid.clone());
+            if same_schematic_document(&child, target) {
+                let mut path = format!("/{root_uuid}");
+                for uuid in suffix.iter() {
+                    path.push('/');
+                    path.push_str(uuid);
+                }
+                found.push(path);
+            } else {
+                complete &= collect_sheet_instance_paths(
+                    &child,
+                    target,
+                    suffix,
+                    stack,
+                    depth + 1,
+                    root_uuid,
+                    found,
+                );
+            }
+            suffix.pop();
+        }
+    } else {
+        complete = false;
+    }
+
+    stack.remove(&canonical);
+    complete
+}
+
+fn same_schematic_document(left: &std::path::Path, right: &std::path::Path) -> bool {
+    canonical_schematic_path(left) == canonical_schematic_path(right)
+}
+
+fn canonical_schematic_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Resolve `sch_path`'s place in its project.
 ///
-/// Falls back to treating the file as its own root — the standalone-sheet
-/// behaviour — whenever no project can be found, the root sheet cannot be
-/// read, or the file is not reachable from it. That keeps a loose `.kicad_sch`
-/// working exactly as before.
-pub fn sheet_instance_context(
+/// Falls back to treating the file as its own root only when no candidate
+/// project exists. Unproven or ambiguous ownership is a structured conflict.
+pub(crate) fn sheet_instance_context(
     sch_path: &std::path::Path,
     sch: &mut konnect_schematic_editor::Schematic,
-) -> SheetInstanceContext {
+) -> Result<SheetInstanceContext, SchematicTargetError> {
     let own_root = ensure_root_uuid(sch);
     let standalone = SheetInstanceContext {
         project_name: project_name_for(sch_path),
         instance_path: format!("/{own_root}"),
+        instance_paths: vec![format!("/{own_root}")],
         is_child_sheet: false,
     };
 
-    let Some(project) = nearest_kicad_pro(sch_path) else {
-        return standalone;
+    let Some(ownership) = resolve_schematic_ownership(sch_path)? else {
+        return Ok(standalone);
     };
-    let root_sheet = project.with_extension("kicad_sch");
-    let canonical = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    if canonical(&root_sheet) == canonical(sch_path) {
-        // This IS the root sheet; only the project name may differ from the
-        // file stem, and here it cannot.
-        return standalone;
-    }
-    let Ok(root) = konnect_schematic_editor::Schematic::load(&root_sheet) else {
-        return standalone;
-    };
-    let Some(root_uuid) = root.uuid.clone() else {
-        return standalone;
-    };
-    let mut sheet_uuids = Vec::new();
-    if !find_sheet_path(&root_sheet, sch_path, &mut sheet_uuids, 0) {
-        return standalone;
-    }
-
-    let mut instance_path = format!("/{root_uuid}");
-    for uuid in &sheet_uuids {
-        instance_path.push('/');
-        instance_path.push_str(uuid);
-    }
-    SheetInstanceContext {
-        project_name: project
+    let instance_path = ownership
+        .instance_paths
+        .first()
+        .cloned()
+        .unwrap_or_else(|| standalone.instance_path.clone());
+    Ok(SheetInstanceContext {
+        project_name: ownership
+            .project_file
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string(),
         instance_path,
-        is_child_sheet: true,
-    }
-}
-
-/// The `.kicad_pro` governing `file`, from its own directory upwards.
-fn nearest_kicad_pro(file: &std::path::Path) -> Option<std::path::PathBuf> {
-    file.parent()?.ancestors().find_map(|dir| {
-        std::fs::read_dir(dir).ok()?.find_map(|entry| {
-            let path = entry.ok()?.path();
-            (path.extension().and_then(|e| e.to_str()) == Some("kicad_pro")).then_some(path)
-        })
+        instance_paths: ownership.instance_paths,
+        is_child_sheet: !same_schematic_document(&ownership.root_schematic, sch_path),
     })
 }
 
-/// Depth-first walk from `from` looking for `target`, recording the uuid of
-/// each `(sheet …)` node stepped through. Bounded like the hierarchy tools:
-/// a `Sheetfile` cycle would otherwise recurse forever.
-fn find_sheet_path(
-    from: &std::path::Path,
-    target: &std::path::Path,
-    acc: &mut Vec<String>,
-    depth: usize,
-) -> bool {
-    if depth > 32 {
-        return false;
+/// Prove that every existing placed symbol is keyed to exactly the hierarchy
+/// identities observed from the parsed project root.
+///
+/// A missing, foreign, duplicate, or obsolete path means the file's saved
+/// instance metadata is stale. Adding another symbol in that state would
+/// produce a document where KiCad resolves different components against
+/// different hierarchy instances, so mutation fails closed before the in-memory
+/// schematic is changed.
+pub(crate) fn validate_sheet_instance_state(
+    sch_path: &std::path::Path,
+    schematic: &konnect_schematic_editor::Schematic,
+    context: &SheetInstanceContext,
+) -> Result<(), SchematicTargetError> {
+    let mut expected = context
+        .instance_paths
+        .iter()
+        .map(|path| (context.project_name.clone(), path.clone()))
+        .collect::<Vec<_>>();
+    expected.sort();
+
+    fn reference_prefix(reference: &str) -> &str {
+        reference.trim_end_matches(|character: char| character.is_ascii_digit() || character == '?')
     }
-    let Ok(sch) = konnect_schematic_editor::Schematic::load(from) else {
-        return false;
-    };
-    let dir = from.parent().unwrap_or(std::path::Path::new("."));
-    let canonical = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    for sheet in sch.sheets.iter() {
-        let child = dir.join(sheet.file());
-        acc.push(sheet.uuid.clone());
-        if canonical(&child) == canonical(target) {
-            return true;
+
+    let mut stale_symbols = Vec::new();
+    for symbol in &schematic.symbols {
+        let instances = symbol.instances();
+        let mut observed = instances
+            .iter()
+            .filter_map(|instance| Some((instance.project.clone()?, instance.path.clone()?)))
+            .collect::<Vec<_>>();
+        observed.sort();
+        let symbol_reference = symbol.reference().filter(|reference| !reference.is_empty());
+        let malformed = instances.iter().any(|instance| {
+            instance.project.as_deref().is_none_or(str::is_empty)
+                || instance.path.as_deref().is_none_or(str::is_empty)
+                || instance.reference.as_deref().is_none_or(str::is_empty)
+                || instance.unit.is_none()
+        });
+        let wrong_unit = instances
+            .iter()
+            .any(|instance| instance.unit != Some(symbol.unit));
+        let wrong_reference = symbol_reference.is_none_or(|reference| {
+            let prefix = reference_prefix(reference);
+            !instances
+                .iter()
+                .any(|instance| instance.reference.as_deref() == Some(reference))
+                || instances.iter().any(|instance| {
+                    instance
+                        .reference
+                        .as_deref()
+                        .is_none_or(|candidate| reference_prefix(candidate) != prefix)
+                })
+        });
+        if malformed || observed != expected || wrong_unit || wrong_reference {
+            let identity = symbol_reference.unwrap_or(symbol.uuid.as_str());
+            let format_paths = |paths: &[(String, String)]| {
+                paths
+                    .iter()
+                    .map(|(project, path)| format!("{project}:{path}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let mut reasons = Vec::new();
+            if malformed {
+                reasons
+                    .push("missing or malformed project/path/reference/unit metadata".to_string());
+            }
+            if observed != expected {
+                reasons.push(format!(
+                    "observed [{}], expected [{}]",
+                    format_paths(&observed),
+                    format_paths(&expected)
+                ));
+            }
+            if wrong_unit {
+                reasons.push(format!(
+                    "instance unit disagrees with symbol unit {}",
+                    symbol.unit
+                ));
+            }
+            if wrong_reference {
+                reasons.push("instance reference identity disagrees with the symbol".to_string());
+            }
+            stale_symbols.push(format!("{identity}: {}", reasons.join(", ")));
         }
-        if child.exists() && find_sheet_path(&child, target, acc, depth + 1) {
-            return true;
-        }
-        acc.pop();
     }
-    false
+
+    if stale_symbols.is_empty() {
+        Ok(())
+    } else {
+        Err(SchematicTargetError::StaleTarget {
+            target: sch_path.to_path_buf(),
+            reason: format!(
+                "placed-symbol instance metadata disagrees with project '{}': {}",
+                context.project_name,
+                stale_symbols.join("; ")
+            ),
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod schematic_target_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    pub(crate) fn native_project(directory: &Path) -> (PathBuf, PathBuf) {
+        std::fs::create_dir_all(directory).unwrap();
+        for (name, bytes) in [
+            (
+                "complex_hierarchy.kicad_pro",
+                include_bytes!(
+                    "../../tests/fixtures/project_ownership/complex_hierarchy.kicad_pro"
+                )
+                .as_slice(),
+            ),
+            (
+                "complex_hierarchy.kicad_sch",
+                include_bytes!(
+                    "../../tests/fixtures/project_ownership/complex_hierarchy.kicad_sch"
+                )
+                .as_slice(),
+            ),
+            (
+                "ampli_ht.kicad_sch",
+                include_bytes!("../../tests/fixtures/project_ownership/ampli_ht.kicad_sch")
+                    .as_slice(),
+            ),
+        ] {
+            std::fs::write(directory.join(name), bytes).unwrap();
+        }
+        (
+            directory.join("complex_hierarchy.kicad_sch"),
+            directory.join("ampli_ht.kicad_sch"),
+        )
+    }
+
+    pub(crate) fn native_deep_project(directory: &Path) -> (PathBuf, PathBuf) {
+        let (root, child) = native_project(directory);
+        let nested = directory.join("sheets/deep/ampli_ht.kicad_sch");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::rename(child, &nested).unwrap();
+        let content = std::fs::read_to_string(&root).unwrap();
+        assert_eq!(content.matches("\"ampli_ht.kicad_sch\"").count(), 2);
+        std::fs::write(
+            &root,
+            content.replace(
+                "\"ampli_ht.kicad_sch\"",
+                "\"sheets/deep/ampli_ht.kicad_sch\"",
+            ),
+        )
+        .unwrap();
+        (root, nested)
+    }
+
+    fn assert_conflict(result: &CallToolResult, directory: &Path, roots: &[PathBuf]) {
+        assert!(result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected structured text error")
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "conflict");
+        let mut expected = vec![directory.display().to_string()];
+        let mut roots = roots.to_vec();
+        roots.sort();
+        roots.dedup();
+        expected.extend(roots.iter().map(|root| root.display().to_string()));
+        assert_eq!(body["error"]["paths"], serde_json::json!(expected));
+        for path in expected {
+            assert!(body["message"].as_str().unwrap().contains(&path));
+        }
+    }
+
+    #[test]
+    fn native_hierarchy_preserves_both_child_instance_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, child) = native_deep_project(directory.path());
+        let owner = resolve_schematic_ownership(&child).unwrap().unwrap();
+        assert_eq!(owner.root_schematic, root);
+        assert_eq!(owner.project_file, root.with_extension("kicad_pro"));
+        assert_eq!(
+            owner.instance_paths,
+            [
+                "/5b9623a5-6d01-41fc-9865-e1bc779418c8/00000000-0000-0000-0000-00004b3a1333",
+                "/5b9623a5-6d01-41fc-9865-e1bc779418c8/00000000-0000-0000-0000-00004b3a13a4",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_candidate_project_allows_a_loose_schematic() {
+        let directory = tempfile::tempdir().unwrap();
+        let loose = blank(&directory.path().join("loose.kicad_sch"));
+        assert_eq!(resolve_schematic_ownership(&loose).unwrap(), None);
+        assert_eq!(
+            library::project_root_for(&loose).unwrap(),
+            Some(directory.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn relative_target_uses_project_ancestors_above_working_directory() {
+        const CHILD_ROOT: &str = "KONNECT_TEST_OWNERSHIP_CHILD_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let target = Path::new("ampli_ht.kicad_sch");
+            let owner = resolve_schematic_ownership(target).unwrap().unwrap();
+            // On macOS, cwd can resolve /var through /private/var. Compare the
+            // actual files instead of requiring the same symlink spelling.
+            assert_eq!(
+                owner.root_schematic.canonicalize().unwrap(),
+                root.canonicalize().unwrap()
+            );
+            assert_eq!(
+                library::project_root_for(target)
+                    .unwrap()
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap(),
+                root.parent().unwrap().canonicalize().unwrap()
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (root, child) = native_deep_project(directory.path());
+        // A subprocess changes cwd without racing other tests in this process.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tools::schematic_target_tests::relative_target_uses_project_ancestors_above_working_directory", "--nocapture"])
+            .current_dir(child.parent().unwrap())
+            .env(CHILD_ROOT, root)
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "relative-path probe failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn incomplete_directory_discovery_is_a_refusal_not_a_loose_schematic() {
+        let directory = tempfile::tempdir().unwrap();
+        let unreadable = directory.path().join("not-a-directory");
+        write(&unreadable, "regular file");
+        let target = unreadable.join("loose.kicad_sch");
+        let result = resolve_schematic_ownership(&target)
+            .unwrap_err()
+            .into_tool_result();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("file_not_found")
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected structured refusal")
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["path"], unreadable.display().to_string());
+    }
+
+    #[test]
+    fn depth_limited_native_hierarchy_is_a_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, child) = native_project(directory.path());
+        let source = std::fs::read_to_string(&root).unwrap();
+        for depth in 0..=sch_hierarchy::MAX_HIERARCHY_DEPTH + 1 {
+            let current = if depth == 0 {
+                root.clone()
+            } else {
+                directory.path().join(format!("level-{depth}.kicad_sch"))
+            };
+            let next = if depth == sch_hierarchy::MAX_HIERARCHY_DEPTH + 1 {
+                "ampli_ht.kicad_sch".to_string()
+            } else {
+                format!("level-{}.kicad_sch", depth + 1)
+            };
+            // Keep one reference per level to avoid exponential repeated-sheet
+            // expansion. The second sheet becomes a cycle back to the root.
+            let content = source
+                .replacen("\"ampli_ht.kicad_sch\"", &format!("\"{next}\""), 1)
+                .replacen(
+                    "\"ampli_ht.kicad_sch\"",
+                    "\"complex_hierarchy.kicad_sch\"",
+                    1,
+                );
+            std::fs::write(current, content).unwrap();
+        }
+        let result = resolve_schematic_ownership(&child)
+            .unwrap_err()
+            .into_tool_result();
+        assert_conflict(&result, directory.path(), &[root]);
+    }
+
+    #[test]
+    fn native_owner_is_selected_among_readable_unrelated_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, child) = native_project(directory.path());
+        write(&directory.path().join("unrelated.kicad_pro"), "{}");
+        std::fs::copy(&child, directory.path().join("unrelated.kicad_sch")).unwrap();
+        assert_eq!(
+            resolve_schematic_ownership(&child)
+                .unwrap()
+                .unwrap()
+                .root_schematic,
+            root
+        );
+    }
+
+    #[test]
+    fn unreadable_competitor_cannot_prove_a_native_owner_is_unique() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, child) = native_project(directory.path());
+        write(&directory.path().join("unknown.kicad_pro"), "{}");
+        // A directory at the root path deterministically fails read_to_string on
+        // every platform, including privileged CI where chmod cannot deny reads.
+        let unreadable = directory.path().join("unknown.kicad_sch");
+        std::fs::create_dir(&unreadable).unwrap();
+        let result = resolve_schematic_ownership(&child)
+            .unwrap_err()
+            .into_tool_result();
+        assert_conflict(&result, directory.path(), &[root, unreadable]);
+    }
+
+    #[test]
+    fn incomplete_native_hierarchy_does_not_prove_unique_membership() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, child) = native_project(directory.path());
+        let content = std::fs::read_to_string(&root).unwrap();
+        std::fs::write(
+            &root,
+            content.replacen("\"ampli_ht.kicad_sch\"", "\"missing.kicad_sch\"", 1),
+        )
+        .unwrap();
+        let result = resolve_schematic_ownership(&child)
+            .unwrap_err()
+            .into_tool_result();
+        assert_conflict(&result, directory.path(), &[root]);
+    }
+
+    #[test]
+    fn conflict_reports_all_candidates_including_unproven_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, child) = native_project(directory.path());
+        let second = directory.path().join("second.kicad_sch");
+        std::fs::copy(&root, &second).unwrap();
+        write(&second.with_extension("kicad_pro"), "{}");
+        let missing = directory.path().join("missing.kicad_sch");
+        write(&missing.with_extension("kicad_pro"), "{}");
+        let result = resolve_schematic_ownership(&child)
+            .unwrap_err()
+            .into_tool_result();
+        assert_conflict(&result, directory.path(), &[root, second, missing]);
+    }
+
+    #[test]
+    fn adjacent_library_tables_override_unproven_ancestor_for_library_lookup() {
+        for table in ["sym-lib-table", "fp-lib-table"] {
+            let directory = tempfile::tempdir().unwrap();
+            write(&directory.path().join("missing.kicad_pro"), "{}");
+            let loose = blank(&directory.path().join("nested/loose.kicad_sch"));
+            let parent = loose.parent().unwrap();
+            write(&parent.join(table), "");
+            assert_eq!(
+                library::project_root_for(&loose).unwrap(),
+                Some(parent.to_path_buf())
+            );
+        }
+    }
+
+    #[test]
+    fn sibling_project_does_not_bypass_conflicting_native_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let (outer, _) = native_project(directory.path());
+        let nested = directory.path().join("nested");
+        let (inner, _) = native_project(&nested);
+        let content = std::fs::read_to_string(&outer).unwrap();
+        std::fs::write(
+            &outer,
+            content.replace(
+                "\"ampli_ht.kicad_sch\"",
+                "\"nested/complex_hierarchy.kicad_sch\"",
+            ),
+        )
+        .unwrap();
+        let result = library::project_root_for(&inner)
+            .unwrap_err()
+            .into_tool_result();
+        assert_conflict(&result, &nested, &[outer, inner]);
+    }
+
+    #[tokio::test]
+    async fn symbol_loading_and_erc_preflight_ownership_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, child) = native_project(directory.path());
+        let loose = directory.path().join("nested/loose.kicad_sch");
+        std::fs::create_dir_all(loose.parent().unwrap()).unwrap();
+        std::fs::copy(child, &loose).unwrap();
+        let before = std::fs::read(&loose).unwrap();
+        let context = Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        ));
+        let mut tools = sch_components::tools();
+        tools.extend(sch_batch::tools());
+        tools.extend(sch_wiring::tools());
+        tools.extend(sch_export::tools());
+        for (name, mut args) in [
+            (
+                "add_schematic_component",
+                serde_json::json!({"lib_id":"complex_hierarchy:R","reference":"R999","x":100.0,"y":100.0}),
+            ),
+            (
+                "batch_place_components",
+                serde_json::json!({"components":[
+                    {"lib_id":"complex_hierarchy:R","reference":"R999","x":100.0,"y":100.0},
+                    {"lib_id":"complex_hierarchy:R","reference":"R998","x":110.0,"y":100.0}
+                ]}),
+            ),
+            ("update_symbols_from_library", serde_json::json!({})),
+            (
+                "replace_component",
+                serde_json::json!({"reference":"C201","new_lib_id":"complex_hierarchy:R"}),
+            ),
+            (
+                "add_power_symbol",
+                serde_json::json!({"power_net":"GND","x":100.0,"y":100.0}),
+            ),
+            ("run_erc", serde_json::json!({})),
+        ] {
+            args["schematic"] = serde_json::json!(loose.display().to_string());
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            let result = (tool.handler)(&args, context.clone()).await.unwrap();
+            assert!(
+                std::fs::read(&loose).unwrap() == before,
+                "{name} changed the schematic before resolving ownership"
+            );
+            assert_conflict(
+                &result,
+                loose.parent().unwrap(),
+                std::slice::from_ref(&root),
+            );
+        }
+    }
+
+    fn write(path: &Path, content: &str) -> PathBuf {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+        path.to_path_buf()
+    }
+
+    fn blank(path: &Path) -> PathBuf {
+        write(path, &blank_schematic_template())
+    }
+
+    fn root_with_child(path: &Path, root_uuid: &str, child: &str, sheet_uuid: &str) -> PathBuf {
+        write(
+            path,
+            &format!(
+                r#"(kicad_sch
+	(version 20250610)
+	(generator "eeschema")
+	(uuid "{root_uuid}")
+	(paper "A4")
+	(lib_symbols)
+	(sheet
+		(at 20 20)
+		(size 40 20)
+		(uuid "{sheet_uuid}")
+		(property "Sheetname" "Child" (at 20 19.365 0))
+		(property "Sheetfile" "{child}" (at 20 40.635 0))
+	)
+	(sheet_instances (path "/" (page "1")))
+)
+"#,
+            ),
+        )
+    }
+
+    #[test]
+    fn exact_project_root_is_resolved() {
+        let directory = tempfile::tempdir().unwrap();
+        write(&directory.path().join("control.kicad_pro"), "{}");
+        let root = blank(&directory.path().join("control.kicad_sch"));
+
+        let owner = resolve_schematic_ownership(&root).unwrap().unwrap();
+
+        assert_eq!(
+            owner.project_file,
+            directory.path().join("control.kicad_pro")
+        );
+        assert_eq!(owner.root_schematic, root);
+        assert_eq!(owner.instance_paths.len(), 1);
+    }
+
+    #[test]
+    fn deep_child_is_proven_through_the_parsed_hierarchy() {
+        let directory = tempfile::tempdir().unwrap();
+        write(&directory.path().join("control.kicad_pro"), "{}");
+        root_with_child(
+            &directory.path().join("control.kicad_sch"),
+            "root-uuid",
+            "sheets/mid.kicad_sch",
+            "mid-sheet-uuid",
+        );
+        root_with_child(
+            &directory.path().join("sheets/mid.kicad_sch"),
+            "mid-file-uuid",
+            "deep/child.kicad_sch",
+            "child-sheet-uuid",
+        );
+        let child = blank(&directory.path().join("sheets/deep/child.kicad_sch"));
+
+        let owner = resolve_schematic_ownership(&child).unwrap().unwrap();
+
+        assert_eq!(
+            owner.project_file,
+            directory.path().join("control.kicad_pro")
+        );
+        assert_eq!(
+            owner.instance_paths,
+            ["/root-uuid/mid-sheet-uuid/child-sheet-uuid"]
+        );
+    }
+
+    #[test]
+    fn loose_sheet_under_an_unrelated_project_returns_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        write(&directory.path().join("unrelated.kicad_pro"), "{}");
+        blank(&directory.path().join("unrelated.kicad_sch"));
+        let loose = blank(&directory.path().join("work/loose.kicad_sch"));
+
+        let result = resolve_schematic_ownership(&loose)
+            .unwrap_err()
+            .into_tool_result();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("conflict")
+        );
+    }
+
+    #[test]
+    fn two_structural_owners_return_existing_conflict() {
+        let outer = tempfile::tempdir().unwrap();
+        write(&outer.path().join("outer.kicad_pro"), "{}");
+        root_with_child(
+            &outer.path().join("outer.kicad_sch"),
+            "outer-root",
+            "nested/child.kicad_sch",
+            "outer-path",
+        );
+
+        let nested = outer.path().join("nested");
+        write(&nested.join("inner.kicad_pro"), "{}");
+        root_with_child(
+            &nested.join("inner.kicad_sch"),
+            "inner-root",
+            "child.kicad_sch",
+            "inner-path",
+        );
+        let child = blank(&nested.join("child.kicad_sch"));
+
+        let error = resolve_schematic_ownership(&child).unwrap_err();
+        let SchematicTargetError::ProjectConflict { target, roots } = error else {
+            panic!("expected ownership conflict")
+        };
+        assert_eq!(target, child);
+        assert_eq!(roots.len(), 2);
+        let result = SchematicTargetError::ProjectConflict { target, roots }.into_tool_result();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("conflict")
+        );
+    }
+
+    #[test]
+    fn missing_or_unreadable_candidate_root_returns_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        write(&directory.path().join("missing.kicad_pro"), "{}");
+        write(&directory.path().join("broken.kicad_pro"), "{}");
+        write(
+            &directory.path().join("broken.kicad_sch"),
+            "not a schematic",
+        );
+        let target = blank(&directory.path().join("nested/loose.kicad_sch"));
+
+        let result = resolve_schematic_ownership(&target)
+            .unwrap_err()
+            .into_tool_result();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("conflict")
+        );
+    }
 }

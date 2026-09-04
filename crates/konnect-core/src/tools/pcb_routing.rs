@@ -152,7 +152,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "delete_trace",
-            "Delete a trace segment identified by its UUID via KiCAD IPC.",
+            "Delete a trace segment identified by its UUID via KiCAD IPC. Refuses UUIDs that are not observed trace segments on the requested board, then verifies the segment is absent before reporting success. Returns the observed preimage and postcondition.",
             json!({
                 "type": "object",
                 "properties": {
@@ -984,14 +984,179 @@ async fn handle_delete_trace(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
     let uuid = match require_str(args, "uuid") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
 
+    let board_ipc = board.clone();
     let uuid_ipc = uuid.clone();
-    ipc!(ctx, args, |c| c.delete_track(&uuid_ipc));
-    Ok(CallToolResult::json(&json!({ "deleted_uuid": uuid })))
+    let deleted = match with_board_ipc_classified(ctx, &board, move |client| {
+        client.delete_trace_segment_verified(&board_ipc, &uuid_ipc)
+    })
+    .await?
+    {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCAD must be running with the board loaded (IPC error: {})",
+                error.message()
+            )))
+        }
+    };
+
+    let Some(trace) = deleted else {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: uuid,
+                reason: "the UUID is not an observed trace segment on the requested board"
+                    .to_string(),
+            },
+            "The requested UUID is not a trace segment on the requested board. No board item was deleted.",
+        ));
+    };
+
+    Ok(CallToolResult::json(&json!({
+        "deleted_uuid": trace.uuid,
+        "deleted_type": "trace_segment",
+        "preimage": {
+            "uuid": trace.uuid,
+            "net": trace.net_name,
+            "layer": trace.layer,
+            "width": trace.width,
+            "from": { "x": trace.start.x, "y": trace.start.y },
+            "to": { "x": trace.end.x, "y": trace.end.y }
+        },
+        "postcondition": "absent_from_trace_readback"
+    })))
+}
+
+#[cfg(test)]
+mod delete_trace_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use konnect_ipc::gen::kiapi;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn non_trace_and_missing_uuids_refuse_before_delete_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        let original = b"(kicad_pcb (version 20260206))";
+        std::fs::write(&board, original).unwrap();
+        let delete_count = Arc::new(Mutex::new(0usize));
+        let delete_count_in_mock = delete_count.clone();
+        let address = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: vec![],
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("DeleteItems") {
+                *delete_count_in_mock.lock().unwrap() += 1;
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::DeleteItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        deleted_items: vec![],
+                    },
+                    "kiapi.common.commands.DeleteItemsResponse",
+                ));
+            }
+            None
+        });
+
+        let ctx = ctx_talking_to(address);
+        for uuid in ["via-1", "zone-1", "graphic-1", "footprint-1", "missing-1"] {
+            let result = handle_delete_trace(
+                &json!({ "board": board.to_string_lossy(), "uuid": uuid }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+            assert!(result.is_error, "{uuid} unexpectedly succeeded");
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("stale_target"),
+                "wrong error for {uuid}"
+            );
+        }
+        assert_eq!(*delete_count.lock().unwrap(), 0);
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn success_reports_the_observed_trace_and_verified_postcondition() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let deleted = Arc::new(Mutex::new(false));
+        let deleted_in_mock = deleted.clone();
+        let mut track =
+            konnect_ipc::builders::build_track("GND", 7, "F.Cu", 0.4, 1.0, 2.0, 3.0, 4.0);
+        track.id = Some(kiapi::common::types::Kiid {
+            value: "segment-1".to_string(),
+        });
+        let packed_track = konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track");
+        let address = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                let items = if *deleted_in_mock.lock().unwrap() {
+                    vec![]
+                } else {
+                    vec![packed_track.clone()]
+                };
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items,
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("DeleteItems") {
+                *deleted_in_mock.lock().unwrap() = true;
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::DeleteItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        deleted_items: vec![],
+                    },
+                    "kiapi.common.commands.DeleteItemsResponse",
+                ));
+            }
+            None
+        });
+
+        let result = handle_delete_trace(
+            &json!({ "board": board.to_string_lossy(), "uuid": "segment-1" }),
+            &ctx_talking_to(address),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error);
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["deleted_uuid"], json!("segment-1"));
+        assert_eq!(body["deleted_type"], json!("trace_segment"));
+        assert_eq!(body["preimage"]["net"], json!("GND"));
+        assert_eq!(body["preimage"]["layer"], json!("F.Cu"));
+        assert_eq!(body["preimage"]["width"], json!(0.4));
+        assert_eq!(body["preimage"]["from"], json!({ "x": 1.0, "y": 2.0 }));
+        assert_eq!(body["preimage"]["to"], json!({ "x": 3.0, "y": 4.0 }));
+        assert_eq!(body["postcondition"], json!("absent_from_trace_readback"));
+    }
 }
 
 async fn handle_query_traces(

@@ -410,6 +410,19 @@ pub(crate) fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlac
 pub(crate) fn extract_graphic_definitions(
     source: &str,
 ) -> anyhow::Result<Vec<konnect_ipc::IpcGraphicDefinition>> {
+    extract_graphic_definitions_with_properties(source, true)
+}
+
+pub(crate) fn extract_graphic_definitions_without_properties(
+    source: &str,
+) -> anyhow::Result<Vec<konnect_ipc::IpcGraphicDefinition>> {
+    extract_graphic_definitions_with_properties(source, false)
+}
+
+fn extract_graphic_definitions_with_properties(
+    source: &str,
+    include_properties: bool,
+) -> anyhow::Result<Vec<konnect_ipc::IpcGraphicDefinition>> {
     use konnect_ipc::IpcGraphicDefinition as Graphic;
     let footprint = konnect_sexp::parse_sexp(source)?;
     let mut graphics = Vec::new();
@@ -493,7 +506,12 @@ pub(crate) fn extract_graphic_definitions(
             stroke_width_mm: text_stroke_width(text),
         });
     }
-    for property in footprint.find_all("property") {
+    let properties = if include_properties {
+        footprint.find_all("property")
+    } else {
+        Vec::new()
+    };
+    for property in properties {
         let name = property.get(1).and_then(konnect_sexp::SexpNode::as_str);
         // Reference and Value travel as first-class fields; hidden built-ins
         // (Footprint, Datasheet, …) are not drawn.
@@ -2472,12 +2490,6 @@ async fn handle_flip_component(
     // The helper refuses only when KiCAD holds *this* board, because that is
     // the only case where the edit would be discarded by its next save.
     //
-    // Untested branch, honestly: the only IPC mock in this crate rejects every
-    // request, which exercises the *proceed* side. Confirming the refusal
-    // needs a mock that answers `GetOpenDocuments` naming this board, which
-    // does not exist here — so the refusal is equally untested for
-    // `add_zone` and the copper-pour path, this helper's two other callers.
-    // Tracked as #241 rather than pretended away.
     if let Some(refusal) =
         crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "footprint flip")
             .await?
@@ -5087,6 +5099,65 @@ mod tests {
         assert_eq!(result["source"], "file");
         assert_eq!(result["changed"], true);
         assert_ne!(std::fs::read_to_string(board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn flip_refuses_the_exact_open_board_without_touching_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("flip.kicad_pcb");
+        let before = format!(
+            "(kicad_pcb\n  (version 20260206)\n  (generator \"pcbnew\")\n  (net 0 \"\")\n{}\n)\n",
+            FLIP_FOOTPRINT
+                .lines()
+                .map(|line| format!("  {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        std::fs::write(&board, &before).unwrap();
+        let address =
+            crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&board, |_| None);
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(address);
+
+        let result = handle_flip_component(
+            &json!({"board": board, "reference": "U1", "layer": "B.Cu"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("footprint flip"));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn flip_proceeds_when_kicad_holds_a_different_board() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("flip.kicad_pcb");
+        let other = tmp.path().join("other.kicad_pcb");
+        let before = format!(
+            "(kicad_pcb\n  (version 20260206)\n  (generator \"pcbnew\")\n  (net 0 \"\")\n{}\n)\n",
+            FLIP_FOOTPRINT
+                .lines()
+                .map(|line| format!("  {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        std::fs::write(&board, &before).unwrap();
+        std::fs::write(&other, "").unwrap();
+        let address =
+            crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(&other, |_| None);
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(address);
+
+        let result = handle_flip_component(
+            &json!({"board": board, "reference": "U1", "layer": "B.Cu"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_ne!(std::fs::read_to_string(&board).unwrap(), before);
     }
 
     #[test]

@@ -1726,10 +1726,23 @@ mod tests {
         serde_json::from_str(text).unwrap()
     }
 
+    fn result_text(result: &CallToolResult) -> &str {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        text
+    }
+
     fn fixture_copy(dir: &tempfile::TempDir) -> std::path::PathBuf {
         let path = dir.path().join("board.kicad_pcb");
         std::fs::copy(FIXTURE, &path).unwrap();
         path
+    }
+
+    fn ctx_with_open_board(board: &std::path::Path) -> ToolContext {
+        let address =
+            crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(board, |_| None);
+        crate::tools::pcb_board::board_mock::ctx_talking_to(address)
     }
 
     /// The decoupling planner must clear the fixture's only deduction: C1/C2
@@ -1802,6 +1815,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn decoupling_apply_refuses_the_exact_open_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let before = std::fs::read(&board).unwrap();
+        let result = handle_place_decoupling(
+            &json!({"board": board, "ic_reference": "U1", "dry_run": false}),
+            &ctx_with_open_board(&board),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("place_decoupling_caps"));
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn decoupling_apply_proceeds_when_a_different_board_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&other, "").unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let result = handle_place_decoupling(
+            &json!({"board": board, "ic_reference": "U1", "dry_run": false}),
+            &ctx_with_open_board(&other),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        assert_ne!(std::fs::read(&board).unwrap(), before);
+    }
+
     /// U2 is Analog_BGA-28 with a 4x7 grid at 0.8 mm pitch. Hand count:
     /// perimeter pads = 2*4 + 2*7 - 4 = 18, inner = 28 - 18 = 10 vias.
     /// Dogbone via offset magnitude = 0.55 * 0.8 = 0.44 mm; track width for
@@ -1857,6 +1905,76 @@ mod tests {
         );
         let b = text_of(&handle_auto_place(&args, &test_ctx()).await.unwrap()).await;
         assert_eq!(a, b, "same input, same plan");
+    }
+
+    #[tokio::test]
+    async fn auto_place_apply_refuses_the_exact_open_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let before = std::fs::read(&board).unwrap();
+        let result = handle_auto_place(
+            &json!({"board": board, "dry_run": false}),
+            &ctx_with_open_board(&board),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("auto_place_from_schematic"));
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn auto_place_apply_proceeds_when_a_different_board_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&other, "").unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let result = handle_auto_place(
+            &json!({"board": board, "dry_run": false}),
+            &ctx_with_open_board(&other),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        assert_ne!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn force_directed_apply_refuses_the_exact_open_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let before = std::fs::read(&board).unwrap();
+        let result = handle_force_directed(
+            &json!({"board": board, "dry_run": false}),
+            &ctx_with_open_board(&board),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("refine_placement_force_directed"));
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn force_directed_apply_proceeds_when_a_different_board_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&other, "").unwrap();
+        let before = std::fs::read(&board).unwrap();
+        let result = handle_force_directed(
+            &json!({"board": board, "dry_run": false}),
+            &ctx_with_open_board(&other),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        assert_ne!(std::fs::read(&board).unwrap(), before);
     }
 
     /// Lock a footprint the way KiCad does, and neither planner may move it

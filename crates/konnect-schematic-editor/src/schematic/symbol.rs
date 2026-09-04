@@ -12,6 +12,17 @@ fn bool_kw(v: bool) -> &'static str {
 
 // ---- Symbol -----------------------------------------------------------------
 
+/// One saved hierarchy identity from a placed symbol's `(instances ...)` block.
+/// Optional fields preserve malformed entries so callers can fail closed rather
+/// than silently dropping incomplete metadata while validating a mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolInstance {
+    pub project: Option<String>,
+    pub path: Option<String>,
+    pub reference: Option<String>,
+    pub unit: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Symbol {
     /// Name of the `lib_symbols` entry this instance actually resolves through,
@@ -286,16 +297,52 @@ impl Symbol {
     /// Whether this symbol already has an instance entry for the given
     /// project name and hierarchical path.
     pub fn has_instance_path(&self, project_name: &str, path: &str) -> bool {
-        self.raw_sub_nodes
+        self.instance_paths()
             .iter()
-            .find(|n| n.tag() == Some("instances"))
-            .map(|inst| {
-                inst.find_all("project").iter().any(|p| {
-                    p.value() == Some(project_name)
-                        && p.find_all("path").iter().any(|pp| pp.value() == Some(path))
-                })
-            })
-            .unwrap_or(false)
+            .any(|(project, candidate)| project == project_name && candidate == path)
+    }
+
+    /// Every project/path identity carried by this placed symbol.
+    ///
+    /// A child schematic file can be instantiated more than once in one root
+    /// hierarchy, so one placed symbol legitimately carries multiple paths.
+    /// Returning all of them lets callers compare the saved identity with the
+    /// structurally observed hierarchy instead of selecting the first entry.
+    pub fn instance_paths(&self) -> Vec<(String, String)> {
+        self.instances()
+            .into_iter()
+            .filter_map(|instance| Some((instance.project?, instance.path?)))
+            .collect()
+    }
+
+    /// Every saved hierarchy entry, including malformed entries with missing
+    /// project, path, reference, or unit fields.
+    pub fn instances(&self) -> Vec<SymbolInstance> {
+        let mut entries = Vec::new();
+        for instances in self
+            .raw_sub_nodes
+            .iter()
+            .filter(|node| node.tag() == Some("instances"))
+        {
+            for project in instances.find_all("project") {
+                let project_name = project.value().map(str::to_owned);
+                for path in project.find_all("path") {
+                    entries.push(SymbolInstance {
+                        project: project_name.clone(),
+                        path: path.value().map(str::to_owned),
+                        reference: path
+                            .find("reference")
+                            .and_then(SexpNode::value)
+                            .map(str::to_owned),
+                        unit: path
+                            .find("unit")
+                            .and_then(SexpNode::value)
+                            .and_then(|value| value.parse().ok()),
+                    });
+                }
+            }
+        }
+        entries
     }
 
     // ---- position -----------------------------------------------------------
@@ -527,5 +574,24 @@ mod tests {
             "property must keep its offset"
         );
         assert_eq!((sym.at.x, sym.at.y), (110.0, 60.0));
+    }
+
+    #[test]
+    fn instance_paths_reports_every_reused_hierarchy_identity() {
+        let mut symbol = Symbol::new("Device:R", 100.0, 50.0);
+        symbol.set_instance_path("control", "/root/a", "R1", 1);
+        symbol.set_instance_path("control", "/root/b", "R1", 1);
+        symbol.set_instance_path("other", "/other/c", "R1", 1);
+
+        assert_eq!(
+            symbol.instance_paths(),
+            [
+                ("control".to_string(), "/root/a".to_string()),
+                ("control".to_string(), "/root/b".to_string()),
+                ("other".to_string(), "/other/c".to_string()),
+            ]
+        );
+        assert!(symbol.has_instance_path("control", "/root/b"));
+        assert!(!symbol.has_instance_path("control", "/root/missing"));
     }
 }

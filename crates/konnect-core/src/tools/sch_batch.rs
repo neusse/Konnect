@@ -8,8 +8,8 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_str, project_name_for, require_array,
-    require_f64, require_str, ToolDef,
+    find_all_symbol_instance_blocks, get_path, opt_str, require_array, require_f64, require_str,
+    ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -19,17 +19,17 @@ use konnect_sexp::{
         find_lib_symbol, format_net_label, format_wire, pin_endpoint, pin_label_rotation,
         read_schematic, symbol_bounds_for_instance, SymbolBounds,
     },
-    writer::{
-        apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
-        new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit,
-    },
+    writer::{apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit},
 };
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
-use super::sch_components::place_one_component;
+use super::sch_components::{
+    commit_component_deletion, indexed_uuid_items, place_one_component, placed_component_readback,
+    plan_component_and_item_deletions, ComponentDeleteTargetError,
+};
 use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -64,7 +64,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_place_components",
-            "Place multiple symbols from KiCAD libraries in a single file read/write cycle. \
+            "Place multiple symbols from KiCAD libraries in one write with committed-file \
+             readback. Preserves every saved hierarchy instance and preflights stale metadata \
+             before any placement. \
              Pass explicit references -- there is no auto-numbering; an omitted reference \
              becomes '?' like an eeschema-unannotated symbol, same as add_schematic_component.",
             json!({
@@ -330,10 +332,13 @@ pub fn tools() -> Vec<ToolDef> {
 ///
 /// One entry per unit: deleting a multi-unit part means deleting all of them.
 /// Returns `(block_start, block_end)` byte offsets in `content`.
+#[cfg(test)]
 fn find_symbol_blocks(content: &str, reference: &str) -> Vec<(usize, usize)> {
     find_all_symbol_instance_blocks(content, reference)
         .into_iter()
-        .filter_map(|(sym_start, _)| find_block_with_leading_whitespace(content, sym_start))
+        .filter_map(|(sym_start, _)| {
+            konnect_sexp::writer::find_block_with_leading_whitespace(content, sym_start)
+        })
         .collect()
 }
 
@@ -479,12 +484,20 @@ async fn handle_batch_place_components(
     };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
-    let project_name = project_name_for(&sch_path);
+    let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
+        Ok(context) => context,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
+    if let Err(error) = crate::tools::validate_sheet_instance_state(&sch_path, &sch, &context) {
+        return Ok(error.into_tool_result());
+    }
     // Built once: the lib-table parse is memoised across the whole batch.
-    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    let src = match crate::tools::library::KiCadSymbolSource::for_file(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(error.into_tool_result()),
+    };
 
-    let mut placed: Vec<serde_json::Value> = Vec::new();
+    let mut placed_uuids = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
     for comp in &components {
@@ -503,8 +516,8 @@ async fn handle_batch_place_components(
 
         match place_one_component(
             &mut sch,
-            &root_uuid,
-            &project_name,
+            &context.instance_paths,
+            &context.project_name,
             lib_id,
             x,
             y,
@@ -514,13 +527,21 @@ async fn handle_batch_place_components(
             unit,
             &src,
         ) {
-            Ok(v) => placed.push(v),
+            Ok(uuid) => placed_uuids.push(uuid),
             Err(e) => errors.push(error_text(&e)),
         }
     }
 
-    if !placed.is_empty() {
+    let mut placed = Vec::new();
+    if !placed_uuids.is_empty() {
         sch.overwrite()?;
+        let committed = cse::Schematic::load(&sch_path)?;
+        for uuid in &placed_uuids {
+            match placed_component_readback(&sch_path, &committed, uuid, &context) {
+                Ok(result) => placed.push(result),
+                Err(error) => return Ok(error),
+            }
+        }
     }
 
     let mut result = CallToolResult::json(&json!({
@@ -594,110 +615,17 @@ async fn handle_batch_connect_pins(
 
 async fn handle_batch_delete(
     args: &serde_json::Value,
-    _ctx: &crate::tools::ToolContext,
+    ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let sch_path = get_path(args, "schematic")?;
-    let content = read_consistent(&sch_path)?;
-    let expected = content.clone();
-
-    let mut edits: Vec<SexpEdit> = Vec::new();
-    let mut deleted: Vec<String> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-    let mut delete_ranges: HashSet<(usize, usize)> = HashSet::new();
-
-    // Delete by UUID — walk back from uuid node to enclosing top-level block
-    if let Some(uuids) = args["uuids"].as_array() {
-        for uuid_val in uuids {
-            let uuid = match uuid_val.as_str() {
-                Some(u) => u,
-                None => continue,
-            };
-            let pattern = format!(r#"(uuid "{}")"#, uuid);
-            match content.find(&pattern) {
-                Some(uuid_pos) => {
-                    match find_enclosing_direct_child_block(&content, "kicad_sch", uuid_pos) {
-                        Some((block_start, block_end)) => {
-                            let item = &content[block_start..block_end];
-                            if !is_deletable_schematic_item(item) {
-                                errors.push(format!(
-                                    "UUID '{}' belongs to protected schematic structure '{}'",
-                                    uuid,
-                                    sexp_tag(item)
-                                ));
-                                continue;
-                            }
-                            match find_block_with_leading_whitespace(&content, block_start) {
-                                Some((del_start, del_end)) => {
-                                    if delete_ranges.insert((del_start, del_end)) {
-                                        edits.push(SexpEdit::delete(del_start, del_end));
-                                        deleted.push(uuid.to_string());
-                                    }
-                                }
-                                None => {
-                                    errors.push(format!("Cannot parse block for UUID '{}'", uuid))
-                                }
-                            }
-                        }
-                        None => errors.push(format!("Cannot locate block for UUID '{}'", uuid)),
-                    }
-                }
-                None => errors.push(format!("UUID '{}' not found", uuid)),
-            }
-        }
-    }
-
-    // Delete by reference designator
-    if let Some(refs) = args["references"].as_array() {
-        for ref_val in refs {
-            let reference = match ref_val.as_str() {
-                Some(r) => r,
-                None => continue,
-            };
-            let blocks = find_symbol_blocks(&content, reference);
-            if blocks.is_empty() {
-                errors.push(format!("Component '{}' not found", reference));
-                continue;
-            }
-            // Every unit of a multi-unit part, or the whole component is not gone.
-            let mut any = false;
-            for (del_start, del_end) in blocks {
-                if delete_ranges.insert((del_start, del_end)) {
-                    edits.push(SexpEdit::delete(del_start, del_end));
-                    any = true;
-                }
-            }
-            if any {
-                deleted.push(reference.to_string());
-            }
-        }
-    }
-
-    let new_content = apply_edits(content, edits);
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
-
-    Ok(CallToolResult::json(&json!({
-        "deleted_count": deleted.len(),
-        "deleted": deleted,
-        "errors": errors
-    })))
-}
-
-fn sexp_tag(block: &str) -> &str {
-    let Some(after_open) = block.strip_prefix('(') else {
-        return "";
-    };
-    let end = after_open
-        .find(|c: char| c.is_whitespace() || c == '(' || c == ')')
-        .unwrap_or(after_open.len());
-    &after_open[..end]
+    handle_structural_batch_delete(args, ctx, true).await
 }
 
 // Blocklist of structural forms, not an allowlist of item kinds: deleting a
 // drawing item (text, bus, sheet, image, polyline, …) by UUID has always
 // worked and must keep working — only the schematic's skeleton is protected.
-fn is_deletable_schematic_item(block: &str) -> bool {
+fn is_deletable_schematic_tag(tag: &str) -> bool {
     !matches!(
-        sexp_tag(block),
+        tag,
         "version"
             | "generator"
             | "generator_version"
@@ -999,43 +927,182 @@ async fn handle_batch_edit(
 
 async fn handle_batch_delete_components(
     args: &serde_json::Value,
+    ctx: &crate::tools::ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    handle_structural_batch_delete(args, ctx, false).await
+}
+
+async fn handle_structural_batch_delete(
+    args: &serde_json::Value,
     _ctx: &crate::tools::ToolContext,
+    allow_uuids: bool,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let refs = match args["references"].as_array() {
         Some(a) => a.clone(),
+        None if allow_uuids => Vec::new(),
         None => return Ok(CallToolResult::error("Missing 'references' array")),
     };
 
     let content = read_consistent(&sch_path)?;
-    let expected = content.clone();
-    let mut edits: Vec<SexpEdit> = Vec::new();
-    let mut deleted: Vec<String> = Vec::new();
+    let tree = match konnect_sexp::parse_sexp(&content) {
+        Ok(tree) => tree,
+        Err(error) => {
+            return Ok(ComponentDeleteTargetError::Stale {
+                target: sch_path.display().to_string(),
+                reason: error.to_string(),
+            }
+            .into_result());
+        }
+    };
+    let instances = extract_symbol_instances(&tree);
+    let available_references = instances
+        .iter()
+        .map(|instance| instance.reference.clone())
+        .collect::<BTreeSet<_>>();
+    let mut reference_by_uuid: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for instance in &instances {
+        if let Some(uuid) = &instance.uuid {
+            reference_by_uuid
+                .entry(uuid.clone())
+                .or_default()
+                .insert(instance.reference.clone());
+        }
+    }
+    let indexed = match indexed_uuid_items(&sch_path, &content) {
+        Ok(indexed) => indexed,
+        Err(error) => return Ok(error.into_result()),
+    };
+
+    let mut selected_references = Vec::new();
+    let mut seen_references = HashSet::new();
+    let mut selected_item_uuids = Vec::new();
+    let mut seen_item_uuids = HashSet::new();
     let mut errors: Vec<String> = Vec::new();
 
     for ref_val in &refs {
         let reference = match ref_val.as_str() {
             Some(r) => r,
-            None => continue,
+            None => {
+                errors.push("Component reference must be a string".to_owned());
+                continue;
+            }
         };
-        let blocks = find_symbol_blocks(&content, reference);
-        if blocks.is_empty() {
+        if !available_references.contains(reference) {
             errors.push(format!("Component '{}' not found", reference));
             continue;
         }
-        // Every unit of a multi-unit part, or the whole component is not gone.
-        for (del_start, del_end) in blocks {
-            edits.push(SexpEdit::delete(del_start, del_end));
+        if seen_references.insert(reference.to_owned()) {
+            selected_references.push(reference.to_owned());
         }
-        deleted.push(reference.to_string());
     }
 
-    let new_content = apply_edits(content, edits);
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    if allow_uuids {
+        if let Some(uuids) = args["uuids"].as_array() {
+            for uuid_value in uuids {
+                let Some(uuid) = uuid_value.as_str() else {
+                    errors.push("Schematic UUID must be a string".to_owned());
+                    continue;
+                };
+                let Some(item) = indexed.get(uuid) else {
+                    errors.push(format!("UUID '{}' not found", uuid));
+                    continue;
+                };
+                if !is_deletable_schematic_tag(&item.kind) {
+                    errors.push(format!(
+                        "UUID '{}' belongs to protected schematic structure '{}'",
+                        uuid, item.kind
+                    ));
+                    continue;
+                }
+                if item.kind == "symbol" {
+                    let Some(references) = reference_by_uuid.get(uuid) else {
+                        return Ok(ComponentDeleteTargetError::Stale {
+                            target: format!("schematic symbol UUID {uuid}"),
+                            reason: "the symbol has no structural reference identity".to_owned(),
+                        }
+                        .into_result());
+                    };
+                    if references.len() != 1 {
+                        return Ok(ComponentDeleteTargetError::Ambiguous {
+                            target: format!("schematic symbol UUID {uuid}"),
+                            candidates: references.iter().cloned().collect(),
+                        }
+                        .into_result());
+                    }
+                    let reference = references.iter().next().expect("one reference").clone();
+                    if seen_references.insert(reference.clone()) {
+                        selected_references.push(reference);
+                    }
+                } else if seen_item_uuids.insert(uuid.to_owned()) {
+                    selected_item_uuids.push(uuid.to_owned());
+                }
+            }
+        }
+    }
+
+    if selected_references.is_empty() && selected_item_uuids.is_empty() {
+        return Ok(ComponentDeleteTargetError::Stale {
+            target: sch_path.display().to_string(),
+            reason: if errors.is_empty() {
+                "no schematic items were selected".to_owned()
+            } else {
+                errors.join("; ")
+            },
+        }
+        .into_result());
+    }
+
+    let plan = match plan_component_and_item_deletions(
+        &sch_path,
+        &content,
+        &selected_references,
+        &selected_item_uuids,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => return Ok(error.into_result()),
+    };
+    let outcome = match commit_component_deletion(&sch_path, plan)? {
+        Ok(outcome) => outcome,
+        Err(refusal) => return Ok(refusal),
+    };
+
+    let deleted_references = selected_references
+        .into_iter()
+        .filter(|reference| outcome.units_by_reference.contains_key(reference))
+        .collect::<Vec<_>>();
+    let deleted_items = selected_item_uuids
+        .into_iter()
+        .filter(|uuid| outcome.item_uuids.contains(uuid))
+        .collect::<Vec<_>>();
+    let deleted_components = deleted_references
+        .iter()
+        .map(|reference| {
+            let unit_uuids = &outcome.units_by_reference[reference];
+            json!({
+                "reference": reference,
+                "deleted_units": unit_uuids.len(),
+                "deleted_unit_uuids": unit_uuids
+            })
+        })
+        .collect::<Vec<_>>();
+    let deleted = deleted_references
+        .iter()
+        .cloned()
+        .chain(deleted_items.iter().cloned())
+        .collect::<Vec<_>>();
 
     Ok(CallToolResult::json(&json!({
         "deleted_count": deleted.len(),
         "deleted": deleted,
+        "deleted_components": deleted_components,
+        "deleted_item_uuids": deleted_items,
+        "removed_no_connects_count": outcome.marker_uuids.len(),
+        "removed_no_connect_uuids": outcome.marker_uuids,
+        "junctions_added_count": outcome.added_junctions.len(),
+        "junctions_added_uuids": outcome.added_junctions,
+        "junctions_pruned_count": outcome.pruned_junctions.len(),
+        "junctions_pruned_uuids": outcome.pruned_junctions,
         "errors": errors
     })))
 }
@@ -1577,6 +1644,208 @@ mod batch_delete_tests {
         assert!(after.contains("(uuid \"root\")"));
         assert!(after.contains("(sheet_instances"));
         assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod connectivity_safe_batch_delete_tests {
+    use super::*;
+    use crate::mcp::{error::extract_error_kind, protocol::ToolContent};
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    const CONNECTIVITY: &str = include_str!("../../tests/fixtures/junction_reconcile.kicad_sch");
+    const ECC83: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("batch-delete.kicad_sch");
+        std::fs::write(&path, content).unwrap();
+        (directory, path)
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        assert!(!result.is_error, "{result:?}");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text result");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn has_junction(content: &str, x: f64, y: f64) -> bool {
+        let tree = konnect_sexp::parse_sexp(content).unwrap();
+        konnect_sexp::schematic::extract_junctions(&tree)
+            .iter()
+            .any(|&(jx, jy)| konnect_sexp::geometry::points_coincident(x, y, jx, jy, 0.01))
+    }
+
+    #[test]
+    fn schematic_skeleton_tags_are_never_uuid_delete_targets() {
+        for tag in [
+            "version",
+            "generator",
+            "generator_version",
+            "uuid",
+            "paper",
+            "title_block",
+            "lib_symbols",
+            "sheet_instances",
+            "symbol_instances",
+            "embedded_fonts",
+        ] {
+            assert!(!is_deletable_schematic_tag(tag), "{tag}");
+        }
+        assert!(is_deletable_schematic_tag("text"));
+        assert!(is_deletable_schematic_tag("wire"));
+    }
+
+    #[tokio::test]
+    async fn both_aliases_dedupe_references_and_report_missing_without_partial_units() {
+        for generic in [true, false] {
+            let (_directory, path) = fixture(ECC83);
+            let args = json!({
+                "schematic": path,
+                "references": ["U1", "MISSING", "U1"]
+            });
+            let result = if generic {
+                handle_batch_delete(&args, &context()).await.unwrap()
+            } else {
+                handle_batch_delete_components(&args, &context())
+                    .await
+                    .unwrap()
+            };
+            let response = body(&result);
+
+            assert_eq!(response["deleted_count"], 1);
+            assert_eq!(response["deleted"], json!(["U1"]));
+            assert_eq!(response["deleted_components"][0]["deleted_units"], 3);
+            assert_eq!(response["errors"], json!(["Component 'MISSING' not found"]));
+            let after = konnect_sexp::schematic::read_schematic(&path).unwrap().1;
+            let instances = extract_symbol_instances(&after);
+            assert!(instances.iter().all(|instance| instance.reference != "U1"));
+            assert!(instances.iter().any(|instance| instance.reference == "R1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_reference_and_unit_uuid_delete_one_whole_component() {
+        let (_directory, path) = fixture(ECC83);
+        let tree = konnect_sexp::schematic::read_schematic(&path).unwrap().1;
+        let uuid = extract_symbol_instances(&tree)
+            .into_iter()
+            .find(|instance| instance.reference == "U1")
+            .and_then(|instance| instance.uuid)
+            .unwrap();
+        let result = handle_batch_delete(
+            &json!({
+                "schematic": path,
+                "references": ["U1"],
+                "uuids": [uuid, uuid]
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        let response = body(&result);
+
+        assert_eq!(response["deleted"], json!(["U1"]));
+        assert_eq!(response["deleted_components"][0]["deleted_units"], 3);
+        assert_eq!(response["deleted_item_uuids"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn component_batch_reconciles_junctions_and_no_connects_once() {
+        for generic in [true, false] {
+            let (_directory, path) = fixture(CONNECTIVITY);
+            let args = json!({ "schematic": path, "references": ["R1", "R3"] });
+            let result = if generic {
+                handle_batch_delete(&args, &context()).await.unwrap()
+            } else {
+                handle_batch_delete_components(&args, &context())
+                    .await
+                    .unwrap()
+            };
+            let response = body(&result);
+
+            assert_eq!(response["deleted_count"], 2);
+            assert_eq!(response["removed_no_connects_count"], 1);
+            assert_eq!(response["junctions_pruned_count"], 1);
+            let committed = std::fs::read_to_string(&path).unwrap();
+            assert!(!has_junction(&committed, 120.65, 139.7));
+            assert!(has_junction(&committed, 120.65, 170.18));
+            assert!(!committed.contains("3f9dbc19-858e-4bf8-b937-b169159de4c8"));
+        }
+    }
+
+    #[tokio::test]
+    async fn total_missing_or_protected_selection_is_structured_stale_and_unchanged() {
+        let cases = [
+            json!({ "references": ["MISSING"] }),
+            json!({ "uuids": ["5a1d3bbf-65fe-4cc0-9d9e-4ec47d238186"] }),
+            json!({ "uuids": ["8026d02f-ff62-464a-9ce5-e55f42254b73"] }),
+        ];
+        for selection in cases {
+            let (_directory, path) = fixture(CONNECTIVITY);
+            let mut args = selection;
+            args["schematic"] = json!(path);
+            let result = handle_batch_delete(&args, &context()).await.unwrap();
+
+            assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), CONNECTIVITY);
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_top_level_uuid_is_stale_and_unchanged() {
+        let closing = CONNECTIVITY.rfind("\n)").unwrap();
+        let duplicate =
+            "\t(junction\n\t\t(at 1 1)\n\t\t(uuid \"6f08a78f-7ec2-45e6-ba39-1d930be32b74\")\n\t)\n";
+        let original = format!(
+            "{}{}{}",
+            &CONNECTIVITY[..closing + 1],
+            duplicate,
+            &CONNECTIVITY[closing + 1..]
+        );
+        let (_directory, path) = fixture(&original);
+        let result = handle_batch_delete_components(
+            &json!({ "schematic": path, "references": ["R1"] }),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn stale_revision_refuses_the_whole_batch_without_overwriting() {
+        let (_directory, path) = fixture(CONNECTIVITY);
+        let plan = plan_component_and_item_deletions(
+            &path,
+            CONNECTIVITY,
+            &["R1".to_owned(), "R3".to_owned()],
+            &[],
+        )
+        .unwrap();
+        let newer = CONNECTIVITY.replace("(paper \"A4\")", "(paper \"A3\")");
+        std::fs::write(&path, &newer).unwrap();
+
+        let refusal = commit_component_deletion(&path, plan)
+            .unwrap()
+            .expect_err("stale batch must refuse");
+        assert_eq!(
+            extract_error_kind(&refusal).as_deref(),
+            Some("stale_target")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), newer);
     }
 }
 

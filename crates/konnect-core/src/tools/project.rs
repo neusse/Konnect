@@ -88,7 +88,9 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_project_info",
             "Read project metadata from a .kicad_pro file. Returns the project name, \
-             schematic and PCB paths, and last modified times.",
+             schematic and PCB paths, last modified time, project-file format version, \
+             and the generator versions recorded by the sibling design files. The \
+             compatibility kicad_version is null when those siblings disagree.",
             json!({
                 "type": "object",
                 "properties": {
@@ -409,6 +411,18 @@ async fn handle_get_project_info(
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
 
+    let schematic_generator_version = read_generator_version(&sch).await;
+    let pcb_generator_version = read_generator_version(&pcb).await;
+    let kicad_version = match (
+        schematic_generator_version.as_deref(),
+        pcb_generator_version.as_deref(),
+    ) {
+        (Some(schematic), Some(pcb)) if schematic == pcb => Some(schematic.to_string()),
+        (Some(schematic), None) => Some(schematic.to_string()),
+        (None, Some(pcb)) => Some(pcb.to_string()),
+        _ => None,
+    };
+
     Ok(CallToolResult::json(&json!({
         "name": stem,
         "path": path.display().to_string(),
@@ -417,8 +431,17 @@ async fn handle_get_project_info(
         "pcb": pcb.display().to_string(),
         "pcb_exists": pcb.exists(),
         "last_modified_unix": modified,
-        "kicad_version": pro.get("meta").and_then(|m| m.get("filename")).and_then(|v| v.as_str())
+        "project_file_version": pro.get("meta").and_then(|m| m.get("version")),
+        "schematic_generator_version": schematic_generator_version,
+        "pcb_generator_version": pcb_generator_version,
+        "kicad_version": kicad_version
     })))
+}
+
+async fn read_generator_version(path: &Path) -> Option<String> {
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+    let root = konnect_sexp::parse_sexp(&content).ok()?;
+    root.find_str("generator_version").map(str::to_owned)
 }
 
 async fn handle_snapshot_project(
@@ -465,14 +488,8 @@ async fn handle_snapshot_project(
         let pcb_pdf_name = format!("{}_pcb_{}_{}.pdf", stem, label, ts);
         let pcb_pdf_path = output_dir.join(&pcb_pdf_name);
         let layers = &["F.Cu", "B.Cu", "F.Silkscreen", "B.Silkscreen", "Edge.Cuts"];
-        let _ = crate::tools::cli::export_pdf(
-            &ctx.config.kicad_cli,
-            &pcb,
-            &pcb_pdf_path,
-            layers,
-            false,
-        )
-        .await;
+        crate::tools::cli::export_pdf(&ctx.config.kicad_cli, &pcb, &pcb_pdf_path, layers, false)
+            .await?;
         result["pcb_snapshot"] = json!(pcb_pdf_path.display().to_string());
     }
 
@@ -811,6 +828,42 @@ mod tests {
         assert_eq!(parsed["name"], "widget");
         assert_eq!(parsed["schematic_exists"], true);
         assert_eq!(parsed["pcb_exists"], true);
+        assert_eq!(parsed["project_file_version"], 1);
+        assert_eq!(parsed["schematic_generator_version"], "10.0");
+        assert_eq!(parsed["pcb_generator_version"], "10.0");
+        assert_eq!(parsed["kicad_version"], "10.0");
+    }
+
+    #[tokio::test]
+    async fn get_project_info_does_not_claim_a_version_when_siblings_disagree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = test_ctx();
+        let create_args = json!({
+            "path": dir.path().to_str().unwrap(),
+            "name": "widget"
+        });
+        handle_create_project(&create_args, &ctx)
+            .await
+            .expect("setup: create_project should succeed");
+
+        let pcb_path = dir.path().join("widget.kicad_pcb");
+        let pcb = std::fs::read_to_string(&pcb_path).expect("read generated board");
+        std::fs::write(
+            &pcb_path,
+            pcb.replace("generator_version \"10.0\"", "generator_version \"10.1\""),
+        )
+        .expect("write board with a distinct generator version");
+
+        let pro_path = dir.path().join("widget.kicad_pro");
+        let info_args = json!({ "path": pro_path.to_str().unwrap() });
+        let result = handle_get_project_info(&info_args, &ctx)
+            .await
+            .expect("handler should succeed");
+        let parsed = response_json(&result);
+
+        assert_eq!(parsed["schematic_generator_version"], "10.0");
+        assert_eq!(parsed["pcb_generator_version"], "10.1");
+        assert!(parsed["kicad_version"].is_null());
     }
 
     #[tokio::test]
@@ -828,6 +881,46 @@ mod tests {
             extract_error_kind(&result).as_deref(),
             Some("file_not_found")
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_propagates_a_missing_pcb_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        // Produce the first (schematic) PDF, then report success without
+        // producing the PCB PDF. This is the exact phantom-path failure #252
+        // described, independent of whether a real KiCad is installed.
+        let cli = crate::tools::cli::test_support::schematic_only_cli(dir.path());
+
+        let schematic = dir.path().join("voice.kicad_sch");
+        let board = dir.path().join("voice.kicad_pcb");
+        std::fs::write(&schematic, "placeholder").unwrap();
+        std::fs::write(&board, "placeholder").unwrap();
+        let ctx = ToolContext::new(
+            ServerConfig {
+                kicad_cli: cli.display().to_string(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        );
+
+        let error = handle_snapshot_project(
+            &json!({
+                "schematic": schematic.display().to_string(),
+                "pcb": board.display().to_string(),
+                "output_dir": dir.path().join("snapshots").display().to_string(),
+                "label": "regression"
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("missing PCB PDF must fail the snapshot call");
+        assert!(error.to_string().contains("did not create"), "{error:#}");
+        assert!(error.to_string().contains("pcb"), "{error:#}");
     }
 
     fn response_json(result: &CallToolResult) -> serde_json::Value {

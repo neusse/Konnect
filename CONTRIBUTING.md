@@ -12,8 +12,34 @@ Thanks for your interest! Bug reports, feature requests, and pull requests are w
   you invest time.
 - Keep each pull request focused on one reviewable outcome. Split unrelated platform,
   protocol, feature, and documentation changes into a short PR series.
+- Follow the [branch and pull request workflow](docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md).
+  Independent changes branch from current `upstream/main`; dependent work exposes one
+  mergeable step at a time instead of opening cumulative PRs against the same old base.
 - Read [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md) before adding public
   tools, schema fields, CLI options, environment variables, or user-facing terms.
+
+## Branch and pull request workflow
+
+The PR base and dependency structure are part of the change:
+
+- Branch independent changes separately from current `upstream/main`.
+- Use the latest `upstream/main`, not the latest release tag. Release tags are
+  consumption points, not contribution bases, unless a maintainer explicitly
+  requests a backport.
+- If PR B genuinely depends on PR A, document the complete order, keep only A ready,
+  and retain B in the contributor's fork until A merges. Then rebuild B on current
+  `upstream/main` with only B's unique commits and rerun CI.
+- Do not open several cumulative PRs against `main` from branches that all contain the
+  same unmerged prerequisite commits. Green checks on those old cumulative heads do
+  not establish merge readiness after `main` changes.
+- Use a short-lived `integration/<topic>` branch only with maintainer agreement for a
+  tightly coupled program. Child PRs target that branch; one terminal, fully validated
+  PR merges the combined result into `main` while unrelated work continues normally.
+- Resolve conflicts in the topic branch before final review. When rewriting a published
+  branch, use `--force-with-lease`, never plain `--force`.
+
+The linked workflow includes exact commands, fork limitations, restacking examples,
+merge-readiness criteria, and integration-branch ownership and cleanup rules.
 
 ## Development setup
 
@@ -40,9 +66,11 @@ The description should state:
 
 1. the user-visible problem and scope;
 2. the root cause and chosen design;
-3. compatibility or migration effects;
-4. tests run, including intentionally skipped environment-dependent checks;
-5. risk and rollback notes for file formats, IPC, packaging, or release changes.
+3. the base branch, dependencies, and position in any PR series;
+4. which commits and acceptance criteria this PR uniquely owns;
+5. compatibility or migration effects;
+6. tests run, including intentionally skipped environment-dependent checks;
+7. risk and rollback notes for file formats, IPC, packaging, or release changes.
 
 Treat MCP tools, schema fields, CLI flags, environment variables, config keys, and
 documented paths as public API. Preserve compatibility or provide an explicit
@@ -57,6 +85,10 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
 - `cargo test --workspace --locked --doc` passes
 - `cargo clippy --workspace --locked --all-targets -- -D warnings` is clean
 - `cargo fmt --all -- --check` is clean
+- The branch includes current `upstream/main`, GitHub reports no conflicts, and the
+  required checks passed on the exact head being reviewed
+- The commit list and diff contain only this PR's unique work; dependencies and stack
+  position are explicit
 - New names follow [the naming conventions](docs/NAMING_CONVENTIONS.md); public name
   changes include compatibility handling and migration notes
 - **Read required arguments through the helpers**, never `unwrap_or`:

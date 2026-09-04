@@ -243,6 +243,12 @@ Netclass width is the default. The Track/Via dropdowns are a separate palette
 in the sibling `.kicad_pro`. Fill them with `set_predefined_sizes` so `W` /
 `Shift+W` can step through extra widths without changing netclasses:
 
+The values below show call syntax only; they are not engineering recommendations.
+Replace every value with one from the accepted project sizing record, derived
+from the current fabrication contract, stackup, and electrical requirements. If
+that evidence is unavailable, report the sizing task as `INCOMPLETE` instead of
+reusing these illustrative values.
+
 ```
 set_predefined_sizes(board, track_widths=[0.2, 0.5, 0.8],
     via_dimensions=[{diameter:0.6, drill:0.3}, {diameter:0.8, drill:0.4}])
