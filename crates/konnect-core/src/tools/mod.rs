@@ -3,13 +3,16 @@
 mod board_session;
 pub mod cli;
 pub mod config;
+pub(crate) mod cross_probe;
 pub mod design_review;
+pub mod editor_navigation;
 mod footprint_graphics;
 mod footprint_metadata;
 mod footprint_models;
 pub mod integration;
 pub mod library;
 pub mod manufacturing;
+pub(crate) mod navigation_target;
 pub mod pcb_board;
 pub mod pcb_components;
 pub mod pcb_export;
@@ -124,6 +127,11 @@ pub struct ToolContext {
     /// Boards positively observed open through IPC during this server process.
     /// Sticky state prevents an unsafe file fallback after KiCad disappears.
     pub(crate) board_session: board_session::BoardSessionMemory,
+    /// Which configuration file configured this process, captured at startup
+    /// and reported read-only by `get_installation_info` (#419). Defaults to
+    /// `unavailable` so a caller that does not track the load reports absence
+    /// rather than a fabricated `defaults`.
+    pub config_resolution: crate::config_resolution::ConfigResolution,
 }
 
 impl ToolContext {
@@ -136,6 +144,7 @@ impl ToolContext {
             observer: crate::observability::CallObserver::new(None),
             jlcpcb_cache: QueryCache::default(),
             board_session: board_session::BoardSessionMemory::default(),
+            config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
         }
     }
 
@@ -152,7 +161,19 @@ impl ToolContext {
             observer,
             jlcpcb_cache: QueryCache::default(),
             board_session: board_session::BoardSessionMemory::default(),
+            config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
         }
+    }
+
+    /// Attach the startup configuration decision. Separate from the constructors
+    /// so the 60-plus existing `ServerConfig` call sites keep their signatures;
+    /// only the real server entry point records provenance.
+    pub fn with_config_resolution(
+        mut self,
+        resolution: crate::config_resolution::ConfigResolution,
+    ) -> Self {
+        self.config_resolution = resolution;
+        self
     }
 }
 
@@ -304,9 +325,9 @@ macro_rules! tool {
 ///
 /// This is the typed gate for the file-editing fallback — never a text match
 /// on the error message — and it is shared rather than copied per toolset:
-/// the toolsets' plain `with_ipc` helpers have already drifted from each
-/// other, and this is the one decision (is it safe to edit a board file behind
-/// a live KiCad?) whose copies must not.
+/// this is the one decision (is it safe to edit a board file behind a live
+/// KiCad?) whose copies must not drift, as the per-toolset `with_ipc` helpers
+/// this and `with_ipc` replaced had.
 pub async fn with_ipc_classified<T, F>(
     address: String,
     f: F,
@@ -316,8 +337,10 @@ where
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
     match tokio::task::spawn_blocking(move || {
-        f(&konnect_ipc::client::KiCadIpcClient::new(&address))
-            .map_err(konnect_ipc::IpcFailure::from_error)
+        f(&konnect_ipc::client::KiCadIpcClient::new(&address)).map_err(|error| {
+            warn_if_ipc_unreachable(&address, &error);
+            konnect_ipc::IpcFailure::from_error(error)
+        })
     })
     .await
     {
@@ -348,6 +371,165 @@ where
         f(client)
     })
     .await
+}
+
+/// Run `f` against KiCad's IPC API, reporting a failure as its message.
+///
+/// Callers that edit board files when this fails want
+/// [`with_ipc_classified`] instead: only the classification says whether a
+/// live KiCad could be holding the board.
+pub(crate) async fn with_ipc<T, F>(address: String, f: F) -> anyhow::Result<Result<T, String>>
+where
+    T: Send + 'static,
+    F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || {
+        f(&konnect_ipc::client::KiCadIpcClient::new(&address)).map_err(|error| {
+            warn_if_ipc_unreachable(&address, &error);
+            format!("{error:#}")
+        })
+    })
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
+    }
+}
+
+/// Warn that an IPC call never reached KiCad, naming the address it tried.
+///
+/// Nothing else records this: a tool that then reads the project files reports
+/// a plain success, and one that fails closed reports an error the user may
+/// read as "KiCad said no" rather than "Konnect never got through". KiCad
+/// *rejected* the call is a different thing, and is not warned about here.
+fn warn_if_ipc_unreachable(address: &str, error: &anyhow::Error) {
+    if !konnect_ipc::is_transport_unreachable(error) {
+        return;
+    }
+    let diagnostic_address = if address.is_empty() {
+        "<unset>".to_string()
+    } else {
+        konnect_ipc::redact_endpoint(address)
+    };
+    tracing::warn!(
+        ipc_address = %diagnostic_address,
+        error = %error.root_cause(),
+        "KiCad IPC unreachable, so the live board was not consulted"
+    );
+}
+
+/// Convert an IPC board-target refusal into the stable MCP error taxonomy.
+pub(crate) fn ipc_target_error_result(error: &konnect_ipc::BoardTargetError) -> CallToolResult {
+    use konnect_ipc::BoardTargetError;
+
+    let message = format!("{}. Konnect did not read or modify another board.", error);
+    match error {
+        BoardTargetError::NoOpenDocuments { requested } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::WrongDocument {
+                requested: requested.clone(),
+                open_documents: Vec::new(),
+            },
+            message,
+        ),
+        BoardTargetError::WrongDocument {
+            requested,
+            open_documents,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::WrongDocument {
+                requested: requested.clone(),
+                open_documents: open_documents.clone(),
+            },
+            message,
+        ),
+        BoardTargetError::AmbiguousDocument {
+            requested,
+            candidates,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::AmbiguousTarget {
+                target: requested.clone(),
+                candidates: candidates.clone(),
+            },
+            message,
+        ),
+        BoardTargetError::UnresolvedDocumentIdentities { requested, .. } => {
+            CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::AmbiguousOpenBoard {
+                    path: requested.clone(),
+                },
+                message,
+            )
+        }
+        BoardTargetError::StaleDocument {
+            requested,
+            previously_bound,
+            open_documents,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::StaleTarget {
+                target: requested.clone(),
+                reason: format!(
+                    "previously bound document '{}' is no longer uniquely open; observed [{}]",
+                    previously_bound,
+                    open_documents.join(", ")
+                ),
+            },
+            message,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod ipc_target_error_tests {
+    use super::*;
+
+    #[test]
+    fn ipc_document_target_failures_keep_distinct_structured_kinds() {
+        let cases = [
+            (
+                konnect_ipc::BoardTargetError::NoOpenDocuments {
+                    requested: "target.kicad_pcb".to_string(),
+                },
+                "wrong_document",
+            ),
+            (
+                konnect_ipc::BoardTargetError::WrongDocument {
+                    requested: "target.kicad_pcb".to_string(),
+                    open_documents: vec!["other.kicad_pcb".to_string()],
+                },
+                "wrong_document",
+            ),
+            (
+                konnect_ipc::BoardTargetError::AmbiguousDocument {
+                    requested: "target.kicad_pcb".to_string(),
+                    candidates: vec!["target.kicad_pcb".to_string(); 2],
+                },
+                "ambiguous_target",
+            ),
+            (
+                konnect_ipc::BoardTargetError::StaleDocument {
+                    requested: "target.kicad_pcb".to_string(),
+                    previously_bound: "target.kicad_pcb".to_string(),
+                    open_documents: vec!["other.kicad_pcb".to_string()],
+                },
+                "stale_target",
+            ),
+            (
+                konnect_ipc::BoardTargetError::UnresolvedDocumentIdentities {
+                    requested: "target.kicad_pcb".to_string(),
+                    reasons: vec!["unidentified document".to_string()],
+                },
+                "ambiguous_open_board",
+            ),
+        ];
+
+        for (error, expected_kind) in cases {
+            let result = ipc_target_error_result(&error);
+            assert!(result.is_error);
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some(expected_kind)
+            );
+        }
+    }
 }
 
 // ─── Argument helpers ─────────────────────────────────────────────────────────
@@ -545,6 +727,18 @@ pub(crate) fn placed_pins(
         .into_iter()
         .flat_map(|(_, pins)| pins)
         .collect()
+}
+
+/// Whether a reference belongs to a symbol that names a net rather than
+/// consuming one — a power symbol, a `PWR_FLAG`. KiCAD prefixes those with `#`
+/// and keeps them out of the netlist as components.
+///
+/// Deliberately not `LabelKind::PowerSymbol`, which `extract_power_symbol_labels`
+/// derives from the `(power)` marker plus a `power_in` pin: `PWR_FLAG`'s pin is
+/// `power_out`, so that test lets it through, and a caller counting what a net
+/// actually reaches wants it out too.
+pub(crate) fn is_power_symbol_reference(reference: &str) -> bool {
+    reference.starts_with('#')
 }
 
 /// [`placed_pins`], grouped under the instance that placed each unit, for

@@ -145,6 +145,299 @@ fn load_board(path: &Path) -> SexpNode {
 
 #[test]
 #[ignore = "requires a running KiCad GUI with its IPC API enabled"]
+fn editor_state_observation_reports_real_version_and_honest_capabilities() {
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let observation = KiCadIpcClient::new(socket)
+        .observe_editor_state()
+        .expect("editor-state observation failed");
+    assert!(
+        observation.kicad_version.major >= 10,
+        "navigation requires KiCad 10 or newer, got {:?}",
+        observation.kicad_version
+    );
+    assert_eq!(observation.evidence_source, "kicad_ipc");
+    assert_eq!(observation.editors.len(), 2);
+    assert!(observation.active_editor.is_none());
+    assert!(observation.active_document.is_none());
+    assert!(observation.active_sheet_instance.is_none());
+    assert!(observation.editors.iter().all(|editor| {
+        editor.addressable
+            || editor.unavailable_reason.as_deref().is_some_and(|reason| {
+                reason.contains("AS_UNHANDLED") || reason.contains("AS_UNIMPLEMENTED")
+            })
+    }));
+}
+
+/// What does KiCad send for a footprint that has no schematic symbol?
+///
+/// `konnect-core`'s board-sync planner treats `symbol_path == None` as
+/// "board-only" — a logo, a fiducial, a mounting hole — and #452 was the
+/// planner reading *absence* as the shared identity `/`. The fix assumes
+/// KiCad's IPC layer sends `symbol_path` **present but empty**
+/// (`Some(SheetPath { path: [] })`) rather than absent (`None`) for such a
+/// footprint. That assumption was read from the source and from the field's
+/// own proto comment ("the associated symbol ... **if one exists**"); until
+/// this test runs it has never been observed against a running editor.
+///
+/// It matters which one it is. If KiCad sends `None`, the empty-vector guard
+/// in `pcb_sync`'s reader is dead code and the `/` identity comes from
+/// somewhere else — so the failure message names the state it actually saw
+/// rather than merely asserting.
+///
+/// The bundled fixture is enough: `live_ipc.kicad_pcb` is KiCad's own EuroCard
+/// template, whose four mounting holes `MH1`–`MH4` carry no `(path ...)` line
+/// at all. Two or more pathless footprints is also exactly the #452 collision,
+/// so this covers the reported case and not a reduced one.
+#[test]
+#[ignore = "requires a running KiCad GUI with its IPC API enabled"]
+fn kicad_reports_an_empty_sheet_path_for_a_board_only_footprint() {
+    use kiapi::common::types::KiCadObjectType as ObjectType;
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+
+    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
+        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let client = KiCadIpcClient::new(socket);
+
+    // The board on disk is the authority for *which* footprints are board-only:
+    // no `(path ...)` child means no schematic symbol behind it. Deriving the
+    // expectation from the file rather than hard-coding references keeps this
+    // honest if the fixture gains a schematic-backed footprint later.
+    //
+    // Deliberately no `save_board()`, unlike the mutating tests below: this one
+    // only observes, so it must not rewrite the open board. That keeps it safe
+    // to run against the tracked fixture itself, and whether a footprint has a
+    // `(path ...)` is a property of the design that no format upgrade changes.
+    let tree = load_board(Path::new(&board));
+    let pathless = tree
+        .find_all("footprint")
+        .into_iter()
+        .filter(|node| node.find("path").is_none())
+        .filter_map(|node| {
+            node.find_all("property").into_iter().find_map(|property| {
+                (property.get(1).and_then(SexpNode::as_str) == Some("Reference"))
+                    .then(|| property.get(2).and_then(SexpNode::as_str))
+                    .flatten()
+                    .map(str::to_string)
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        pathless.len() >= 2,
+        "this test needs at least two footprints with no (path ...) on the open \
+         board — the bundled fixture's MH1-MH4 qualify; found {pathless:?}"
+    );
+
+    let document = client
+        .find_open_board(Path::new(&board))
+        .expect("KiCad has not got the requested board open");
+    let items = client
+        .get_items_in(document, ObjectType::KotPcbFootprint)
+        .expect("footprint query failed");
+
+    let mut seen = Vec::new();
+    let mut captures = Vec::new();
+    for item in items {
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .expect("KiCad returned an invalid footprint item");
+        let reference = footprint
+            .reference_field
+            .as_ref()
+            .and_then(|field| field.text.as_ref())
+            .and_then(|text| text.text.as_ref())
+            .map(|text| text.text.clone())
+            .unwrap_or_default();
+        if !pathless.contains(&reference) {
+            continue;
+        }
+        let state = match footprint.symbol_path.as_ref() {
+            None => "absent (None)".to_string(),
+            Some(path) if path.path.is_empty() => "present and empty".to_string(),
+            Some(path) => format!(
+                "present with {} KIID(s): {:?}",
+                path.path.len(),
+                path.path
+                    .iter()
+                    .map(|k| k.value.as_str())
+                    .collect::<Vec<_>>()
+            ),
+        };
+        captures.push((reference.clone(), item.value.clone(), footprint.clone()));
+        seen.push((reference, state));
+    }
+
+    // Regeneration + provenance inspection for the checked-in capture. Off by
+    // default; the assertions below are what runs normally.
+    if std::env::var("KONNECT_CAPTURE_IPC_FIXTURE").is_ok() {
+        for (reference, raw, decoded) in &captures {
+            eprintln!("--- {reference} ({} bytes) ---\n{decoded:#?}", raw.len());
+        }
+        let (reference, raw, _) = captures
+            .first()
+            .expect("no board-only footprint captured to write");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../konnect-core/tests/fixtures/board_only_footprint.ipc.bin");
+        std::fs::write(&out, raw).expect("failed to write capture");
+        eprintln!(
+            "wrote {} bytes from {reference} to {}",
+            raw.len(),
+            out.display()
+        );
+    }
+
+    assert_eq!(
+        seen.len(),
+        pathless.len(),
+        "IPC did not return every board-only footprint the file carries: saw {seen:?}, \
+         expected {pathless:?}"
+    );
+    let wrong = seen
+        .iter()
+        .filter(|(_, state)| state != "present and empty")
+        .collect::<Vec<_>>();
+    assert!(
+        wrong.is_empty(),
+        "a footprint with no (path ...) must arrive as a present-but-empty SheetPath, \
+         because that is what pcb_sync's board_symbol_path guard normalises to None. \
+         These did not: {wrong:?}. If they are 'absent (None)', the guard is dead code \
+         and the `/` identity in #452 comes from somewhere else."
+    );
+}
+
+/// Two board-only footprints on one board really do share the reference
+/// `REF**`, and KiCad reports both that way over IPC.
+///
+/// `pcb_sync` narrows `duplicate_board_reference` to references the schematic
+/// export actually names, so a board carrying repeated `REF**` graphics stops
+/// blocking a sync. That narrowing rests on a claim about KiCad, not about
+/// Konnect: that a footprint placed on the board without annotation keeps the
+/// library's own `REF**`, and that a second one keeps it too — the duplicate
+/// is normal, not a corrupt board.
+///
+/// `live_ipc.kicad_pcb` cannot witness it: its four mounting holes are
+/// annotated `MH1`-`MH4`. `fixtures/board_only_shared_reference.kicad_pcb` is
+/// a board KiCad itself wrote for this, holding two unannotated
+/// `MountingHole:MountingHole_2.7mm_M2.5_DIN965` instances. Point
+/// `KONNECT_LIVE_KICAD_SHARED_REFERENCE_BOARD` at a copy of it.
+///
+/// Observing only, like the test above: no `save_board()`, so it cannot
+/// rewrite the board it is reading.
+#[test]
+#[ignore = "requires a running KiCad GUI with its IPC API enabled"]
+fn kicad_reports_the_same_reference_for_two_board_only_footprints() {
+    use kiapi::common::types::KiCadObjectType as ObjectType;
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+    use std::collections::BTreeMap;
+
+    let board = std::env::var("KONNECT_LIVE_KICAD_SHARED_REFERENCE_BOARD").expect(
+        "KONNECT_LIVE_KICAD_SHARED_REFERENCE_BOARD must name the open copy of \
+         fixtures/board_only_shared_reference.kicad_pcb",
+    );
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let client = KiCadIpcClient::new(socket);
+
+    // The file is the authority for which footprints are board-only and what
+    // they are called, exactly as in the test above — derived, not hard-coded,
+    // so a fixture that gained a schematic-backed footprint fails here rather
+    // than quietly narrowing what the test covers.
+    let tree = load_board(Path::new(&board));
+    let mut pathless_by_reference: BTreeMap<String, usize> = BTreeMap::new();
+    for node in tree.find_all("footprint") {
+        if node.find("path").is_some() {
+            continue;
+        }
+        let reference = node.find_all("property").into_iter().find_map(|property| {
+            (property.get(1).and_then(SexpNode::as_str) == Some("Reference"))
+                .then(|| property.get(2).and_then(SexpNode::as_str))
+                .flatten()
+                .map(str::to_string)
+        });
+        if let Some(reference) = reference {
+            *pathless_by_reference.entry(reference).or_default() += 1;
+        }
+    }
+    let (shared, count) = pathless_by_reference
+        .iter()
+        .find(|(_, count)| **count >= 2)
+        .map(|(reference, count)| (reference.clone(), *count))
+        .unwrap_or_else(|| {
+            panic!(
+                "this test needs two board-only footprints sharing one reference on the \
+                 open board — that is the #452 case; found {pathless_by_reference:?}"
+            )
+        });
+    assert_eq!(
+        shared, "REF**",
+        "the shared reference should be KiCad's own unannotated default, not one \
+         an editing session happened to leave behind"
+    );
+
+    let document = client
+        .find_open_board(Path::new(&board))
+        .expect("KiCad has not got the requested board open");
+    let items = client
+        .get_items_in(document, ObjectType::KotPcbFootprint)
+        .expect("footprint query failed");
+
+    let mut seen = Vec::new();
+    let mut captures = Vec::new();
+    for item in items {
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .expect("KiCad returned an invalid footprint item");
+        let reference = footprint
+            .reference_field
+            .as_ref()
+            .and_then(|field| field.text.as_ref())
+            .and_then(|text| text.text.as_ref())
+            .map(|text| text.text.clone())
+            .unwrap_or_default();
+        if reference != shared {
+            continue;
+        }
+        let empty_path = footprint
+            .symbol_path
+            .as_ref()
+            .is_some_and(|path| path.path.is_empty());
+        captures.push((reference.clone(), item.value.clone(), footprint.clone()));
+        seen.push((reference, empty_path));
+    }
+
+    // Regeneration + provenance inspection for the checked-in capture. Off by
+    // default; the assertions below are what runs normally.
+    if std::env::var("KONNECT_CAPTURE_IPC_FIXTURE").is_ok() {
+        for (reference, raw, decoded) in &captures {
+            eprintln!("--- {reference} ({} bytes) ---\n{decoded:#?}", raw.len());
+        }
+        let (reference, raw, _) = captures
+            .first()
+            .expect("no board-only footprint captured to write");
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../konnect-core/tests/fixtures/board_only_shared_reference.ipc.bin");
+        std::fs::write(&out, raw).expect("failed to write capture");
+        eprintln!(
+            "wrote {} bytes from {reference} to {}",
+            raw.len(),
+            out.display()
+        );
+    }
+
+    assert_eq!(
+        seen.len(),
+        count,
+        "IPC returned {} footprints called {shared}, but the file carries {count}",
+        seen.len()
+    );
+    assert!(
+        seen.iter().all(|(_, empty_path)| *empty_path),
+        "every footprint sharing {shared} must arrive with a present-but-empty SheetPath, \
+         or it is not the board-only case #452 is about: {seen:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a running KiCad GUI with its IPC API enabled"]
 fn moving_and_rotating_footprint_preserves_child_geometry() {
     let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
         .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
@@ -526,6 +819,23 @@ fn the_live_fixture_satisfies_what_the_live_tests_assume() {
          a live run saved over the tracked file instead of a copy"
     );
 
+    // `kicad_reports_an_empty_sheet_path_for_a_board_only_footprint` needs at
+    // least two footprints with no `(path ...)` — that is the #452 collision,
+    // and one would let the test pass on a case the defect never reached. The
+    // template's four mounting holes supply them; a fixture that gained
+    // schematic-backed footprints, or lost the holes, would leave that test
+    // asserting nothing.
+    let pathless = tree
+        .find_all("footprint")
+        .into_iter()
+        .filter(|node| node.find("path").is_none())
+        .count();
+    assert!(
+        pathless >= 2,
+        "the fixture needs at least two footprints with no (path ...) for the \
+         board-only identity test; found {pathless}"
+    );
+
     // The template is not at the origin, and coordinates in the live tests are
     // absolute. A zone outside the outline is clipped to nothing, and a via
     // outside it is not the regression the via test means to catch.
@@ -595,5 +905,54 @@ fn the_live_fixture_satisfies_what_the_live_tests_assume() {
         "no GND segment runs through the zone test's region \
          ({zone_left}, {zone_top})-({zone_right}, {zone_bottom}); its fill \
          would be removed as unconnected islands"
+    );
+}
+
+/// The shared-reference fixture's own preconditions, checked without KiCad —
+/// and, like the guard above, deliberately **not** `#[ignore]`d.
+///
+/// `board_only_shared_reference.kicad_pcb` exists to witness one fact: KiCad
+/// leaves an unannotated footprint the library's `REF**`, so a board can carry
+/// two board-only footprints with the same reference and nothing is wrong with
+/// it. The unit tests in `konnect-core`'s `pcb_sync` build their duplicate pair
+/// by varying only the KIID on the capture taken from this board, which is
+/// honest only while the board really does carry the pair. Nothing in CI opens
+/// KiCad, so this is the only automatic check that it still does.
+#[test]
+fn the_shared_reference_fixture_still_carries_a_duplicate_board_only_reference() {
+    use std::collections::BTreeMap;
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/board_only_shared_reference.kicad_pcb");
+    let tree = load_board(&fixture);
+
+    let mut pathless_by_reference: BTreeMap<String, usize> = BTreeMap::new();
+    let mut with_path = 0usize;
+    for node in tree.find_all("footprint") {
+        if node.find("path").is_some() {
+            with_path += 1;
+            continue;
+        }
+        let reference = node.find_all("property").into_iter().find_map(|property| {
+            (property.get(1).and_then(SexpNode::as_str) == Some("Reference"))
+                .then(|| property.get(2).and_then(SexpNode::as_str))
+                .flatten()
+                .map(str::to_string)
+        });
+        if let Some(reference) = reference {
+            *pathless_by_reference.entry(reference).or_default() += 1;
+        }
+    }
+
+    assert_eq!(
+        with_path, 0,
+        "every footprint on this fixture must be board-only; a schematic-backed one \
+         would give the duplicate reference an adoption target and change the case"
+    );
+    assert_eq!(
+        pathless_by_reference.get("REF**").copied(),
+        Some(2),
+        "the fixture must carry exactly two board-only footprints called REF**; \
+         found {pathless_by_reference:?}"
     );
 }

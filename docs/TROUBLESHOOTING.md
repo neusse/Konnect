@@ -22,8 +22,29 @@ to verify the process that actually restarted. This diagnostic writes nothing.
 ## "KiCAD IPC socket path not configured"
 
 Any tool that talks to a live KiCAD session (`save_project`, PCB editing,
-`check_kicad_ui`, …) needs the IPC socket address. Two separate configurations
-must both be correct — neither happens automatically:
+`check_kicad_ui`, …) needs the IPC socket address.
+
+**At startup** — once, and only then — Konnect resolves it in order: the
+`ipc_address` in your config, then `KICAD_API_SOCKET` (set only for plugins
+KiCad launches itself), then the platform default — `<temp dir>/kicad/api.sock`,
+used only if something is actually listening there. The startup log on stderr
+says which it picked, and warns when nothing was found.
+
+So on Linux and macOS, **if KiCad is already running with the API enabled when
+Konnect starts**, no configuration is needed. That order matters and is easy to
+get wrong: an MCP client normally launches the Konnect server itself, before
+you open KiCad. Konnect does not re-probe afterwards, so a server started first
+stays unresolved for its whole life no matter what you open later. Start KiCad
+first, or restart the Konnect server (in most clients, reconnect the MCP
+server) once KiCad is up — or set `ipc_address` explicitly, which never depends
+on ordering.
+
+Windows detects nothing either way: KiCad's `ipc://` endpoint is a named pipe
+there and this probe cannot ask it whether anyone is listening, so a Windows
+setup is configured by hand exactly as it was before.
+
+If the address is unresolved, both of the following must be correct — neither
+happens automatically:
 
 1. **The socket path in Konnect's plugin settings** (inside KiCAD)
 2. **The Konnect server registration in your AI client's MCP config**
@@ -70,6 +91,23 @@ That message means the transport was unreachable. If KiCAD *is* running with
 that board open and a tool still refuses, the error you get back is the tool's
 own reason — "a polygon needs at least 3 points", "requested board … is not open
 in KiCAD" — and it names what to change about the request.
+
+## Tools answer from the file while KiCad is open
+
+Tools that read the board IPC-first report `"source": "ipc"` or `"file"`, and a
+`file` answer means the live board was never consulted — unsaved changes are
+missing from it. Those tools go through one shared IPC helper, and it logs a
+`WARN` on stderr each time the transport could not be reached, naming the
+address it tried; check that against the address KiCad reports as "Listening
+on".
+
+The warning covers that helper, which is every tool that falls back to a file.
+It is not a global "IPC failed" log: the health tools (`check_kicad_ui`,
+`launch_kicad_ui`) and `get_project_info` dial KiCad directly and report the
+outcome in their own response — `ipc_responsive`, `connected` — rather than
+falling back to anything, so read those fields instead of looking for a
+warning. A KiCad that *answered and refused* is not warned about anywhere; that
+is a tool error, and it says so.
 
 ## "layer 'X' has no KiCAD board layer this build can represent"
 
@@ -146,7 +184,13 @@ result is not what you expect.
 
 Common install paths are auto-detected (including the Windows registry). If
 your install is somewhere unusual, set the path in the plugin settings dialog
-in a `settings.json` beside the binary, or in a `konnect.toml` in the working directory (`kicad_cli`). Discovery order is `konnect.toml` and `settings.json` in the CWD, then `settings.json` next to the binary and one level up, then the platform config dir. A file under any other name is only read when passed with `--config`.
+in a `settings.json` beside the binary, or in a `konnect.toml` in the working directory (`kicad_cli`). Discovery order is `konnect.toml` and `settings.json` in the CWD, then `settings.json` next to the binary and one level up, then the platform config dir. **Only the first existing file is loaded — later ones are not merged in**, so a `kicad_cli` set in a lower-priority file is ignored while a higher-priority file exists. A file under any other name is only read when passed with `--config`.
+
+If a setting appears to be ignored, call `get_installation_info` and read its
+`configuration` block: `selected_path` is the file that configured the running
+process and `skipped_existing_paths` lists the ones it shadowed. That
+distinguishes "my file was never read" from "my file was read and the value is
+wrong", which otherwise look identical.
 
 ## Native Specctra export used the Rust fallback
 
@@ -265,7 +309,7 @@ callable tools, the fix is to make the *first* listing complete:
 ```
 
 in `konnect.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
-startup, so `tools/list` carries all 228 tools from the first call.
+startup, so `tools/list` carries all 233 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly
 25K tokens per listing instead of ~2K. Turn it on only if your client needs it.

@@ -1,6 +1,248 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// KiCad design editor addressed by the typed IPC API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcEditorKind {
+    Schematic,
+    Pcb,
+}
+
+impl IpcEditorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Schematic => "schematic",
+            Self::Pcb => "pcb",
+        }
+    }
+}
+
+/// Runtime availability of one semantic editor capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcCapabilityAvailability {
+    Available,
+    Unsupported,
+    Unknown,
+}
+
+/// One capability statement and the evidence used to make it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcCapability {
+    pub availability: IpcCapabilityAvailability,
+    pub evidence_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Capabilities relevant to the Priority 1 semantic navigation surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcEditorCapabilities {
+    pub observe_documents: IpcCapability,
+    pub observe_active_context: IpcCapability,
+    pub read_selection: IpcCapability,
+    pub mutate_selection: IpcCapability,
+    pub activate_document: IpcCapability,
+    pub activate_sheet: IpcCapability,
+    pub reveal_object: IpcCapability,
+    pub center_object: IpcCapability,
+    pub fit_view: IpcCapability,
+    pub cross_probe: IpcCapability,
+}
+
+/// Running KiCad version observed through `GetVersion`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcKiCadVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+    pub full_version: String,
+}
+
+/// Project identity carried by a live KiCad `DocumentSpecifier`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcProjectIdentity {
+    pub name: String,
+    pub path: String,
+}
+
+/// Canonical schematic instance identity carried by KiCad IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcSheetInstancePath {
+    pub kiids: Vec<String>,
+    pub human_readable: String,
+}
+
+/// One exact live document identity observed through KiCad IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcEditorDocument {
+    pub editor: IpcEditorKind,
+    pub project: Option<IpcProjectIdentity>,
+    /// Exact board path when KiCad provides one. KiCad 10 schematic document
+    /// specifiers carry a sheet path rather than a schematic filename, so this
+    /// is deliberately null for schematics instead of being inferred from disk.
+    pub document_path: Option<String>,
+    pub sheet_instance_path: Option<IpcSheetInstancePath>,
+}
+
+/// Observation for one editor kind on the configured IPC endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcEditorObservation {
+    pub editor: IpcEditorKind,
+    pub addressable: bool,
+    pub documents: Vec<IpcEditorDocument>,
+    pub capabilities: IpcEditorCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// Result of observing the configured KiCad IPC endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcEditorStateObservation {
+    pub kicad_version: IpcKiCadVersion,
+    pub evidence_source: String,
+    pub editors: Vec<IpcEditorObservation>,
+    /// KiCad 10 has no stable typed foreground-frame or active-document query.
+    /// These fields remain null rather than treating open-document order as
+    /// active state.
+    pub active_editor: Option<IpcEditorKind>,
+    pub active_document: Option<IpcEditorDocument>,
+    pub active_sheet_instance: Option<IpcSheetInstancePath>,
+    pub limitations: Vec<String>,
+}
+
+/// One selected object observed from the exact requested live document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcSelectedObject {
+    /// Stable KiCad object identifier (KIID/UUID), never a display reference.
+    pub kiid: String,
+    /// Semantic object kind derived from the exact protobuf type URL.
+    pub object_type: String,
+    /// Full protobuf type carried by KiCad, retained as decoding evidence.
+    pub protocol_type: String,
+}
+
+/// Selection readback bound to one exact live editor/document/sheet context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcSelectionObservation {
+    pub project: Option<IpcProjectIdentity>,
+    pub document: IpcEditorDocument,
+    pub editor: IpcEditorKind,
+    pub sheet_instance_path: Option<IpcSheetInstancePath>,
+    pub selected_objects: Vec<IpcSelectedObject>,
+    pub evidence_source: String,
+}
+
+/// Semantic selection change requested from one exact editor context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcSelectionMutation {
+    Clear,
+    Add,
+    Remove,
+}
+
+impl IpcSelectionMutation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Add => "add",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+/// Verified selection mutation. Success means the post-operation observation
+/// exactly matched the requested set transition, not merely that IPC replied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcSelectionMutationResult {
+    pub operation: IpcSelectionMutation,
+    pub requested_kiids: Vec<String>,
+    pub before: IpcSelectionObservation,
+    pub after: IpcSelectionObservation,
+    pub evidence_source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcSelectionMutationErrorKind {
+    InvalidRequest,
+    ReadbackMismatch,
+}
+
+/// A semantic selection mutation was invalid or its observed result did not
+/// prove the requested change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcSelectionMutationError {
+    pub kind: IpcSelectionMutationErrorKind,
+    pub operation: IpcSelectionMutation,
+    pub requested_kiids: Vec<String>,
+    pub before_kiids: Vec<String>,
+    pub after_kiids: Vec<String>,
+    pub reason: String,
+}
+
+impl IpcSelectionMutationError {
+    pub fn from_error(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
+impl std::fmt::Display for IpcSelectionMutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cannot verify {} selection mutation: {}",
+            self.operation.as_str(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for IpcSelectionMutationError {}
+
+/// Stable classification for a fail-closed selection observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcSelectionObservationErrorKind {
+    WrongProject,
+    WrongDocument,
+    WrongSheetInstance,
+    AmbiguousDocument,
+    StaleEditorState,
+    UnsupportedObjectType,
+    MalformedSelectedObject,
+}
+
+/// A selection could not be attributed to the exact requested live context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcSelectionObservationError {
+    pub kind: IpcSelectionObservationErrorKind,
+    pub editor: IpcEditorKind,
+    pub requested: String,
+    pub candidates: Vec<String>,
+    pub reason: String,
+}
+
+impl IpcSelectionObservationError {
+    pub fn from_error(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
+impl std::fmt::Display for IpcSelectionObservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cannot observe {} selection for {}: {}",
+            self.editor.as_str(),
+            self.requested,
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for IpcSelectionObservationError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcVector2 {
     pub x: f64,

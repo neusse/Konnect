@@ -1,11 +1,13 @@
 mod config;
 mod install;
 mod manifest;
+mod run_registry;
 mod transaction_cli;
 mod transport;
 
 use anyhow::Result;
 use config::{Config, TransportMode};
+use konnect_core::config_resolution::ConfigSource;
 use konnect_core::mcp::handler::McpHandler;
 use std::io::IsTerminal;
 use tracing::info;
@@ -120,15 +122,7 @@ async fn main() -> Result<()> {
         .and_then(|pos| args.get(pos + 1))
         .map(std::path::PathBuf::from);
 
-    let config = if let Some(ref path) = config_path {
-        // KiCAD launches the server this way (with KICAD_API_SOCKET set), so
-        // the env fallback for a blank ipc_address must apply here too (#39).
-        let mut c = Config::load_from(path)?;
-        c.apply_env_fallbacks();
-        c
-    } else {
-        Config::load()?
-    };
+    let (config, ipc_source, config_resolution) = Config::load_resolved(config_path.as_deref())?;
 
     // ─── Initialize tracing (stderr only — stdout is MCP protocol) ──
     let filter =
@@ -140,6 +134,43 @@ async fn main() -> Result<()> {
         .init();
 
     info!("Konnect v{} starting", env!("CARGO_PKG_VERSION"));
+    ipc_source.log(&config.ipc_address);
+
+    // Name the configuration that actually started this process. A user whose
+    // settings appear to be ignored otherwise has nothing to go on before the
+    // first tool call, and `get_installation_info` may not be reachable at all
+    // if the transport is the thing misconfigured (#419). One record, not one
+    // per shadowed file: first-match is the intended policy, so a warning per
+    // skipped file would be noise.
+    match (
+        config_resolution.source(),
+        config_resolution.selected_path(),
+    ) {
+        // An explicit --config bypasses discovery, so a count of "later
+        // candidates" would claim a search ran that never did.
+        (ConfigSource::ExplicitPath, Some(path)) => info!(
+            "configuration: explicit_path from {} (search list not consulted)",
+            path.display(),
+        ),
+        (_, Some(path)) => info!(
+            "configuration: {} from {} ({} later candidate(s) exist and were not merged)",
+            config_resolution.source().as_str(),
+            path.display(),
+            config_resolution.skipped_existing_paths().len(),
+        ),
+        (_, None) => info!(
+            "configuration: {} (no configuration file was loaded)",
+            config_resolution.source().as_str(),
+        ),
+    }
+
+    // Record this server, and reap the records of servers that are gone
+    // (#103). This is the only spot that sees all three spawn paths — the
+    // Python ActionPlugin, KiCad 10's `exec` entrypoint, and an external MCP
+    // client — so it is the only spot where the bookkeeping cannot be skipped
+    // by launching a different way. The guard has to outlive every transport
+    // below: it holds the lock that proves this process is still alive.
+    let _run_record = run_registry::sweep_and_register(&config.transport);
 
     let server_config = konnect_core::tools::ServerConfig {
         kicad_cli: config.kicad_cli.clone(),
@@ -150,11 +181,22 @@ async fn main() -> Result<()> {
         auto_load_toolsets: config.auto_load_toolsets,
         eager_toolsets: config.eager_toolsets,
     };
-    let handler = McpHandler::new(server_config).await?;
+    let handler = McpHandler::new_with_config_resolution(server_config, config_resolution).await?;
 
     match config.transport {
         TransportMode::Stdio => {
-            transport::stdio::run_stdio(handler).await?;
+            handler.enable_stdio_reload();
+            match transport::stdio::run_stdio(handler).await? {
+                transport::stdio::StdioExit::Eof => {}
+                #[cfg(unix)]
+                transport::stdio::StdioExit::Reload(plan) => {
+                    // exec does not run destructors. Release the old process's
+                    // run-registry pair explicitly so the replacement can
+                    // register the same PID without leaving stale state.
+                    drop(_run_record);
+                    exec_reload(plan)?;
+                }
+            }
         }
         TransportMode::Http => {
             transport::http::run_http(handler, &config.http_address).await?;
@@ -180,6 +222,25 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Replace the standalone process through the platform-specific validated
+/// handoff selected by the handler. Keeping this in the binary entry point
+/// makes the embedded library structurally incapable of invoking it.
+#[cfg(unix)]
+fn exec_reload(plan: konnect_core::router::meta_tools::ReloadPlan) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let executable = plan
+        .validated_exec_path()
+        .map_err(|reason| anyhow::anyhow!("reload_server refused final handoff: {reason}"))?;
+    let error = std::process::Command::new(executable)
+        .args(&plan.arguments)
+        .exec();
+    Err(anyhow::anyhow!(
+        "reload_server failed to exec {}: {error}",
+        plan.binary_path.display()
+    ))
 }
 
 /// Help for one subcommand, or the whole program.

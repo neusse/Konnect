@@ -12,20 +12,23 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **20 toolsets** organized into 10 categories
-- **221 registered tools** + **7 always-visible meta-tools** = **228 total**
+- **21 toolsets** organized into 10 categories
+- **226 registered tools** + **7 always-visible meta-tools** = **233 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
 ## Meta-tools (always visible)
 
-Seven tools, grouped into *discovery/routing*, *observability*, and *runtime diagnostics*.
+Seven cross-platform tools, grouped into *discovery/routing*, *observability*,
+and *runtime diagnostics*. The standalone Unix executable running exclusively
+over stdio also advertises `reload_server`; embedded, HTTP, mixed-transport,
+and Windows servers do not.
 
 ### Discovery / routing
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 20 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 21 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -42,6 +45,12 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | Tool | Purpose |
 |------|---------|
 | `get_installation_info` | Report the serving build version and commit, executable path, verified install source, on-disk binary version, KiCad CLI version, redacted IPC endpoint, proven stale-process evidence, and platform-specific restart guidance. |
+
+### Unix stdio maintenance
+
+| Tool | Purpose |
+|------|---------|
+| `reload_server` | After explicit confirmation, open and validate the on-disk Konnect binary, preserve the original argv (including `--config`), flush the reply, stop accepting requests, release process bookkeeping, recheck the candidate identity at the final handoff, and replace the current standalone Unix stdio process image. Linux executes the open file directly. Same-version development rebuilds require `allow_same_version=true`; downgrades are refused. |
 
 ---
 
@@ -60,6 +69,18 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `rename_project` | Rename the `.kicad_pro`/`.kicad_sch`/`.kicad_pcb`/`.kicad_prl` files *and* the internal references that carry the old name. Renaming the files alone makes KiCad treat the design as unannotated, losing every reference designator, because each symbol instance stores `(project "name")`. Supports `dry_run`. |
 | `snapshot_project` | Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. Useful before major edits. |
 | `open_schematic_viewer` | Launch the live schematic viewer (SVG with auto-refresh on file change). Use after placing components so the user can see changes in real time. |
+
+### `editor_navigation` · 5 tools
+**Purpose:** Observe and semantically navigate exact KiCad editor, document, sheet, selection, and cross-probe context.
+**Source:** [`crates/konnect-core/src/tools/editor_navigation.rs`](crates/konnect-core/src/tools/editor_navigation.rs)
+
+| Tool | Description |
+|------|-------------|
+| `get_editor_state` | Observe the configured KiCad IPC endpoint's running version, addressable schematic/PCB editors, exact open document identities, capability availability, and explicit active-context limitations. |
+| `get_editor_selection` | Read the selection from one exact editor, project, document, and hierarchical sheet instance with stable KIID/UUID identities and document-readback freshness checks. |
+| `resolve_navigation_target` | Resolve an exact open project/document/sheet object by stable KIID, or by a human reference only when saved KiCad structure yields one unambiguous candidate. |
+| `mutate_editor_selection` | Clear, add to, or remove from one exact editor selection after saved-object validation; report success only when a fresh typed selection readback proves the complete requested set transition. |
+| `resolve_cross_probe_target` | Resolve an exact schematic-symbol/PCB-footprint destination in either direction from saved KiCad symbol-path linkage, while proving both explicit live document contexts and performing no activation or selection. |
 
 ---
 
@@ -148,7 +169,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `trace_from_point` | Trace connectivity from any (X,Y) point — returns what is at that point and the net it belongs to. |
 | `find_orphan_items` | Find dangling wire ends, floating labels, and unconnected pin endpoints. Pins, sheet pins, junctions, and no-connect flags all count as connections. |
 | `find_shorted_nets` | Detect accidentally merged nets — pairs of distinct net names sharing a wire path. |
-| `find_single_pin_nets` | Find nets with only one label/connection — often indicates a missing counterpart. |
+| `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
@@ -225,7 +246,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `set_active_layer` | Set the active layer recorded in the board file's setup section. |
 | `add_board_outline` | Add a rectangular Edge.Cuts outline with sharp or circular rounded corners, identically over IPC and file fallback. Appends — clear the old edges with `delete_graphics` first. |
 | `delete_graphics` | Delete board graphics (lines, rects, arcs, circles, polys, curves, text, textboxes, dimensions) matching a UUID/layer/type filter; `dry_run` lists them instead. |
-| `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
+| `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position, under the MountingHole library name stock KiCad 10 ships for that drill; a drill with no shipped footprint is refused. |
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
@@ -284,7 +305,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 
 | Tool | Description |
 |------|-------------|
-| `score_placement` | Score the placement 0-100 with named deductions (courtyard overlaps, off-board parts, connector edge distance, decoupling distance). Hard failures decide the verdict regardless of the numeric score; a missing outline blocks a pass rather than passing silently. |
+| `score_placement` | Score the placement 0-100 with named deductions (courtyard overlaps, off-board parts, connector edge distance, decoupling distance). Hard failures decide the verdict regardless of the numeric score; a missing outline blocks a pass rather than passing silently. A cap sitting on a connector's own pins for cable filtering is judged against that connector instead of the nearest IC, and every such waiver is listed in `interface_filter_caps` — evidence that the check ran and was answered, not a separate score. |
 | `place_decoupling_caps` | Plan (dry-run default) or apply a row of decoupling caps beside an IC, paired by shared nets, never reference guessing; the response carries the board score before and after the plan. |
 | `plan_bga_fanout` | Plan a BGA fanout with the pitch detected from the pad grid: dogbone or inline vias for inner pads, stub traces, conservative via sizes. Apply executes the whole plan as one KiCad undo commit over live IPC. |
 | `auto_place_from_schematic` | Deterministic first placement: net-clustered groups laid out as grids inside the outline, courtyards non-overlapping; explicitly a starting point, with before/after scores in the response. |
@@ -311,7 +332,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `export_ipc2581` | Export the PCB in IPC-2581 format using kicad-cli — a unified fab/assembly/test data format. |
 | `export_odb` | Export the PCB in ODB++ format using kicad-cli — a unified fabrication data format. |
 | `refill_zones` | Refill every copper pour zone over KiCad IPC. Per-zone selection is not available; requires a running KiCad with the board open. |
-| `get_drc_violations` | Run the Design Rule Check and return a list of violations. |
+| `get_drc_violations` | Run the Design Rule Check and return a list of violations. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — resolved by exact UUID against the board that was checked. |
 
 ---
 
@@ -376,7 +397,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `run_drc` | Run KiCad's complete configured DRC ruleset and return structured violation results. |
+| `run_drc` | Run KiCad's complete configured DRC ruleset and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. |
 | `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the sibling `.kicad_pro` project file. The board file is not modified. |
 | `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
 | `set_predefined_sizes` | Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill pairs) into the sibling `.kicad_pro`. These fill the Track/Via dropdowns; they are not DRC limits. |
@@ -450,7 +471,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 
 | Tool | Description |
 |------|-------------|
-| `export_manufacturing_package` | Generate ALL files needed for PCB fab + assembly in one call: Gerbers, drill, fab-house BOM, pick-and-place. Targets JLCPCB, PCBWay, etc. |
+| `export_manufacturing_package` | Generate ALL files needed for PCB fab + assembly in one call: Gerbers, drill, fab-house BOM, and pick-and-place. JLCPCB output applies versioned footprint/component CPL corrections, reports every match and unmatched footprint, and requires a Component Placements preview. |
 | `validate_for_manufacturing` | Board pre-flight before ordering: checks outline, design rules, footprints, routing evidence, and complete DRC results. |
 | `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. |
 
@@ -472,6 +493,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 3. **Cross-toolset cleanups** (historical notes):
    - `search_footprints` and `get_symbol_info` were originally in `verification`; moved to `library` where they belong semantically. Users who were loading `verification` for these will be auto-redirected by the smart "tool not loaded" error.
    - `get_drc_violations` (`pcb_export`) and `run_drc` (`verification`) run the same kicad-cli check. Their tool descriptions now cross-reference each other and steer the LLM toward `run_drc` for interactive use (cleaner summary with error/warning counts) and `get_drc_violations` for bundling into a build package.
+     Both go through `cli::run_drc`, which is also where item ownership is resolved, so the two cannot disagree about who owns a violation.
 
 ### Implementation notes
 

@@ -1,5 +1,6 @@
 //! Read-only runtime and installation provenance for the serving process.
 
+use crate::config_resolution::{ConfigResolution, SEARCH_POLICY};
 use crate::tools::ServerConfig;
 use serde_json::{json, Value};
 use std::cmp::Ordering;
@@ -10,7 +11,7 @@ use tokio::process::Command;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const PCM_IDENTIFIER: &str = "com.github.mixelpixx.konnect";
 
-pub(crate) async fn collect(config: &ServerConfig) -> Value {
+pub(crate) async fn collect(config: &ServerConfig, resolution: &ConfigResolution) -> Value {
     let running_version = env!("CARGO_PKG_VERSION");
     let executable_path = std::env::current_exe().ok();
     let installation = executable_path
@@ -37,7 +38,7 @@ pub(crate) async fn collect(config: &ServerConfig) -> Value {
     let ipc_endpoint = if config.ipc_address.trim().is_empty() {
         None
     } else {
-        Some(redact_endpoint(config.ipc_address.trim()))
+        Some(konnect_ipc::redact_endpoint(config.ipc_address.trim()))
     };
 
     json!({
@@ -73,7 +74,27 @@ pub(crate) async fn collect(config: &ServerConfig) -> Value {
             "source": "resolved_server_config",
             "endpoint": ipc_endpoint,
         },
+        "configuration": configuration_block(resolution),
         "restart_guidance": restart_guidance(installation.name, newer_than_running),
+    })
+}
+
+/// Report which configuration file configured this process (#419).
+///
+/// Derived from the resolution captured at startup, never from a fresh search:
+/// a file created after launch must not be reported as the one that configured
+/// the running process. Paths only — no configuration values, file contents or
+/// IPC credentials.
+fn configuration_block(resolution: &ConfigResolution) -> Value {
+    json!({
+        "source": resolution.source().as_str(),
+        "selected_path": resolution.selected_path().map(display_path),
+        "search_policy": SEARCH_POLICY,
+        "skipped_existing_paths": resolution
+            .skipped_existing_paths()
+            .iter()
+            .map(|path| display_path(path.as_path()))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -207,6 +228,20 @@ async fn probe_command_version(path: &Path, command_kind: VersionCommand) -> Ver
     }
 }
 
+/// Probe a Konnect executable for the version it reports. Reload validation
+/// uses the same parser and timeout as installation diagnostics so the two
+/// paths cannot disagree about whether a candidate is runnable.
+#[cfg(unix)]
+pub(crate) async fn probe_konnect_version(path: &Path) -> Result<String, &'static str> {
+    let probe = probe_command_version(path, VersionCommand::Konnect).await;
+    probe.version.ok_or(probe.status)
+}
+
+#[cfg(any(unix, test))]
+pub(crate) fn compare_konnect_versions(candidate: &str, running: &str) -> Option<Ordering> {
+    stable_version_cmp(candidate, running)
+}
+
 fn parse_konnect_version(line: &str) -> Option<&str> {
     let version = line.strip_prefix("konnect ")?.trim();
     (!version.is_empty() && !version.chars().any(char::is_whitespace)).then_some(version)
@@ -237,31 +272,6 @@ fn stable_version_cmp(candidate: &str, running: &str) -> Option<Ordering> {
     }
 
     Some(stable_triplet(candidate)?.cmp(&stable_triplet(running)?))
-}
-
-fn redact_endpoint(endpoint: &str) -> String {
-    let (without_fragment, had_fragment) = endpoint
-        .split_once('#')
-        .map_or((endpoint, false), |(head, _)| (head, true));
-    let (without_query, had_query) = without_fragment
-        .split_once('?')
-        .map_or((without_fragment, false), |(head, _)| (head, true));
-
-    let without_credentials = if let Some((scheme, rest)) = without_query.split_once("://") {
-        if let Some((_, authority_and_path)) = rest.split_once('@') {
-            format!("{scheme}://[redacted]@{authority_and_path}")
-        } else {
-            without_query.to_string()
-        }
-    } else {
-        without_query.to_string()
-    };
-
-    if had_query || had_fragment {
-        format!("{without_credentials} [query/fragment redacted]")
-    } else {
-        without_credentials
-    }
 }
 
 fn restart_guidance(source: &str, newer_than_running: Option<bool>) -> Vec<String> {
@@ -344,18 +354,6 @@ mod tests {
         let source = classify_installation(&executable);
         assert_eq!(source.name, "kicad_pcm");
         assert_eq!(source.manifest_path, Some(plugin_dir.join("plugin.json")));
-    }
-
-    #[test]
-    fn endpoint_redaction_removes_credentials_query_and_fragment() {
-        assert_eq!(
-            redact_endpoint("tcp://user:secret@127.0.0.1:9000/api?token=hidden#detail"),
-            "tcp://[redacted]@127.0.0.1:9000/api [query/fragment redacted]"
-        );
-        assert_eq!(
-            redact_endpoint("ipc:///tmp/kicad/api.sock"),
-            "ipc:///tmp/kicad/api.sock"
-        );
     }
 
     #[test]

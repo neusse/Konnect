@@ -52,12 +52,63 @@ pub enum ToolErrorKind {
     /// A mutation conflicts with filesystem state, or schematic ownership
     /// cannot be proven uniquely. Paths identify the conflicting evidence.
     Conflict { paths: Vec<String> },
+    /// More than one observed object identifies a requested target. Clients
+    /// must choose from the returned stable candidates rather than guessing.
+    AmbiguousTarget {
+        target: String,
+        candidates: Vec<String>,
+    },
+    /// The requested document is not the document set observed in the target
+    /// editor, so proceeding would answer about or mutate another file.
+    WrongDocument {
+        requested: String,
+        open_documents: Vec<String>,
+    },
+    /// No open document belongs to the explicitly requested project.
+    WrongProject {
+        requested: String,
+        open_projects: Vec<String>,
+    },
+    /// The requested schematic hierarchy instance is not the instance set
+    /// observed in the exact live schematic editor context.
+    WrongSheetInstance {
+        requested: String,
+        open_sheet_instances: Vec<String>,
+    },
     /// The caller named a target, but its observed editor or document state
     /// no longer agrees with the state required to mutate it safely.
     StaleTarget { target: String, reason: String },
+    /// No live editor endpoint is configured or reachable for the requested
+    /// semantic operation.
+    EditorUnavailable { editor: String, reason: String },
+    /// The running KiCad version or the bundled stable protocol does not
+    /// provide a capability the caller requested.
+    UnsupportedCapability {
+        capability: String,
+        kicad_version: Option<String>,
+    },
+    /// KiCad accepted a semantic mutation, but a fresh observation did not
+    /// prove the exact requested post-operation state.
+    ReadbackMismatch {
+        operation: String,
+        requested_kiids: Vec<String>,
+        before_kiids: Vec<String>,
+        after_kiids: Vec<String>,
+    },
+    /// Saved KiCad structure cannot prove one exact destination for a
+    /// cross-probe source object.
+    UnresolvedCrossProbeDestination {
+        source_kiid: String,
+        candidates: Vec<String>,
+        reason: String,
+    },
     /// A board was live earlier in this server process, but IPC is now gone;
     /// its saved file may be stale relative to lost editor state.
-    UnsafeFileFallback { path: String },
+    UnsafeFileFallback { path: String, reason: String },
+    /// KiCad answered, and its open-document list could not be read as a
+    /// complete set of comparable board identities — so whether it holds this
+    /// board is unknown, and neither a live edit nor a file edit is safe.
+    AmbiguousOpenBoard { path: String },
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
@@ -74,8 +125,17 @@ impl ToolErrorKind {
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::FileNotFound { .. } => "file_not_found",
             Self::Conflict { .. } => "conflict",
+            Self::AmbiguousTarget { .. } => "ambiguous_target",
+            Self::WrongDocument { .. } => "wrong_document",
+            Self::WrongProject { .. } => "wrong_project",
+            Self::WrongSheetInstance { .. } => "wrong_sheet_instance",
             Self::StaleTarget { .. } => "stale_target",
+            Self::EditorUnavailable { .. } => "editor_unavailable",
+            Self::UnsupportedCapability { .. } => "unsupported_capability",
+            Self::ReadbackMismatch { .. } => "readback_mismatch",
+            Self::UnresolvedCrossProbeDestination { .. } => "unresolved_cross_probe_destination",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
+            Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
             Self::HandlerError { .. } => "handler_error",
         }
     }
@@ -158,6 +218,30 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_target_preserves_candidates_through_the_observer() {
+        let result = CallToolResult::error_kind(
+            ToolErrorKind::AmbiguousTarget {
+                target: "component U1".into(),
+                candidates: vec!["uuid-a".into(), "uuid-b".into()],
+            },
+            "Component U1 is ambiguous.",
+        );
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("ambiguous_target")
+        );
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("structured error must be text JSON");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["target"], "component U1");
+        assert_eq!(
+            body["error"]["candidates"],
+            serde_json::json!(["uuid-a", "uuid-b"])
+        );
+    }
+
+    #[test]
     fn short_code_matches_serialized_kind_field() {
         // If these ever drift, clients that match on the `kind` string will
         // silently break. Pin them here.
@@ -175,11 +259,50 @@ mod tests {
             ToolErrorKind::Conflict {
                 paths: vec!["p".into()],
             },
+            ToolErrorKind::AmbiguousTarget {
+                target: "t".into(),
+                candidates: vec!["a".into(), "b".into()],
+            },
+            ToolErrorKind::WrongDocument {
+                requested: "p".into(),
+                open_documents: vec!["a".into()],
+            },
+            ToolErrorKind::WrongProject {
+                requested: "p".into(),
+                open_projects: vec!["a".into()],
+            },
+            ToolErrorKind::WrongSheetInstance {
+                requested: "/root/child".into(),
+                open_sheet_instances: vec!["/root/other".into()],
+            },
             ToolErrorKind::StaleTarget {
                 target: "p".into(),
                 reason: "r".into(),
             },
-            ToolErrorKind::UnsafeFileFallback { path: "p".into() },
+            ToolErrorKind::EditorUnavailable {
+                editor: "pcb".into(),
+                reason: "closed".into(),
+            },
+            ToolErrorKind::UnsupportedCapability {
+                capability: "activate_sheet".into(),
+                kicad_version: Some("10.0.5".into()),
+            },
+            ToolErrorKind::ReadbackMismatch {
+                operation: "add".into(),
+                requested_kiids: vec!["b".into()],
+                before_kiids: vec!["a".into()],
+                after_kiids: vec!["a".into()],
+            },
+            ToolErrorKind::UnresolvedCrossProbeDestination {
+                source_kiid: "sym".into(),
+                candidates: vec!["fp-a".into(), "fp-b".into()],
+                reason: "ambiguous".into(),
+            },
+            ToolErrorKind::UnsafeFileFallback {
+                path: "p".into(),
+                reason: "r".into(),
+            },
+            ToolErrorKind::AmbiguousOpenBoard { path: "p".into() },
             ToolErrorKind::HandlerError { reason: "r".into() },
         ];
         for kind in kinds {

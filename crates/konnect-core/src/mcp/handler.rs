@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 #[derive(Clone)]
 pub struct McpHandler {
     ctx: Arc<crate::tools::ToolContext>,
+    reload: meta_tools::ReloadControl,
     sse_senders: Arc<RwLock<Vec<mpsc::Sender<Event>>>>,
     /// Raw-JSON-line notification sinks for non-SSE transports (stdio). A
     /// server-initiated notification (e.g. tools/list_changed) must reach the
@@ -30,8 +31,41 @@ pub struct McpHandler {
     observer: CallObserver,
 }
 
+/// MCP clients known to cache the first `tools/list` and ignore
+/// `notifications/tools/list_changed`. For these, any toolset loaded after the
+/// handshake is permanently uncallable (#134, #169, #459), so the whole
+/// catalogue is loaded before the first listing instead.
+///
+/// Names are matched case-insensitively as prefixes of `clientInfo.name`.
+/// `claude-ai` is what Claude Desktop sends, read from its own MCP log
+/// (`%APPDATA%/Claude/logs`) rather than assumed. Add a client here only with
+/// the same kind of evidence.
+const CLIENTS_THAT_CACHE_TOOL_LIST: &[&str] = &["claude-ai"];
+
+pub(crate) fn client_caches_tool_list(client_name: &str) -> bool {
+    let name = client_name.trim().to_ascii_lowercase();
+    CLIENTS_THAT_CACHE_TOOL_LIST
+        .iter()
+        .any(|known| name.starts_with(known))
+}
+
 impl McpHandler {
     pub async fn new(config: crate::tools::ServerConfig) -> anyhow::Result<Self> {
+        Self::new_with_config_resolution(
+            config,
+            crate::config_resolution::ConfigResolution::unavailable(),
+        )
+        .await
+    }
+
+    /// As `new`, but recording which configuration file configured this process
+    /// so `get_installation_info` can report it (#419). The real server entry
+    /// point uses this; `new` keeps its signature for the many callers that do
+    /// not resolve a config file and would otherwise have to invent one.
+    pub async fn new_with_config_resolution(
+        config: crate::tools::ServerConfig,
+        config_resolution: crate::config_resolution::ConfigResolution,
+    ) -> anyhow::Result<Self> {
         let router = Arc::new(ToolRouter::new());
 
         // Load only the starter kit at startup so baseline `tools/list` stays small
@@ -48,14 +82,14 @@ impl McpHandler {
         }
 
         let observer = CallObserver::new(Some(default_calls_log_path()));
-        let ctx = Arc::new(crate::tools::ToolContext::new_with_observer(
-            config,
-            router,
-            observer.clone(),
-        ));
+        let ctx = Arc::new(
+            crate::tools::ToolContext::new_with_observer(config, router, observer.clone())
+                .with_config_resolution(config_resolution),
+        );
 
         Ok(McpHandler {
             ctx,
+            reload: meta_tools::ReloadControl::default(),
             sse_senders: Arc::new(RwLock::new(Vec::new())),
             notif_sinks: Arc::new(RwLock::new(Vec::new())),
             observer,
@@ -66,6 +100,19 @@ impl McpHandler {
     /// and `server_stats` that live on `ToolContext`.
     pub fn observer(&self) -> &CallObserver {
         &self.observer
+    }
+
+    /// Enable the Unix-only in-place reload tool for the standalone executable
+    /// when its sole transport is stdio. Embedded, HTTP, and mixed transports
+    /// intentionally never call this, so they neither advertise nor dispatch
+    /// the operation.
+    pub fn enable_stdio_reload(&self) {
+        #[cfg(unix)]
+        self.reload.enable();
+    }
+
+    pub fn take_reload_request(&self) -> Option<meta_tools::ReloadPlan> {
+        self.reload.take()
     }
 
     pub async fn register_sse_sender(&self, tx: mpsc::Sender<Event>) {
@@ -118,10 +165,38 @@ impl McpHandler {
         }
     }
 
+    /// At `initialize`, look at who is on the other end. A client that caches
+    /// its first tool list gets the full catalogue loaded now, before the
+    /// `tools/list` that follows the handshake, because for it there is no
+    /// later. Every other client keeps the starter kit and the on-demand
+    /// loader.
+    ///
+    /// `eager_toolsets = true` still loads everything at startup for any
+    /// client; this only adds the automatic case. Loading is idempotent, so a
+    /// client that is both configured eager and detected here loads once.
+    async fn adapt_to_client(&self, params: Option<&Value>) {
+        let name = params
+            .and_then(|p| p.get("clientInfo"))
+            .and_then(|c| c.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        tracing::info!(
+            "MCP client: {}",
+            if name.is_empty() { "(unnamed)" } else { name }
+        );
+        if client_caches_tool_list(name) {
+            tracing::info!(
+                "client caches its tool list; loading every toolset before the first tools/list"
+            );
+            self.ctx.router.load_all().await;
+        }
+    }
+
     async fn dispatch(&self, req: &JsonRpcRequest) -> anyhow::Result<Option<Value>> {
         match req.method.as_str() {
             // ── Lifecycle ──────────────────────────────────────────────────
             "initialize" => {
+                self.adapt_to_client(req.params.as_ref()).await;
                 let result = McpServerState::build_initialize_result();
                 Ok(Some(serde_json::to_value(result)?))
             }
@@ -131,7 +206,7 @@ impl McpHandler {
             // ── Tool listing ───────────────────────────────────────────────
             "tools/list" => {
                 // Meta-tools (always visible) + all domain tools (pre-loaded at startup)
-                let mut tools = meta_tools::meta_tool_descriptions();
+                let mut tools = meta_tools::meta_tool_descriptions_for(self.reload.is_enabled());
                 for def in self.ctx.router.active_tools().await {
                     tools.push(def.to_mcp_description());
                 }
@@ -222,7 +297,9 @@ impl McpHandler {
         args: &Value,
     ) -> (CallToolResult, CallStatus, Option<String>) {
         // Meta-tools always win.
-        if let Some(result) = meta_tools::handle_meta_tool(name, args, &self.ctx).await {
+        if let Some(result) =
+            meta_tools::handle_meta_tool_with_reload(name, args, &self.ctx, &self.reload).await
+        {
             if name == "load_toolset" || name == "unload_toolset" {
                 self.notify_tools_list_changed().await;
             }
@@ -308,22 +385,40 @@ impl McpHandler {
                     )
                 }
                 Err(e) if kicad_editor_locked_path(&e).is_some() => {
-                    let path = kicad_editor_locked_path(&e)
-                        .expect("guard matched")
-                        .display()
-                        .to_string();
-                    (
-                        CallToolResult::error_kind(
-                            ToolErrorKind::Conflict {
-                                paths: vec![path.clone()],
-                            },
-                            format!(
-                                "Schematic '{path}' has a KiCad editor lock. Close Eeschema, or resolve a stale lock only after confirming no editor owns the file, then retry."
+                    let locked = kicad_editor_locked_path(&e).expect("guard matched");
+                    let path = locked.display().to_string();
+                    if locked
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pcb"))
+                    {
+                        let reason = kicad_board_lock_reason(&e).to_string();
+                        (
+                            CallToolResult::error_kind(
+                                ToolErrorKind::UnsafeFileFallback {
+                                    path: path.clone(),
+                                    reason: reason.clone(),
+                                },
+                                format!(
+                                    "Board '{path}' cannot be replaced safely ({reason}): a KiCad editor lock appeared before the committed write, so saved-file authority cannot be proven. Konnect did not modify it. Close or recover Pcbnew, reconcile any unsaved work, and save the authoritative state. Retry only after confirming that no KiCad process owns the board and the lock is gone."
+                                ),
                             ),
-                        ),
-                        CallStatus::Error,
-                        Some("conflict".to_string()),
-                    )
+                            CallStatus::Error,
+                            Some("unsafe_file_fallback".to_string()),
+                        )
+                    } else {
+                        (
+                            CallToolResult::error_kind(
+                                ToolErrorKind::Conflict {
+                                    paths: vec![path.clone()],
+                                },
+                                format!(
+                                    "Schematic '{path}' has a KiCad editor lock. Close Eeschema, or resolve a stale lock only after confirming no editor owns the file, then retry."
+                                ),
+                            ),
+                            CallStatus::Error,
+                            Some("conflict".to_string()),
+                        )
+                    }
                 }
                 Err(e) => {
                     warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
@@ -412,6 +507,22 @@ fn kicad_editor_locked_path(error: &anyhow::Error) -> Option<&std::path::Path> {
         }
     }
     None
+}
+
+fn kicad_board_lock_reason(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        if let Some(konnect_sexp::SexpError::KiCadEditorLocked {
+            inspection_error, ..
+        }) = cause.downcast_ref::<konnect_sexp::SexpError>()
+        {
+            return if inspection_error.is_some() {
+                "kicad_lock_unreadable"
+            } else {
+                "kicad_lock_present"
+            };
+        }
+    }
+    "kicad_lock_present"
 }
 
 /// Sum of content bytes in a `CallToolResult` — used for observability size
@@ -707,6 +818,42 @@ mod required_argument_dispatch_tests {
         assert_eq!(std::fs::read_to_string(schematic).unwrap(), source);
         assert!(lock.exists());
     }
+
+    #[tokio::test]
+    async fn a_kicad_board_lock_is_a_typed_unsafe_file_fallback() {
+        let handler = handler().await;
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("locked.kicad_pcb");
+        let lock = directory.path().join("~locked.kicad_pcb.lck");
+        let source = "(kicad_pcb (version 20240108) (generator pcbnew))\n";
+        std::fs::write(&board, source).unwrap();
+        std::fs::write(&lock, "lock ownership cannot be inferred").unwrap();
+
+        let (result, status, kind) = handler
+            .dispatch_tool(
+                "add_mounting_hole",
+                &json!({
+                    "board": board.display().to_string(),
+                    "x": 10.0,
+                    "y": 10.0,
+                    "reference": "H1"
+                }),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(status, CallStatus::Error);
+        assert_eq!(kind.as_deref(), Some("unsafe_file_fallback"));
+        let text = match result.content.first() {
+            Some(ToolContent::Text { text }) => text,
+            other => panic!("expected text, got {other:?}"),
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "unsafe_file_fallback");
+        assert_eq!(body["error"]["reason"], "kicad_lock_present");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+        assert!(lock.exists());
+    }
 }
 
 /// Every registered tool refuses a call that omits its required arguments.
@@ -856,5 +1003,121 @@ mod first_missing_required_tests {
             None
         );
         assert_eq!(first_missing_required(&schema(json!([])), &json!({})), None);
+    }
+}
+
+/// Claude Desktop caches the first `tools/list` and never re-fetches it, so
+/// out of the box it could call 20 of 217 tools (#459). The handshake now
+/// tells us who is asking, and a known caching client gets the whole
+/// catalogue before its first listing.
+#[cfg(test)]
+mod client_adaptation_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    async fn lazy_handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    fn request(method: &str, params: Value) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: method.to_string(),
+            params: Some(params),
+        }
+    }
+
+    async fn listed_tool_count(handler: &McpHandler) -> usize {
+        let out = handler
+            .dispatch(&request("tools/list", json!({})))
+            .await
+            .expect("tools/list dispatches")
+            .expect("tools/list returns a result");
+        out["tools"].as_array().expect("tools array").len()
+    }
+
+    fn initialize_from(client: &str) -> Value {
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": client, "version": "0.1.0"}
+        })
+    }
+
+    fn full_catalogue() -> usize {
+        crate::router::registry::ALL_TOOLSETS
+            .iter()
+            .map(|t| t.tool_count)
+            .sum::<usize>()
+            + meta_tools::meta_tool_descriptions().len()
+    }
+
+    /// The exact string Claude Desktop sends, read from its own log.
+    #[tokio::test]
+    async fn claude_desktop_gets_the_full_catalogue_before_its_first_listing() {
+        let handler = lazy_handler().await;
+        let starter = listed_tool_count(&handler).await;
+        handler
+            .dispatch(&request("initialize", initialize_from("claude-ai")))
+            .await
+            .expect("initialize dispatches");
+        let after = listed_tool_count(&handler).await;
+        assert!(
+            after > starter,
+            "initialize must have loaded more than the starter kit: {starter} -> {after}"
+        );
+        assert_eq!(
+            after,
+            full_catalogue(),
+            "a caching client must see the whole catalogue in its first listing"
+        );
+    }
+
+    /// A client that honours list_changed keeps the cheap starter kit; the
+    /// context economy is the point of the router and must survive this.
+    #[tokio::test]
+    async fn other_clients_keep_the_starter_kit() {
+        let handler = lazy_handler().await;
+        let starter = listed_tool_count(&handler).await;
+        handler
+            .dispatch(&request("initialize", initialize_from("some-other-client")))
+            .await
+            .expect("initialize dispatches");
+        assert_eq!(listed_tool_count(&handler).await, starter);
+    }
+
+    /// No clientInfo at all is neither an error nor a reason to load.
+    #[tokio::test]
+    async fn a_missing_client_name_is_tolerated() {
+        let handler = lazy_handler().await;
+        let starter = listed_tool_count(&handler).await;
+        handler
+            .dispatch(&request("initialize", json!({})))
+            .await
+            .expect("initialize dispatches");
+        assert_eq!(listed_tool_count(&handler).await, starter);
+    }
+
+    /// Claude Code honours list_changed and must not be swept up by a loose
+    /// "claude" match: the cost is ~23K tokens on every listing.
+    #[test]
+    fn matching_is_case_insensitive_prefix_and_does_not_catch_claude_code() {
+        assert!(client_caches_tool_list("claude-ai"));
+        assert!(client_caches_tool_list("Claude-AI"));
+        assert!(client_caches_tool_list("claude-ai-desktop"));
+        assert!(!client_caches_tool_list("claude-code"));
+        assert!(!client_caches_tool_list("Claude Code"));
+        assert!(!client_caches_tool_list(""));
     }
 }

@@ -36,6 +36,60 @@ Closed-board move, rotate, and flip in `tools/pcb_components.rs` are narrowly
 scoped exceptions with explicit geometry checks. They are not a general license
 to edit a live board file.
 
+### Editor observation
+
+`konnect-ipc::KiCadIpcClient::observe_editor_state` queries the running KiCad
+version and schematic/PCB `GetOpenDocuments` surfaces on the configured
+endpoint. `tools/editor_navigation.rs` exposes that typed observation through
+the provisional `editor_navigation` toolset while design issue #395 is under
+review.
+
+The observation preserves project and `DocumentSpecifier` sheet/board identity
+and labels its evidence as live IPC. KiCad 10 has no stable typed query for the
+foreground frame, active document, or active schematic sheet, so those fields
+remain unavailable; Konnect does not infer active state from open-document
+order. The same capability record reports stable typed activation and reveal
+as unsupported rather than routing callers through arbitrary `RunAction`
+strings.
+
+`KiCadIpcClient::observe_selection` accepts one exact editor/document identity
+from that observation, matches it before issuing `GetSelection`, and repeats
+the open-document read afterward because KiCad's `SelectionResponse` carries
+no response header. Every returned item is dispatched by its full protobuf
+type URL and must contain a non-empty KIID; an unknown or malformed selected
+item fails the entire observation rather than being dropped. The vendored
+schematic protobuf currently decodes line and label selections. Schematic
+symbols and other unmodelled types remain explicitly unsupported until KiCad
+provides stable typed serialization for them.
+
+Navigation target resolution keeps two evidence channels in the same result
+without merging them. `GetOpenDocuments` proves that the exact requested live
+project/document/sheet context is still addressable; the saved `.kicad_sch` or
+`.kicad_pcb` structure proves object KIID and human-reference identity. Stable
+KIID lookup is primary. A reference such as `C10` is accepted only when one
+object matches in the exact document and sheet instance; duplicates return
+structured candidates, and stale project ownership or symbol-instance paths
+fail closed before any editor mutation.
+
+Selection mutation uses KiCad's typed `ClearSelection`, `AddToSelection`, and
+`RemoveFromSelection` commands only after every non-clear KIID resolves in the
+explicit saved project/document/sheet. The transport response is not treated
+as success: Konnect performs a fresh exact-context `GetSelection`, compares the
+entire observed set with the expected before/after transition, and returns a
+structured `readback_mismatch` if KiCad did not make precisely that change.
+Duplicate or empty KIID requests are rejected before IPC.
+
+`resolve_cross_probe_target` maps an exact schematic symbol to its PCB
+footprint, or the footprint back to the symbol, from KiCad's saved footprint
+symbol-path linkage. It requires the explicit project, both saved documents,
+the schematic hierarchy instance, and the source KIID; reference agreement is
+checked as an additional consistency guard. Both requested editor documents
+must also be proven open through typed `GetOpenDocuments` readback. Missing,
+duplicate, malformed, or instance-inconsistent links return a structured
+`unresolved_cross_probe_destination` instead of guessing. The operation is
+resolve-only: it does not activate an editor or mutate selection, and pin/pad/
+net expansion remains unsupported until one stable destination can be proven.
+
 ## Schematic-To-Board Sync
 
 `update_pcb_from_schematic` in `tools/pcb_sync.rs` is live-IPC-only. It uses
@@ -88,7 +142,13 @@ through Python.
 
 ## Configuration
 
-`crates/konnect/src/config.rs` searches, in order:
+Konnect selects the first existing server configuration file in the order below
+and loads only that file. It does not merge settings from later locations. Call
+`get_installation_info` to see which file configured the running process and
+which later files were shadowed.
+
+So a value present only in a lower-priority file has no effect while a
+higher-priority file exists.
 
 1. `konnect.toml` in the working directory;
 2. `settings.json` in the working directory;
@@ -96,7 +156,30 @@ through Python.
 4. `settings.json` one directory above the executable;
 5. the platform configuration directory.
 
-`--config <path>` loads an explicit file. Relevant fields include `kicad_cli`,
+Two consequences worth stating outright, because both have been reported as
+missing functionality:
+
+- In the standard plugin layout a `settings.json` exists beside the binary, so
+  the platform configuration directory is never reached and any `config.toml`
+  there is inert.
+- A stray `konnect.toml` or `settings.json` in a working directory takes over the
+  entire configuration for that run.
+
+Call **`get_installation_info`** to see which file configured the running
+process: its `configuration` block reports `source`
+(`explicit_path` | `search_path` | `defaults`), the absolute `selected_path`, the
+`search_policy`, and `skipped_existing_paths` — the later files that exist and
+were shadowed. The values are captured at startup, so a file created afterwards
+is not reported. The server also logs one INFO line naming the selection at
+startup, for when no tool call is possible yet.
+
+Note that `load_user_config` is a different plane: it reads a user
+design-preferences file (`config.json`), not the server startup configuration
+described here, so its path does not answer "which file configured the server".
+
+`--config <path>` loads an explicit file and bypasses the search entirely; the
+list above is not consulted, and `get_installation_info` reports
+`source: "explicit_path"` with no skipped candidates. Relevant fields include `kicad_cli`,
 `kicad_binary`, `ipc_address`, `transport`, `http_address`, `jlcpcb_db_path`,
 `log_level`, `auto_load_toolsets`, and `eager_toolsets`. The legacy
 `ipc_socket_path` alias is accepted by the serde definition in `config.rs`.

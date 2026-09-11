@@ -13,6 +13,7 @@ use crate::types::*;
 use anyhow::{Context, Result};
 // NNG SetOpt trait is brought in scope automatically by the nng crate's prelude
 use prost::Message;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
@@ -309,6 +310,155 @@ impl std::fmt::Display for TransportUnreachable {
 
 impl std::error::Error for TransportUnreachable {}
 
+/// Whether `error` came from a request that never reached KiCad.
+///
+/// The borrowing form of [`IpcFailure::from_error`], for callers that only
+/// need the classification (logging a fallback) and must leave the error
+/// intact. Like `from_error`, it walks the chain — never the message text.
+pub fn is_transport_unreachable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<TransportUnreachable>())
+}
+
+/// Typed KiCad response status for a request that completed a round trip.
+///
+/// Keeping the numeric status in the error chain lets capability discovery
+/// distinguish an unsupported/unhandled command from an unreachable editor
+/// without matching human-readable error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiStatusError {
+    pub code: i32,
+    pub code_name: String,
+    pub message: String,
+}
+
+impl ApiStatusError {
+    pub fn from_error(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+
+    pub fn is_unsupported(&self) -> bool {
+        self.code == kiapi::common::ApiStatusCode::AsUnhandled as i32
+            || self.code == kiapi::common::ApiStatusCode::AsUnimplemented as i32
+    }
+}
+
+impl std::fmt::Display for ApiStatusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "KiCad IPC error: {} ({})",
+            self.message, self.code_name
+        )
+    }
+}
+
+impl std::error::Error for ApiStatusError {}
+
+/// A live document reply did not carry the identity required by its requested
+/// editor kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcDocumentObservationError {
+    pub editor: IpcEditorKind,
+    pub reason: String,
+}
+
+impl std::fmt::Display for IpcDocumentObservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "KiCad returned a malformed {} document identity: {}",
+            self.editor.as_str(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for IpcDocumentObservationError {}
+
+/// A board-bearing operation could not resolve one exact live KiCad document.
+///
+/// `NoOpenDocuments` and `WrongDocument` positively prove that the requested
+/// board is not open and may therefore permit the guarded file fallback.
+/// `AmbiguousDocument` and `StaleDocument` do not prove absence and must fail
+/// closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoardTargetError {
+    NoOpenDocuments {
+        requested: String,
+    },
+    WrongDocument {
+        requested: String,
+        open_documents: Vec<String>,
+    },
+    AmbiguousDocument {
+        requested: String,
+        candidates: Vec<String>,
+    },
+    UnresolvedDocumentIdentities {
+        requested: String,
+        reasons: Vec<String>,
+    },
+    StaleDocument {
+        requested: String,
+        previously_bound: String,
+        open_documents: Vec<String>,
+    },
+}
+
+impl BoardTargetError {
+    pub fn proves_not_open(&self) -> bool {
+        matches!(
+            self,
+            Self::NoOpenDocuments { .. } | Self::WrongDocument { .. }
+        )
+    }
+}
+
+impl std::fmt::Display for BoardTargetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoOpenDocuments { requested } => write!(
+                formatter,
+                "requested board '{requested}' is not open because KiCad reports no PCB documents"
+            ),
+            Self::WrongDocument {
+                requested,
+                open_documents,
+            } => write!(
+                formatter,
+                "requested board '{requested}' is not open in KiCad (open boards: {})",
+                open_documents.join(", ")
+            ),
+            Self::AmbiguousDocument {
+                requested,
+                candidates,
+            } => write!(
+                formatter,
+                "requested board '{requested}' cannot be resolved uniquely ({})",
+                candidates.join("; ")
+            ),
+            Self::UnresolvedDocumentIdentities { requested, reasons } => write!(
+                formatter,
+                "KiCad's open documents cannot be compared safely with requested board '{requested}' ({})",
+                reasons.join("; ")
+            ),
+            Self::StaleDocument {
+                requested,
+                previously_bound,
+                open_documents,
+            } => write!(
+                formatter,
+                "requested board '{requested}' was bound to '{previously_bound}', but that document is no longer uniquely open (open boards: {})",
+                open_documents.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BoardTargetError {}
+
 /// Why an IPC operation failed, for callers deciding whether a file-based
 /// fallback is safe.
 ///
@@ -316,6 +466,9 @@ impl std::error::Error for TransportUnreachable {}
 /// unconfigured (empty socket path) or the dial/send failed — so no live
 /// KiCad can be holding the board, and editing the board file directly
 /// cannot race an editor.
+///
+/// `Target` retains a typed board-identity decision. Only target errors whose
+/// [`BoardTargetError::proves_not_open`] is true may permit a file fallback.
 ///
 /// `Rejected` is everything else, including any error after a request was
 /// delivered (a receive timeout may mean KiCad is still processing it).
@@ -325,6 +478,10 @@ impl std::error::Error for TransportUnreachable {}
 pub enum IpcFailure {
     Unreachable(String),
     Rejected(String),
+    Target {
+        error: BoardTargetError,
+        message: String,
+    },
 }
 
 impl IpcFailure {
@@ -333,10 +490,15 @@ impl IpcFailure {
     /// message text.
     pub fn from_error(error: anyhow::Error) -> Self {
         let message = format!("{error:#}");
-        if error
+        if let Some(target) = error
             .chain()
-            .any(|cause| cause.is::<TransportUnreachable>())
+            .find_map(|cause| cause.downcast_ref::<BoardTargetError>().cloned())
         {
+            IpcFailure::Target {
+                error: target,
+                message,
+            }
+        } else if is_transport_unreachable(&error) {
             IpcFailure::Unreachable(message)
         } else {
             IpcFailure::Rejected(message)
@@ -345,7 +507,9 @@ impl IpcFailure {
 
     pub fn message(&self) -> &str {
         match self {
-            IpcFailure::Unreachable(message) | IpcFailure::Rejected(message) => message,
+            IpcFailure::Unreachable(message)
+            | IpcFailure::Rejected(message)
+            | IpcFailure::Target { message, .. } => message,
         }
     }
 }
@@ -360,11 +524,24 @@ pub struct KiCadIpcClient {
     socket_path: String,
     kicad_token: String,
     client_name: String,
+    bound_board: std::sync::Mutex<Option<BoundBoardTarget>>,
+}
+
+#[derive(Clone)]
+struct BoundBoardTarget {
+    requested: PathBuf,
+    document: kiapi::common::types::DocumentSpecifier,
 }
 
 impl KiCadIpcClient {
     /// Create a client connecting to the given IPC socket path.
     /// If empty, tries KICAD_API_SOCKET environment variable.
+    ///
+    /// This is the last-resort fallback for embedders that construct a client
+    /// directly. Konnect's server resolves the address once at startup — config
+    /// file, then the env var, then [`crate::socket::detect_ipc_address`] — and
+    /// hands the result in, so an empty path here means that resolution already
+    /// came up empty.
     pub fn new(socket_path: impl Into<String>) -> Self {
         let path = socket_path.into();
         let effective_path = if path.is_empty() {
@@ -376,6 +553,7 @@ impl KiCadIpcClient {
             socket_path: effective_path,
             kicad_token: std::env::var("KICAD_API_TOKEN").unwrap_or_default(),
             client_name: format!("konnect-{}", std::process::id()),
+            bound_board: std::sync::Mutex::new(None),
         }
     }
 
@@ -423,7 +601,7 @@ impl KiCadIpcClient {
             "[BETA] IPC → {} ({} bytes) to {}",
             type_name,
             request_bytes.len(),
-            self.socket_path
+            crate::redact_endpoint(&self.socket_path)
         );
 
         // Connect via NNG req0 socket
@@ -453,9 +631,14 @@ impl KiCadIpcClient {
             format!("ipc://{}", self.socket_path)
         };
 
+        let diagnostic_dial_url = crate::redact_endpoint(&dial_url);
         socket.dial(&dial_url).map_err(|error| {
             anyhow::Error::new(TransportUnreachable).context(format!(
-                "Cannot connect to KiCAD IPC at {dial_url}: {error}"
+                "Cannot connect to KiCad IPC at {diagnostic_dial_url}: {error}. KiCad may be \
+                 closed, its API disabled (Edit > Preferences > Plugins > \
+                 'Enable KiCad API'), or this address left behind by a closed \
+                 session (guide: \
+                 https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md)"
             ))
         })?;
 
@@ -486,7 +669,11 @@ impl KiCadIpcClient {
                 status.error_message.clone()
             };
             debug!("[BETA] IPC ← error: {} ({})", msg, code.as_str_name());
-            anyhow::bail!("KiCad IPC error: {} ({})", msg, code.as_str_name());
+            return Err(anyhow::Error::new(ApiStatusError {
+                code: code as i32,
+                code_name: code.as_str_name().to_string(),
+                message: msg,
+            }));
         }
 
         debug!("[BETA] IPC ← OK");
@@ -501,24 +688,383 @@ impl KiCadIpcClient {
         match self.send_command(&ping, "kiapi.common.commands.Ping") {
             Ok(_) => Ok(true),
             Err(e) => {
-                warn!("[BETA] Ping failed: {}", e);
+                // The address, because this is the one IPC failure that never
+                // reaches a caller as an error: `check_kicad_ui` reports the
+                // `false` and nothing else records which endpoint went unheard.
+                warn!(
+                    "[BETA] Ping to {} failed: {}",
+                    if self.socket_path.is_empty() {
+                        "<unconfigured socket>".to_string()
+                    } else {
+                        crate::redact_endpoint(&self.socket_path)
+                    },
+                    e
+                );
                 Ok(false)
             }
         }
     }
 
+    /// Observe the running KiCad version through the typed IPC command.
+    pub fn get_kicad_version(&self) -> Result<IpcKiCadVersion> {
+        let command = kiapi::common::commands::GetVersion {};
+        let response = unpack_required::<kiapi::common::commands::GetVersionResponse>(
+            self.send_command(&command, "kiapi.common.commands.GetVersion")?,
+            "GetVersion",
+        )?;
+        let version = response
+            .version
+            .context("GetVersion response did not contain a KiCad version")?;
+        Ok(IpcKiCadVersion {
+            major: version.major,
+            minor: version.minor,
+            patch: version.patch,
+            full_version: version.full_version,
+        })
+    }
+
+    /// Query open documents for one explicit editor type.
+    pub fn get_open_documents_for(
+        &self,
+        editor: IpcEditorKind,
+    ) -> Result<Vec<kiapi::common::types::DocumentSpecifier>> {
+        let document_type = match editor {
+            IpcEditorKind::Schematic => kiapi::common::types::DocumentType::DoctypeSchematic,
+            IpcEditorKind::Pcb => kiapi::common::types::DocumentType::DoctypePcb,
+        };
+        let command = kiapi::common::commands::GetOpenDocuments {
+            r#type: document_type as i32,
+        };
+        let response = unpack_required::<kiapi::common::commands::GetOpenDocumentsResponse>(
+            self.send_command(&command, "kiapi.common.commands.GetOpenDocuments")?,
+            "GetOpenDocuments",
+        )?;
+        Ok(response.documents)
+    }
+
+    /// Observe the editor/document surface exposed by the configured endpoint.
+    ///
+    /// KiCad 10 does not expose a stable typed query for the foreground frame,
+    /// active document, or active schematic sheet. Those facts remain null and
+    /// the capability matrix states why; open-document order is never treated
+    /// as active state.
+    pub fn observe_editor_state(&self) -> Result<IpcEditorStateObservation> {
+        let version = self.get_kicad_version()?;
+        let editors = [IpcEditorKind::Schematic, IpcEditorKind::Pcb]
+            .into_iter()
+            .map(|editor| self.observe_editor(editor, &version))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(IpcEditorStateObservation {
+            kicad_version: version,
+            evidence_source: "kicad_ipc".to_string(),
+            editors,
+            active_editor: None,
+            active_document: None,
+            active_sheet_instance: None,
+            limitations: vec![
+                "The configured IPC endpoint cannot enumerate every running KiCad frame or endpoint."
+                    .to_string(),
+                "KiCad 10 exposes no stable typed foreground-frame, active-document, or active-sheet query; open-document order is not active-state evidence."
+                    .to_string(),
+            ],
+        })
+    }
+
+    /// Read the selection for one exact live editor/document/sheet context.
+    ///
+    /// The requested identity is matched against `GetOpenDocuments` before
+    /// and after `GetSelection`. KiCad's `SelectionResponse` has no response
+    /// header, so this bounded document readback is the freshness boundary:
+    /// a disappeared or retargeted document is never reported as a valid
+    /// selection from the caller's context.
+    pub fn observe_selection(
+        &self,
+        requested: &IpcEditorDocument,
+    ) -> Result<IpcSelectionObservation> {
+        let before = self.resolve_selection_document(requested)?;
+        let command = kiapi::common::commands::GetSelection {
+            header: Some(header_for(before.clone())),
+            types: Vec::new(),
+        };
+        let response = unpack_required::<kiapi::common::commands::SelectionResponse>(
+            self.send_command(&command, "kiapi.common.commands.GetSelection")?,
+            "GetSelection",
+        )?;
+        let selected_objects = response
+            .items
+            .iter()
+            .map(|item| decode_selected_object(requested.editor, item))
+            .collect::<Result<Vec<_>>>()?;
+
+        let after = self
+            .resolve_selection_document(requested)
+            .map_err(|error| {
+                let (candidates, reason) = IpcSelectionObservationError::from_error(&error)
+                    .map(|selection| (selection.candidates.clone(), selection.reason.clone()))
+                    .unwrap_or_else(|| (Vec::new(), error.to_string()));
+                anyhow::Error::new(IpcSelectionObservationError {
+                    kind: IpcSelectionObservationErrorKind::StaleEditorState,
+                    editor: requested.editor,
+                    requested: editor_document_label(requested),
+                    candidates,
+                    reason: format!("document context changed during selection readback: {reason}"),
+                })
+            })?;
+        if before != after {
+            return Err(anyhow::Error::new(IpcSelectionObservationError {
+                kind: IpcSelectionObservationErrorKind::StaleEditorState,
+                editor: requested.editor,
+                requested: editor_document_label(requested),
+                candidates: vec![document_specifier_label(&after)],
+                reason: "document identity changed during selection readback".to_string(),
+            }));
+        }
+
+        Ok(IpcSelectionObservation {
+            project: requested.project.clone(),
+            document: requested.clone(),
+            editor: requested.editor,
+            sheet_instance_path: requested.sheet_instance_path.clone(),
+            selected_objects,
+            evidence_source: "kicad_ipc_get_selection_with_document_readback".to_string(),
+        })
+    }
+
+    /// Mutate one exact editor selection and prove the complete resulting set
+    /// through a fresh typed `GetSelection` observation.
+    pub fn mutate_selection(
+        &self,
+        requested: &IpcEditorDocument,
+        operation: IpcSelectionMutation,
+        requested_kiids: &[String],
+    ) -> Result<IpcSelectionMutationResult> {
+        let mut unique = BTreeSet::new();
+        if requested_kiids.iter().any(|kiid| kiid.is_empty()) {
+            return Err(selection_mutation_error(
+                operation,
+                requested_kiids,
+                Vec::new(),
+                Vec::new(),
+                IpcSelectionMutationErrorKind::InvalidRequest,
+                "selection KIIDs must not be empty",
+            ));
+        }
+        if requested_kiids.iter().any(|kiid| !unique.insert(kiid)) {
+            return Err(selection_mutation_error(
+                operation,
+                requested_kiids,
+                Vec::new(),
+                Vec::new(),
+                IpcSelectionMutationErrorKind::InvalidRequest,
+                "selection mutation contains a duplicate KIID",
+            ));
+        }
+        match operation {
+            IpcSelectionMutation::Clear if !requested_kiids.is_empty() => {
+                return Err(selection_mutation_error(
+                    operation,
+                    requested_kiids,
+                    Vec::new(),
+                    Vec::new(),
+                    IpcSelectionMutationErrorKind::InvalidRequest,
+                    "clear selection does not accept object KIIDs",
+                ));
+            }
+            IpcSelectionMutation::Add | IpcSelectionMutation::Remove
+                if requested_kiids.is_empty() =>
+            {
+                return Err(selection_mutation_error(
+                    operation,
+                    requested_kiids,
+                    Vec::new(),
+                    Vec::new(),
+                    IpcSelectionMutationErrorKind::InvalidRequest,
+                    "add and remove selection require at least one object KIID",
+                ));
+            }
+            _ => {}
+        }
+
+        let before = self.observe_selection(requested)?;
+        let document = self.resolve_selection_document(requested)?;
+        let items = requested_kiids
+            .iter()
+            .map(|kiid| kiapi::common::types::Kiid {
+                value: kiid.clone(),
+            })
+            .collect::<Vec<_>>();
+        let response = match operation {
+            IpcSelectionMutation::Clear => self.send_command(
+                &kiapi::common::commands::ClearSelection {
+                    header: Some(header_for(document)),
+                },
+                "kiapi.common.commands.ClearSelection",
+            )?,
+            IpcSelectionMutation::Add => self.send_command(
+                &kiapi::common::commands::AddToSelection {
+                    header: Some(header_for(document)),
+                    items,
+                },
+                "kiapi.common.commands.AddToSelection",
+            )?,
+            IpcSelectionMutation::Remove => self.send_command(
+                &kiapi::common::commands::RemoveFromSelection {
+                    header: Some(header_for(document)),
+                    items,
+                },
+                "kiapi.common.commands.RemoveFromSelection",
+            )?,
+        };
+        let _: kiapi::common::commands::SelectionResponse =
+            unpack_required(response, "selection mutation")?;
+        let after = self.observe_selection(requested)?;
+
+        let before_kiids = selection_kiids(&before);
+        let after_kiids = selection_kiids(&after);
+        let mut expected = before_kiids.iter().cloned().collect::<BTreeSet<_>>();
+        match operation {
+            IpcSelectionMutation::Clear => expected.clear(),
+            IpcSelectionMutation::Add => expected.extend(requested_kiids.iter().cloned()),
+            IpcSelectionMutation::Remove => {
+                for kiid in requested_kiids {
+                    expected.remove(kiid);
+                }
+            }
+        }
+        let expected_kiids = expected.into_iter().collect::<Vec<_>>();
+        if expected_kiids != after_kiids {
+            return Err(selection_mutation_error(
+                operation,
+                requested_kiids,
+                before_kiids,
+                after_kiids,
+                IpcSelectionMutationErrorKind::ReadbackMismatch,
+                "post-operation GetSelection did not match the requested exact set transition",
+            ));
+        }
+
+        Ok(IpcSelectionMutationResult {
+            operation,
+            requested_kiids: requested_kiids.to_vec(),
+            before,
+            after,
+            evidence_source: "kicad_ipc_selection_mutation_with_get_selection_readback".to_string(),
+        })
+    }
+
+    /// Prove that one exact editor/document/sheet identity is currently open.
+    ///
+    /// This is the read-only context gate used by semantic target resolution;
+    /// it shares the same no-fallback matching rules as selection observation
+    /// without issuing a selection query.
+    pub fn observe_exact_open_document(
+        &self,
+        requested: &IpcEditorDocument,
+    ) -> Result<IpcEditorDocument> {
+        let document = self.resolve_selection_document(requested)?;
+        editor_document_from_specifier(requested.editor, document)
+    }
+
+    fn resolve_selection_document(
+        &self,
+        requested: &IpcEditorDocument,
+    ) -> Result<kiapi::common::types::DocumentSpecifier> {
+        let raw_documents = self.get_open_documents_for(requested.editor)?;
+        let mut documents = Vec::with_capacity(raw_documents.len());
+        for raw in raw_documents {
+            let observed = editor_document_from_specifier(requested.editor, raw.clone())?;
+            documents.push((raw, observed));
+        }
+
+        let candidate_labels = documents
+            .iter()
+            .map(|(_, document)| editor_document_label(document))
+            .collect::<Vec<_>>();
+        let same_project = documents
+            .iter()
+            .filter(|(_, document)| document.project == requested.project)
+            .collect::<Vec<_>>();
+        if same_project.is_empty() && !documents.is_empty() {
+            return Err(selection_target_error(
+                IpcSelectionObservationErrorKind::WrongProject,
+                requested,
+                candidate_labels,
+                "no open document belongs to the requested project",
+            ));
+        }
+
+        let exact = same_project
+            .into_iter()
+            .filter(|(_, document)| selection_document_identity_matches(requested, document))
+            .collect::<Vec<_>>();
+        if exact.is_empty() {
+            let kind = match requested.editor {
+                IpcEditorKind::Schematic => IpcSelectionObservationErrorKind::WrongSheetInstance,
+                IpcEditorKind::Pcb => IpcSelectionObservationErrorKind::WrongDocument,
+            };
+            return Err(selection_target_error(
+                kind,
+                requested,
+                candidate_labels,
+                "the exact requested document or sheet instance is not open",
+            ));
+        }
+        if exact.len() != 1 {
+            return Err(selection_target_error(
+                IpcSelectionObservationErrorKind::AmbiguousDocument,
+                requested,
+                exact
+                    .iter()
+                    .map(|(_, document)| editor_document_label(document))
+                    .collect(),
+                "KiCad returned duplicate exact document identities",
+            ));
+        }
+        Ok(exact[0].0.clone())
+    }
+
+    fn observe_editor(
+        &self,
+        editor: IpcEditorKind,
+        version: &IpcKiCadVersion,
+    ) -> Result<IpcEditorObservation> {
+        let documents = match self.get_open_documents_for(editor) {
+            Ok(documents) => documents,
+            Err(error) => {
+                if let Some(status) = ApiStatusError::from_error(&error) {
+                    if status.is_unsupported() {
+                        return Ok(IpcEditorObservation {
+                            editor,
+                            addressable: false,
+                            documents: Vec::new(),
+                            capabilities: editor_capabilities(editor, version, false),
+                            unavailable_reason: Some(format!(
+                                "GetOpenDocuments is {} on this endpoint",
+                                status.code_name
+                            )),
+                        });
+                    }
+                }
+                return Err(error);
+            }
+        };
+
+        let documents = documents
+            .into_iter()
+            .map(|document| editor_document_from_specifier(editor, document))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(IpcEditorObservation {
+            editor,
+            addressable: true,
+            documents,
+            capabilities: editor_capabilities(editor, version, true),
+            unavailable_reason: None,
+        })
+    }
+
     /// Get the list of open documents (boards).
     pub fn get_open_documents(&self) -> Result<Vec<kiapi::common::types::DocumentSpecifier>> {
-        let cmd = kiapi::common::commands::GetOpenDocuments {
-            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-        };
-        let response_any = self.send_command(&cmd, "kiapi.common.commands.GetOpenDocuments")?;
-        if let Some(any) = response_any {
-            let resp: kiapi::common::commands::GetOpenDocumentsResponse = unpack_any(&any)?;
-            Ok(resp.documents)
-        } else {
-            Ok(vec![])
-        }
+        self.get_open_documents_for(IpcEditorKind::Pcb)
     }
 
     /// Resolve the filenames of every open PCB document, including relative
@@ -531,12 +1077,56 @@ impl KiCadIpcClient {
             .collect())
     }
 
-    /// Get the first open PCB's DocumentSpecifier (needed for most commands).
+    /// Get the uniquely targeted PCB document for generic board helpers.
+    ///
+    /// Once [`Self::find_open_board`] binds a requested board, this re-observes
+    /// the open-document set and carries the same typed target forward. It
+    /// never substitutes the first board in KiCad's list.
     fn get_board_document(&self) -> Result<kiapi::common::types::DocumentSpecifier> {
         let docs = self.get_open_documents()?;
-        docs.into_iter().next().ok_or_else(|| {
-            anyhow::anyhow!("No PCB document is open in KiCAD. Open a board file first.")
-        })
+        let bound = self
+            .bound_board
+            .lock()
+            .map_err(|_| anyhow::anyhow!("bound board target lock is poisoned"))?
+            .clone();
+
+        if let Some(bound) = bound {
+            return match select_requested_board(&docs, &bound.requested) {
+                Ok(document) => {
+                    self.bind_board(bound.requested, document.clone())?;
+                    Ok(document)
+                }
+                Err(
+                    error @ (BoardTargetError::AmbiguousDocument { .. }
+                    | BoardTargetError::UnresolvedDocumentIdentities { .. }),
+                ) => Err(anyhow::Error::new(error)),
+                Err(_) => Err(anyhow::Error::new(BoardTargetError::StaleDocument {
+                    requested: bound.requested.display().to_string(),
+                    previously_bound: board_document_label(&bound.document),
+                    open_documents: board_document_labels(&docs),
+                })),
+            };
+        }
+
+        match docs.as_slice() {
+            [] => Err(anyhow::Error::new(BoardTargetError::NoOpenDocuments {
+                requested: "<unspecified>".to_string(),
+            })),
+            [document] => {
+                let path = board_document_identity(document).map_err(|reason| {
+                    anyhow::Error::new(BoardTargetError::UnresolvedDocumentIdentities {
+                        requested: "<unspecified>".to_string(),
+                        reasons: vec![reason],
+                    })
+                })?;
+                self.bind_board(path, document.clone())?;
+                Ok(document.clone())
+            }
+            _ => Err(anyhow::Error::new(BoardTargetError::AmbiguousDocument {
+                requested: "<unspecified>".to_string(),
+                candidates: board_document_labels(&docs),
+            })),
+        }
     }
 
     /// Find the open document matching `requested`, so a path-bearing MCP
@@ -550,23 +1140,34 @@ impl KiCadIpcClient {
         requested: &Path,
     ) -> Result<kiapi::common::types::DocumentSpecifier> {
         let docs = self.get_open_documents()?;
-        if docs.is_empty() {
-            anyhow::bail!("No PCB document is open in KiCAD. Open a board file first.");
-        }
-        let mut open_names = Vec::new();
-        for doc in docs {
-            if let Some(path) = board_document_path(&doc) {
-                if paths_refer_to_same_board(requested, &path) {
-                    return Ok(doc);
-                }
-                open_names.push(path.display().to_string());
+        let document = select_requested_board(&docs, requested).map_err(anyhow::Error::new)?;
+        self.bind_board(requested.to_path_buf(), document.clone())?;
+        Ok(document)
+    }
+
+    fn bind_board(
+        &self,
+        requested: PathBuf,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<()> {
+        let mut bound = self
+            .bound_board
+            .lock()
+            .map_err(|_| anyhow::anyhow!("bound board target lock is poisoned"))?;
+        if let Some(previous) = bound.as_ref() {
+            if previous.document != document {
+                return Err(anyhow::Error::new(BoardTargetError::StaleDocument {
+                    requested: requested.display().to_string(),
+                    previously_bound: board_document_label(&previous.document),
+                    open_documents: vec![board_document_label(&document)],
+                }));
             }
         }
-        anyhow::bail!(
-            "requested board '{}' is not open in KiCAD (open boards: {})",
-            requested.display(),
-            open_names.join(", ")
-        )
+        *bound = Some(BoundBoardTarget {
+            requested,
+            document,
+        });
+        Ok(())
     }
 
     /// Fail closed unless the requested board is open in the IPC session.
@@ -2640,13 +3241,607 @@ fn board_document_path(document: &kiapi::common::types::DocumentSpecifier) -> Op
         .or(Some(path))
 }
 
-fn paths_refer_to_same_board(requested: &Path, active: &Path) -> bool {
-    match (requested.canonicalize(), active.canonicalize()) {
-        (Ok(requested), Ok(active)) => requested == active,
-        _ if active.components().count() == 1 => {
-            requested.components().count() == 1 && requested.file_name() == active.file_name()
+fn editor_document_from_specifier(
+    expected: IpcEditorKind,
+    document: kiapi::common::types::DocumentSpecifier,
+) -> Result<IpcEditorDocument> {
+    use kiapi::common::types::document_specifier::Identifier;
+
+    let expected_type = match expected {
+        IpcEditorKind::Schematic => kiapi::common::types::DocumentType::DoctypeSchematic,
+        IpcEditorKind::Pcb => kiapi::common::types::DocumentType::DoctypePcb,
+    };
+    if document.r#type != expected_type as i32 {
+        return Err(anyhow::Error::new(IpcDocumentObservationError {
+            editor: expected,
+            reason: format!(
+                "requested {}, observed {}",
+                expected_type.as_str_name(),
+                kiapi::common::types::DocumentType::try_from(document.r#type)
+                    .map(|kind| kind.as_str_name().to_string())
+                    .unwrap_or_else(|_| document.r#type.to_string())
+            ),
+        }));
+    }
+
+    let project = document.project.as_ref().map(|project| IpcProjectIdentity {
+        name: project.name.clone(),
+        path: project.path.clone(),
+    });
+    let (document_path, sheet_instance_path) = match (expected, document.identifier.as_ref()) {
+        (IpcEditorKind::Pcb, Some(Identifier::BoardFilename(filename))) if !filename.is_empty() => {
+            (
+                board_document_path(&document).map(|path| path.display().to_string()),
+                None,
+            )
         }
-        _ => requested == active,
+        (IpcEditorKind::Schematic, Some(Identifier::SheetPath(path)))
+            if !path.path.is_empty() && path.path.iter().all(|id| !id.value.is_empty()) =>
+        {
+            (
+                None,
+                Some(IpcSheetInstancePath {
+                    kiids: path.path.iter().map(|id| id.value.clone()).collect(),
+                    human_readable: path.path_human_readable.clone(),
+                }),
+            )
+        }
+        _ => {
+            return Err(anyhow::Error::new(IpcDocumentObservationError {
+                editor: expected,
+                reason: "missing or empty document identifier".to_string(),
+            }));
+        }
+    };
+
+    Ok(IpcEditorDocument {
+        editor: expected,
+        project,
+        document_path,
+        sheet_instance_path,
+    })
+}
+
+fn selection_document_identity_matches(
+    requested: &IpcEditorDocument,
+    observed: &IpcEditorDocument,
+) -> bool {
+    if requested.editor != observed.editor || requested.project != observed.project {
+        return false;
+    }
+    match requested.editor {
+        IpcEditorKind::Pcb => {
+            requested.document_path.is_some()
+                && requested.document_path == observed.document_path
+                && requested.sheet_instance_path.is_none()
+        }
+        IpcEditorKind::Schematic => {
+            requested.document_path.is_none()
+                && requested
+                    .sheet_instance_path
+                    .as_ref()
+                    .is_some_and(|requested_path| {
+                        observed
+                            .sheet_instance_path
+                            .as_ref()
+                            .is_some_and(|observed_path| {
+                                requested_path.kiids == observed_path.kiids
+                            })
+                    })
+        }
+    }
+}
+
+fn selection_target_error(
+    kind: IpcSelectionObservationErrorKind,
+    requested: &IpcEditorDocument,
+    candidates: Vec<String>,
+    reason: &str,
+) -> anyhow::Error {
+    anyhow::Error::new(IpcSelectionObservationError {
+        kind,
+        editor: requested.editor,
+        requested: editor_document_label(requested),
+        candidates,
+        reason: reason.to_string(),
+    })
+}
+
+fn editor_document_label(document: &IpcEditorDocument) -> String {
+    let project = document
+        .project
+        .as_ref()
+        .map(|project| format!("{} at {}", project.name, project.path))
+        .unwrap_or_else(|| "standalone project".to_string());
+    match document.editor {
+        IpcEditorKind::Pcb => format!(
+            "PCB {} in {project}",
+            document
+                .document_path
+                .as_deref()
+                .unwrap_or("<missing path>")
+        ),
+        IpcEditorKind::Schematic => format!(
+            "schematic sheet {} in {project}",
+            document
+                .sheet_instance_path
+                .as_ref()
+                .map(|path| {
+                    if path.human_readable.is_empty() {
+                        path.kiids.join("/")
+                    } else {
+                        path.human_readable.clone()
+                    }
+                })
+                .unwrap_or_else(|| "<missing instance path>".to_string())
+        ),
+    }
+}
+
+fn document_specifier_label(document: &kiapi::common::types::DocumentSpecifier) -> String {
+    let editor = match kiapi::common::types::DocumentType::try_from(document.r#type) {
+        Ok(kiapi::common::types::DocumentType::DoctypeSchematic) => IpcEditorKind::Schematic,
+        _ => IpcEditorKind::Pcb,
+    };
+    editor_document_from_specifier(editor, document.clone())
+        .map(|document| editor_document_label(&document))
+        .unwrap_or_else(|_| "malformed live document".to_string())
+}
+
+fn decode_selected_object(
+    editor: IpcEditorKind,
+    item: &prost_types::Any,
+) -> Result<IpcSelectedObject> {
+    let protocol_type = crate::builders::any_type_name(item);
+    macro_rules! selected {
+        ($message:ty, $kind:literal, $id:expr) => {{
+            let decoded: $message = unpack_any(item).map_err(|error| {
+                malformed_selected_object(editor, protocol_type, format!("decode failed: {error}"))
+            })?;
+            selected_object_from_id(editor, protocol_type, $kind, $id(&decoded))
+        }};
+    }
+
+    match protocol_type {
+        "kiapi.board.types.FootprintInstance" => selected!(
+            kiapi::board::types::FootprintInstance,
+            "pcb_footprint",
+            |value: &kiapi::board::types::FootprintInstance| value.id.clone()
+        ),
+        "kiapi.board.types.Pad" => selected!(
+            kiapi::board::types::Pad,
+            "pcb_pad",
+            |value: &kiapi::board::types::Pad| value.id.clone()
+        ),
+        "kiapi.board.types.BoardGraphicShape" => selected!(
+            kiapi::board::types::BoardGraphicShape,
+            "pcb_shape",
+            |value: &kiapi::board::types::BoardGraphicShape| value.id.clone()
+        ),
+        "kiapi.board.types.BoardText" => selected!(
+            kiapi::board::types::BoardText,
+            "pcb_text",
+            |value: &kiapi::board::types::BoardText| value.id.clone()
+        ),
+        "kiapi.board.types.BoardTextBox" => selected!(
+            kiapi::board::types::BoardTextBox,
+            "pcb_text_box",
+            |value: &kiapi::board::types::BoardTextBox| value.id.clone()
+        ),
+        "kiapi.board.types.Track" => selected!(
+            kiapi::board::types::Track,
+            "pcb_trace",
+            |value: &kiapi::board::types::Track| value.id.clone()
+        ),
+        "kiapi.board.types.Via" => selected!(
+            kiapi::board::types::Via,
+            "pcb_via",
+            |value: &kiapi::board::types::Via| value.id.clone()
+        ),
+        "kiapi.board.types.Arc" => selected!(
+            kiapi::board::types::Arc,
+            "pcb_arc",
+            |value: &kiapi::board::types::Arc| value.id.clone()
+        ),
+        "kiapi.board.types.Dimension" => selected!(
+            kiapi::board::types::Dimension,
+            "pcb_dimension",
+            |value: &kiapi::board::types::Dimension| value.id.clone()
+        ),
+        "kiapi.board.types.Zone" => selected!(
+            kiapi::board::types::Zone,
+            "pcb_zone",
+            |value: &kiapi::board::types::Zone| value.id.clone()
+        ),
+        "kiapi.board.types.Group" => selected!(
+            kiapi::board::types::Group,
+            "pcb_group",
+            |value: &kiapi::board::types::Group| value.id.clone()
+        ),
+        "kiapi.board.types.Field" => selected!(
+            kiapi::board::types::Field,
+            "pcb_field",
+            |value: &kiapi::board::types::Field| value
+                .text
+                .as_ref()
+                .and_then(|text| text.id.clone())
+        ),
+        "kiapi.schematic.types.Line" => selected!(
+            kiapi::schematic::types::Line,
+            "schematic_line",
+            |value: &kiapi::schematic::types::Line| value.id.clone()
+        ),
+        "kiapi.schematic.types.LocalLabel" => selected!(
+            kiapi::schematic::types::LocalLabel,
+            "schematic_label",
+            |value: &kiapi::schematic::types::LocalLabel| value.id.clone()
+        ),
+        "kiapi.schematic.types.GlobalLabel" => selected!(
+            kiapi::schematic::types::GlobalLabel,
+            "schematic_global_label",
+            |value: &kiapi::schematic::types::GlobalLabel| value.id.clone()
+        ),
+        "kiapi.schematic.types.HierarchicalLabel" => selected!(
+            kiapi::schematic::types::HierarchicalLabel,
+            "schematic_hierarchical_label",
+            |value: &kiapi::schematic::types::HierarchicalLabel| value.id.clone()
+        ),
+        "kiapi.schematic.types.DirectiveLabel" => selected!(
+            kiapi::schematic::types::DirectiveLabel,
+            "schematic_directive_label",
+            |value: &kiapi::schematic::types::DirectiveLabel| value.id.clone()
+        ),
+        _ => Err(anyhow::Error::new(IpcSelectionObservationError {
+            kind: IpcSelectionObservationErrorKind::UnsupportedObjectType,
+            editor,
+            requested: protocol_type.to_string(),
+            candidates: Vec::new(),
+            reason: "the bundled stable KiCad protocol cannot decode this selected object type"
+                .to_string(),
+        })),
+    }
+}
+
+fn selected_object_from_id(
+    editor: IpcEditorKind,
+    protocol_type: &str,
+    object_type: &str,
+    id: Option<kiapi::common::types::Kiid>,
+) -> Result<IpcSelectedObject> {
+    let Some(id) = id.filter(|id| !id.value.is_empty()) else {
+        return Err(malformed_selected_object(
+            editor,
+            protocol_type,
+            "selected object has no stable KIID".to_string(),
+        ));
+    };
+    Ok(IpcSelectedObject {
+        kiid: id.value,
+        object_type: object_type.to_string(),
+        protocol_type: protocol_type.to_string(),
+    })
+}
+
+fn malformed_selected_object(
+    editor: IpcEditorKind,
+    protocol_type: &str,
+    reason: String,
+) -> anyhow::Error {
+    anyhow::Error::new(IpcSelectionObservationError {
+        kind: IpcSelectionObservationErrorKind::MalformedSelectedObject,
+        editor,
+        requested: protocol_type.to_string(),
+        candidates: Vec::new(),
+        reason,
+    })
+}
+
+fn selection_kiids(observation: &IpcSelectionObservation) -> Vec<String> {
+    let mut kiids = observation
+        .selected_objects
+        .iter()
+        .map(|object| object.kiid.clone())
+        .collect::<Vec<_>>();
+    kiids.sort();
+    kiids
+}
+
+fn selection_mutation_error(
+    operation: IpcSelectionMutation,
+    requested_kiids: &[String],
+    before_kiids: Vec<String>,
+    after_kiids: Vec<String>,
+    kind: IpcSelectionMutationErrorKind,
+    reason: &str,
+) -> anyhow::Error {
+    anyhow::Error::new(IpcSelectionMutationError {
+        kind,
+        operation,
+        requested_kiids: requested_kiids.to_vec(),
+        before_kiids,
+        after_kiids,
+        reason: reason.to_string(),
+    })
+}
+
+fn editor_capabilities(
+    editor: IpcEditorKind,
+    version: &IpcKiCadVersion,
+    addressable: bool,
+) -> IpcEditorCapabilities {
+    let available = |source: &str| IpcCapability {
+        availability: IpcCapabilityAvailability::Available,
+        evidence_source: source.to_string(),
+        reason: None,
+    };
+    let unsupported = |source: &str, reason: &str| IpcCapability {
+        availability: IpcCapabilityAvailability::Unsupported,
+        evidence_source: source.to_string(),
+        reason: Some(reason.to_string()),
+    };
+
+    let documents = if addressable {
+        available("kicad_ipc_runtime_probe")
+    } else {
+        unsupported(
+            "kicad_ipc_runtime_probe",
+            "the configured endpoint did not handle this editor's document query",
+        )
+    };
+    let selection = if addressable && version.major >= 10 {
+        available("kicad_version_and_typed_protocol")
+    } else {
+        unsupported(
+            "kicad_version_and_typed_protocol",
+            "selection requires an addressable KiCad 10-or-newer editor endpoint",
+        )
+    };
+    let no_active_context = unsupported(
+        "konnect_bundled_kicad_protocol",
+        "no stable typed active-frame, active-document, or active-sheet query is available",
+    );
+    let no_activation = unsupported(
+        "konnect_bundled_kicad_protocol",
+        match editor {
+            IpcEditorKind::Schematic => {
+                "no stable typed exact schematic/sheet activation command is available"
+            }
+            IpcEditorKind::Pcb => "no stable typed exact PCB activation command is available",
+        },
+    );
+    let no_reveal = unsupported(
+        "konnect_bundled_kicad_protocol",
+        "selection is typed, but reveal/center/fit has no stable typed command",
+    );
+    let cross_probe = if addressable && version.major >= 10 {
+        available("konnect_saved_structure_and_typed_live_context")
+    } else {
+        unsupported(
+            "konnect_saved_structure_and_typed_live_context",
+            "cross-probe resolution requires an addressable KiCad 10-or-newer editor endpoint",
+        )
+    };
+
+    IpcEditorCapabilities {
+        observe_documents: documents,
+        observe_active_context: no_active_context,
+        read_selection: selection.clone(),
+        mutate_selection: selection,
+        activate_document: no_activation.clone(),
+        activate_sheet: no_activation,
+        reveal_object: no_reveal.clone(),
+        center_object: no_reveal.clone(),
+        fit_view: no_reveal,
+        cross_probe,
+    }
+}
+
+fn board_document_label(document: &kiapi::common::types::DocumentSpecifier) -> String {
+    board_document_identity(document)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|reason| format!("<unidentified PCB document: {reason}>"))
+}
+
+fn board_document_labels(documents: &[kiapi::common::types::DocumentSpecifier]) -> Vec<String> {
+    documents.iter().map(board_document_label).collect()
+}
+
+/// Resolve exactly one requested board while retaining #407's safety rule:
+/// absence is only proven when every reported document identity is readable.
+fn select_requested_board(
+    documents: &[kiapi::common::types::DocumentSpecifier],
+    requested: &Path,
+) -> std::result::Result<kiapi::common::types::DocumentSpecifier, BoardTargetError> {
+    let requested_label = requested.display().to_string();
+    if documents.is_empty() {
+        return Err(BoardTargetError::NoOpenDocuments {
+            requested: requested_label,
+        });
+    }
+
+    let requested_identity = comparable_identity(requested).map_err(|reason| {
+        BoardTargetError::UnresolvedDocumentIdentities {
+            requested: requested_label.clone(),
+            reasons: vec![format!(
+                "requested path {reason}, so it cannot be compared with KiCad's documents"
+            )],
+        }
+    })?;
+    let identities = documents
+        .iter()
+        .map(board_document_identity)
+        .collect::<Vec<_>>();
+    let matched = identities
+        .iter()
+        .enumerate()
+        .filter(|(_, identity)| {
+            identity
+                .as_ref()
+                .is_ok_and(|path| *path == requested_identity)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    match matched.as_slice() {
+        [index] => return Ok(documents[*index].clone()),
+        [] => {}
+        _ => {
+            return Err(BoardTargetError::AmbiguousDocument {
+                requested: requested_label,
+                candidates: matched
+                    .iter()
+                    .map(|index| board_document_label(&documents[*index]))
+                    .collect(),
+            })
+        }
+    }
+
+    let unresolved = identities
+        .iter()
+        .filter_map(|identity| identity.as_ref().err().cloned())
+        .collect::<Vec<_>>();
+    if !unresolved.is_empty() {
+        return Err(BoardTargetError::UnresolvedDocumentIdentities {
+            requested: requested_label,
+            reasons: unresolved,
+        });
+    }
+
+    let open = identities
+        .iter()
+        .filter_map(|identity| identity.as_ref().ok())
+        .collect::<Vec<_>>();
+    if let Some(duplicated) = first_duplicate(&open) {
+        return Err(BoardTargetError::UnresolvedDocumentIdentities {
+            requested: requested_label,
+            reasons: vec![format!(
+                "KiCad reports '{}' open more than once",
+                duplicated.display()
+            )],
+        });
+    }
+
+    Err(BoardTargetError::WrongDocument {
+        requested: requested_label,
+        open_documents: open.iter().map(|path| path.display().to_string()).collect(),
+    })
+}
+
+/// One open PCB document as a path that can be compared with a requested
+/// board, or the reason it cannot be.
+///
+/// The reason is returned rather than logged because it is the whole point: an
+/// identity that cannot be compared has to reach the decision, or absence gets
+/// concluded from a list that was never read (#426).
+///
+/// KiCad's own contract is a bare filename plus the project directory —
+/// `board_filename` is documented as "a PCB with a given filename, e.g.
+/// `board.kicad_pcb`", with `ProjectSpecifier.path` supplying the directory —
+/// so a bare name *with* a project path is the ordinary case, and a bare name
+/// *without* one is a record Konnect cannot place on disk.
+fn board_document_identity(
+    document: &kiapi::common::types::DocumentSpecifier,
+) -> std::result::Result<PathBuf, String> {
+    use kiapi::common::types::document_specifier::Identifier;
+
+    let filename = match document.identifier.as_ref() {
+        Some(Identifier::BoardFilename(filename)) => filename,
+        Some(Identifier::LibId(_)) => {
+            return Err("a PCB document identified by a library id".to_string())
+        }
+        Some(Identifier::SheetPath(_)) => {
+            return Err("a PCB document identified by a sheet path".to_string())
+        }
+        None => return Err("a PCB document that reports no identifier".to_string()),
+    };
+    if filename.trim().is_empty() {
+        return Err("a PCB document with an empty board filename".to_string());
+    }
+
+    let path = PathBuf::from(filename);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        match document.project.as_ref().map(|project| &project.path) {
+            Some(project_path) if Path::new(project_path).is_absolute() => {
+                Path::new(project_path).join(&path)
+            }
+            _ => {
+                return Err(format!(
+                    "the bare filename '{filename}' with no project directory"
+                ))
+            }
+        }
+    };
+    comparable_identity(&absolute).map_err(|reason| format!("'{filename}' {reason}"))
+}
+
+/// An absolute path reduced to the form two paths can be compared in, or the
+/// reason the filesystem could not say.
+///
+/// A path that does not exist is still comparable — it is normalized
+/// lexically, so a board deleted out from under an open editor still compares
+/// equal to itself. Any *other* failure (a permission denied on a parent
+/// directory, a symlink loop) means the two paths might name one file and
+/// might not, which is exactly the case that must fail closed rather than
+/// resolve to "different".
+fn comparable_identity(path: &Path) -> std::result::Result<PathBuf, String> {
+    match path.canonicalize() {
+        Ok(resolved) => Ok(resolved),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(lexically_normalized(path))
+        }
+        Err(error) => Err(format!("cannot be resolved on this filesystem: {error}")),
+    }
+}
+
+/// `.` and `..` removed without touching the filesystem. Only used for paths
+/// that do not exist, where `canonicalize` cannot do it.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(Component::ParentDir);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The first identity that appears twice, if any. KiCad opening one board
+/// twice is not a list Konnect models, so it is not one absence can be read
+/// from either.
+fn first_duplicate<'a>(paths: &[&'a PathBuf]) -> Option<&'a PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    paths.iter().copied().find(|path| !seen.insert(*path))
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn dial_failure_does_not_expose_endpoint_secrets() {
+        let endpoint = "tcp://user:secret@127.0.0.1:1?token=hidden#detail";
+        let client = KiCadIpcClient::new(endpoint);
+        let error = client
+            .send_command(
+                &kiapi::common::commands::Ping {},
+                "kiapi.common.commands.Ping",
+            )
+            .expect_err("the deliberately unusable endpoint must not answer");
+        let diagnostic = format!("{error:#}");
+
+        assert!(diagnostic.contains("[redacted]"), "{diagnostic}");
+        assert!(!diagnostic.contains("secret"), "{diagnostic}");
+        assert!(!diagnostic.contains("hidden"), "{diagnostic}");
     }
 }
 
@@ -2654,44 +3849,167 @@ fn paths_refer_to_same_board(requested: &Path, active: &Path) -> bool {
 mod document_path_tests {
     use super::*;
 
-    #[test]
-    fn relative_board_filename_is_resolved_against_project_path() {
-        let document = kiapi::common::types::DocumentSpecifier {
+    /// An absolute project directory on the platform running the test.
+    ///
+    /// `Path::is_absolute` is what decides whether a project directory can
+    /// place a bare board filename, and a POSIX-rooted path is *not* absolute
+    /// on Windows — it is relative to the current drive. Keeping the rule
+    /// strict is deliberate; the fixture has to speak the local dialect.
+    fn project_dir() -> &'static str {
+        if cfg!(windows) {
+            r"C:\work\controller"
+        } else {
+            "/work/controller"
+        }
+    }
+
+    fn expected_board() -> PathBuf {
+        PathBuf::from(project_dir()).join("controller.kicad_pcb")
+    }
+
+    fn board_document(
+        filename: &str,
+        project_path: Option<&str>,
+    ) -> kiapi::common::types::DocumentSpecifier {
+        kiapi::common::types::DocumentSpecifier {
             r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
             identifier: Some(
                 kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                    "controller.kicad_pcb".to_string(),
+                    filename.to_string(),
                 ),
             ),
+            project: project_path.map(|path| kiapi::common::types::ProjectSpecifier {
+                name: "controller".to_string(),
+                path: path.to_string(),
+            }),
+        }
+    }
+
+    /// KiCad's documented form: a bare filename plus the project directory.
+    #[test]
+    fn relative_board_filename_is_resolved_against_project_path() {
+        assert_eq!(
+            board_document_path(&board_document("controller.kicad_pcb", Some(project_dir())))
+                .unwrap(),
+            expected_board()
+        );
+        assert_eq!(
+            board_document_identity(&board_document("controller.kicad_pcb", Some(project_dir())))
+                .unwrap(),
+            expected_board()
+        );
+    }
+
+    /// The record that used to be dropped. A bare filename with no project
+    /// directory names no file on disk, and the old lookup skipped it and then
+    /// reported the requested board absent — which is what let a file write
+    /// proceed past evidence nobody had read.
+    #[test]
+    fn a_bare_filename_with_no_project_directory_is_not_an_identity() {
+        let reason = board_document_identity(&board_document("controller.kicad_pcb", None))
+            .expect_err("a bare filename places no file on disk");
+
+        assert!(reason.contains("controller.kicad_pcb"), "{reason}");
+        assert!(reason.contains("no project directory"), "{reason}");
+    }
+
+    #[test]
+    fn a_relative_project_path_is_not_an_identity() {
+        assert!(board_document_identity(&board_document(
+            "controller.kicad_pcb",
+            Some("controller")
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn an_empty_board_filename_is_not_an_identity() {
+        assert!(board_document_identity(&board_document("", Some(project_dir()))).is_err());
+        assert!(board_document_identity(&board_document("   ", Some(project_dir()))).is_err());
+    }
+
+    #[test]
+    fn a_document_with_no_identifier_is_not_an_identity() {
+        let document = kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            identifier: None,
             project: Some(kiapi::common::types::ProjectSpecifier {
                 name: "controller".to_string(),
-                path: "/work/controller".to_string(),
+                path: project_dir().to_string(),
             }),
         };
 
+        assert!(board_document_identity(&document)
+            .expect_err("no identifier")
+            .contains("no identifier"));
+    }
+
+    /// A PCB document identified as something other than a board filename is
+    /// a shape Konnect does not model. It is not a board that is absent.
+    #[test]
+    fn a_non_board_identifier_is_not_an_identity() {
+        let document = kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::SheetPath(
+                    kiapi::common::types::SheetPath {
+                        path: vec![],
+                        path_human_readable: "/".to_string(),
+                    },
+                ),
+            ),
+            project: None,
+        };
+
+        assert!(board_document_identity(&document).is_err());
+    }
+
+    /// A board deleted out from under an open editor still has to compare
+    /// equal to itself — `canonicalize` cannot resolve it, so the identity is
+    /// normalized lexically instead.
+    #[test]
+    fn a_missing_path_is_still_comparable_to_itself() {
         assert_eq!(
-            board_document_path(&document).unwrap(),
-            PathBuf::from("/work/controller/controller.kicad_pcb")
+            comparable_identity(&PathBuf::from(project_dir()).join("./gone.kicad_pcb")).unwrap(),
+            comparable_identity(&PathBuf::from(project_dir()).join("sub/../gone.kicad_pcb"))
+                .unwrap()
+        );
+        assert_ne!(
+            comparable_identity(&PathBuf::from(project_dir()).join("gone.kicad_pcb")).unwrap(),
+            comparable_identity(&PathBuf::from(project_dir()).join("other.kicad_pcb")).unwrap()
+        );
+    }
+
+    /// Two paths through a symlink are one board. `canonicalize` is what makes
+    /// them compare equal, and losing it would turn a board KiCad *has* open
+    /// into one it does not.
+    #[test]
+    fn a_symlinked_path_resolves_to_the_same_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.kicad_pcb");
+        std::fs::write(&real, "(kicad_pcb)").unwrap();
+        let link = dir.path().join("link.kicad_pcb");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&real, &link).unwrap();
+
+        #[cfg(unix)]
+        assert_eq!(
+            comparable_identity(&real).unwrap(),
+            comparable_identity(&link).unwrap()
         );
     }
 
     #[test]
-    fn bare_kicad_filename_is_not_enough_to_authorize_an_absolute_request() {
-        assert!(!paths_refer_to_same_board(
-            Path::new("/work/controller/controller.kicad_pcb"),
-            Path::new("controller.kicad_pcb")
-        ));
-        assert!(paths_refer_to_same_board(
-            Path::new("controller.kicad_pcb"),
-            Path::new("controller.kicad_pcb")
-        ));
-        assert!(!paths_refer_to_same_board(
-            Path::new("/work/controller/other.kicad_pcb"),
-            Path::new("controller.kicad_pcb")
-        ));
+    fn first_duplicate_finds_a_repeated_identity() {
+        let a = PathBuf::from(project_dir()).join("a.kicad_pcb");
+        let b = PathBuf::from(project_dir()).join("b.kicad_pcb");
+
+        assert_eq!(first_duplicate(&[&a, &b]), None);
+        assert_eq!(first_duplicate(&[&a, &b, &a]), Some(&a));
     }
 }
-
 #[cfg(test)]
 mod footprint_graphics_tests {
     use super::*;

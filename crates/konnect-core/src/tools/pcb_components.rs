@@ -7,7 +7,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
-use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite, FILE_FALLBACK_WARNING};
+use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite};
 use crate::tools::{
     get_path, require_array, require_f64, require_str, require_u64, with_board_ipc_classified,
     ToolContext, ToolDef,
@@ -40,6 +40,9 @@ macro_rules! ipc {
                     "KiCAD must be running with the board loaded (IPC error: {})",
                     msg
                 )))
+            }
+            Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+                return Ok(crate::tools::ipc_target_error_result(&error))
             }
             Err(konnect_ipc::IpcFailure::Rejected(msg)) => return Ok(CallToolResult::error(msg)),
         }
@@ -862,6 +865,80 @@ fn insert_into_board(board_path: &Path, blocks: &[String]) -> anyhow::Result<()>
 
     persist_board_replacement(board_path, &content, &new_content)?;
     Ok(())
+}
+
+/// One prepared footprint placement shared by the IPC and guarded file paths.
+///
+/// Callers choose whether the definition came from a KiCad library or from
+/// deliberately supplied inline geometry, but they do not orchestrate the
+/// parser, IPC extraction, board serialization, and duplicate-safe insertion
+/// helpers independently.
+#[derive(Clone)]
+pub(crate) struct PreparedFootprintPlacement {
+    pub(crate) value: String,
+    pub(crate) pads: Vec<konnect_ipc::IpcPadDefinition>,
+    pub(crate) graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
+    pub(crate) fields: konnect_ipc::IpcFieldPlacement,
+    board_sexp: String,
+}
+
+impl PreparedFootprintPlacement {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_library(
+        source: &str,
+        lib_id: &str,
+        reference: &str,
+        value: Option<&str>,
+        x: f64,
+        y: f64,
+        rotation: f64,
+        layer: &str,
+        project_dir: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let prepared =
+            prepare_footprint_source(source, lib_id, reference, value, x, y, rotation, layer)?;
+        let pads = extract_pad_definitions(&prepared)?;
+        let graphics = extract_graphic_definitions(&prepared)?;
+        let fields = extract_field_placement(&prepared);
+        let board_sexp =
+            board_footprint_sexp(lib_id, x, y, rotation, layer, Some(reference), project_dir)
+                .map_err(anyhow::Error::msg)?;
+        let value = value.map(str::to_string).unwrap_or_else(|| {
+            lib_id
+                .split_once(':')
+                .map_or(lib_id, |(_, entry)| entry)
+                .to_string()
+        });
+        Ok(Self {
+            value,
+            pads,
+            graphics,
+            fields,
+            board_sexp,
+        })
+    }
+
+    pub(crate) fn from_inline(
+        value: String,
+        pads: Vec<konnect_ipc::IpcPadDefinition>,
+        graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
+        fields: konnect_ipc::IpcFieldPlacement,
+        board_sexp: String,
+    ) -> Self {
+        Self {
+            value,
+            pads,
+            graphics,
+            fields,
+            board_sexp,
+        }
+    }
+
+    /// Insert exactly this footprint through the same atomic, duplicate-safe
+    /// path used by ordinary library placement.
+    pub(crate) fn insert_into_board(&self, board_path: &Path) -> anyhow::Result<()> {
+        insert_into_board(board_path, std::slice::from_ref(&self.board_sexp))
+    }
 }
 
 fn footprint_references(content: &str) -> anyhow::Result<HashSet<String>> {
@@ -1964,7 +2041,7 @@ pub fn tools() -> Vec<ToolDef> {
             "get_component_pads",
             "Return live board-space pad positions, layers and net assignments for a footprint. \
              Reads the board open in KiCad when it is reachable and falls back to the file only \
-             when KiCad IPC is unreachable — \
+             when no live KiCad holds this board — IPC unreachable, or that board not open — \
              'source' says which, so unsaved placements are visible without a save. \
              A pad's 'net' is its net name, \"\" if the pad carries no net \
              (unconnected), or — reading the file — null if the net node is present \
@@ -2112,27 +2189,20 @@ async fn handle_place_component(
         Ok(source) => source,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
-    let prepared = match prepare_footprint_source(
-        &source, &footprint, &reference, None, x, y, rotation, &layer,
+    let prepared = match PreparedFootprintPlacement::from_library(
+        &source,
+        &footprint,
+        &reference,
+        None,
+        x,
+        y,
+        rotation,
+        &layer,
+        board.parent(),
     ) {
         Ok(prepared) => prepared,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
-    let pads = match extract_pad_definitions(&prepared) {
-        Ok(pads) => pads,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
-    };
-    let graphics = match extract_graphic_definitions(&prepared) {
-        Ok(graphics) => graphics,
-        Err(error) => return Ok(CallToolResult::error(error.to_string())),
-    };
-    let fields = extract_field_placement(&prepared);
-
-    let value = footprint
-        .split_once(':')
-        .map(|(_, entry)| entry)
-        .unwrap_or(&footprint)
-        .to_string();
 
     // Try IPC first. The fallback gate is the typed transport classification:
     // only when the transport is unreachable and this server has never
@@ -2142,15 +2212,16 @@ async fn handle_place_component(
     let reference_ipc = reference.clone();
     let layer_ipc = layer.clone();
     let requested_board = board.clone();
+    let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board, "placement", move |c| {
         c.place_footprint(
             &requested_board,
             &footprint_ipc,
             &reference_ipc,
-            &value,
-            &pads,
-            &graphics,
-            &fields,
+            &prepared_ipc.value,
+            &prepared_ipc.pads,
+            &prepared_ipc.graphics,
+            &prepared_ipc.fields,
             x,
             y,
             rotation,
@@ -2168,7 +2239,7 @@ async fn handle_place_component(
             "source": "ipc"
         }))),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File => {
+        BoardWrite::File(reason) => {
             // No live KiCad on the other end of this transport: fall back to
             // editing the board file directly.
             if board_contains_reference(&board, &reference)? {
@@ -2182,25 +2253,14 @@ async fn handle_place_component(
                     format!("Footprint reference '{reference}' already exists on the board"),
                 ));
             }
-            let sexp = match board_footprint_sexp(
-                &footprint,
-                x,
-                y,
-                rotation,
-                &layer,
-                Some(&reference),
-                board.parent(),
-            ) {
-                Ok(sexp) => sexp,
-                Err(message) => return Ok(CallToolResult::error(message)),
-            };
-            insert_into_board(&board, std::slice::from_ref(&sexp))?;
+            prepared.insert_into_board(&board)?;
             Ok(CallToolResult::json(&json!({
                 "placed": reference,
                 "footprint": footprint,
                 "x": x, "y": y, "rotation": rotation, "layer": layer,
                 "source": "file",
-                "warning": FILE_FALLBACK_WARNING
+                "fallback_reason": reason.evidence(),
+                "warning": reason.warning()
             })))
         }
     }
@@ -2234,7 +2294,7 @@ async fn handle_move_component(
             &json!({ "moved": reference, "x": x, "y": y, "source": "ipc" }),
         )),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File => {
+        BoardWrite::File(reason) => {
             match update_closed_board_footprint(
                 &board,
                 &reference,
@@ -2245,7 +2305,8 @@ async fn handle_move_component(
                     "x": x,
                     "y": y,
                     "source": "file",
-                    "warning": FILE_FALLBACK_WARNING
+                    "fallback_reason": reason.evidence(),
+                    "warning": reason.warning()
                 }))),
                 Err(error) => Ok(error.into_result()),
             }
@@ -2338,7 +2399,7 @@ async fn handle_rotate_component(
             "source": "ipc"
         }))),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File => {
+        BoardWrite::File(reason) => {
             match update_closed_board_footprint(
                 &board,
                 &reference,
@@ -2348,7 +2409,8 @@ async fn handle_rotate_component(
                     "rotated": reference,
                     "rotation": rotation,
                     "source": "file",
-                    "warning": FILE_FALLBACK_WARNING
+                    "fallback_reason": reason.evidence(),
+                    "warning": reason.warning()
                 }))),
                 Err(error) => Ok(error.into_result()),
             }
@@ -2439,12 +2501,13 @@ async fn handle_set_component_placements(
             "undo": "One KiCad undo step reverses the whole placement batch."
         }))),
         BoardWrite::Refused(result) => Ok(result),
-        BoardWrite::File => match update_closed_board_footprints(&board, &placements) {
+        BoardWrite::File(reason) => match update_closed_board_footprints(&board, &placements) {
             Ok(applied) => Ok(CallToolResult::json(&json!({
                 "count": applied.len(),
                 "placements": applied,
                 "source": "file",
-                "warning": FILE_FALLBACK_WARNING
+                "fallback_reason": reason.evidence(),
+                "warning": reason.warning()
             }))),
             Err(error) => Ok(error.into_result()),
         },
@@ -2480,12 +2543,13 @@ async fn handle_flip_component(
     // `attempt_ipc_write`.
     //
     // The distinction is not cosmetic. Running `ensure_board_is_active` and
-    // then bailing unconditionally produced an `anyhow` with no
-    // `TransportUnreachable` marker, which `IpcFailure::from_error` classifies
-    // as `Rejected` — so *every* reachable KiCAD refused the flip, including
-    // one holding an unrelated project, where this board file is demonstrably
+    // then bailing unconditionally produced an `anyhow` classified as
+    // `Rejected` — so *every* reachable KiCAD refused the flip, including one
+    // holding an unrelated project, where this board file is demonstrably
     // free. It also reported Konnect's own refusal as "KiCAD rejected the
-    // footprint flip over IPC", which is the class fixed in v0.5.0.
+    // footprint flip over IPC", which is the class fixed in v0.5.0. That
+    // misclassification is now gone at the source: "not open" carries the
+    // `BoardNotOpen` marker and classifies as its own answer.
     //
     // The helper refuses only when KiCAD holds *this* board, because that is
     // the only case where the edit would be discarded by its next save.
@@ -3079,9 +3143,11 @@ async fn handle_repair_corrupted_footprints(
     Ok(match outcome {
         BoardWrite::Ipc(value) => CallToolResult::json(&value),
         BoardWrite::Refused(result) => result,
-        BoardWrite::File => CallToolResult::error(
-            "KiCad IPC is unreachable. repair_corrupted_footprints is live-IPC-only and never edits the board file directly. Open the requested board in KiCad and retry.",
-        ),
+        BoardWrite::File(reason) => CallToolResult::error(format!(
+            "{} repair_corrupted_footprints is live-IPC-only and never edits the board file \
+             directly. Open the requested board in KiCad and retry.",
+            reason.premise()
+        )),
     })
 }
 
@@ -3199,7 +3265,13 @@ async fn handle_get_component_pads(
                 "Footprint '{reference}' not found on the board open in KiCad"
             )))
         }
+        // Unreachable, or reachable and holding some other board: either way
+        // no live KiCad can be answering about this one, so read the file.
         Err(konnect_ipc::IpcFailure::Unreachable(_)) => {}
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {}
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            return Ok(crate::tools::ipc_target_error_result(&error));
+        }
         Err(konnect_ipc::IpcFailure::Rejected(message)) => {
             return Ok(CallToolResult::error(message));
         }

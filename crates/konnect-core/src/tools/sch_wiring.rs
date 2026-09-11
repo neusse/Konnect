@@ -329,7 +329,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "connect_to_net",
             "Connect a pin to a named net by adding a short wire stub and a net label. \
-             Name the pin with reference + pin_number, or give its coordinates directly.",
+             Name the pin with reference + pin_number, or give its coordinates directly. \
+             The label is sheet-local: a sheet instanced N times gets N independent nets. \
+             A rail shared by every instance needs add_power_symbol or a global_label, \
+             which are one net across all sheets and instances.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1686,6 +1689,17 @@ async fn handle_add_power_symbol(
     }
 
     let uuid = sym.uuid.clone();
+    let placement = super::sch_components::ComponentTargetUnit::placement(
+        &uuid,
+        &context,
+        &lib_id,
+        x,
+        y,
+        rotation,
+        &pwr_ref,
+        Some(&power_net),
+        1,
+    );
     sch.add_symbol(sym);
     sch.overwrite()?;
 
@@ -1694,7 +1708,7 @@ async fn handle_add_power_symbol(
     let junctions_added = crate::tools::add_pin_midwire_junctions(&sch_path, &pwr_ref)?;
     let committed = cse::Schematic::load(&sch_path)?;
     let mut observed = match super::sch_components::placed_component_readback(
-        &sch_path, &committed, &uuid, &context,
+        &sch_path, &committed, &placement, &context,
     ) {
         Ok(result) => result,
         Err(error) => return Ok(error),

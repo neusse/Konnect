@@ -22,6 +22,7 @@ use konnect_sexp::{
     },
 };
 use serde_json::json;
+use std::path::Path;
 
 // Build the 4 Edge.Cuts segments forming a rectangle, packed as Any for create_items.
 fn rect_outline_items(x1: f64, y1: f64, x2: f64, y2: f64, w: f64) -> Vec<prost_types::Any> {
@@ -188,12 +189,65 @@ pub(crate) enum BoardWrite<T = ()> {
     /// IPC call returned, for tools that echo it back — the placed footprint,
     /// for instance.
     Ipc(T),
-    /// No live KiCad on this transport and this board was not observed live
+    /// No live KiCad is holding this board and it was not observed live
     /// during the current server session; proceed with the S-expression path.
-    File,
+    /// Carries *why*, because the caller's user has a different next move for
+    /// each — start KiCad, or open this board in the one already running.
+    File(NoLiveBoard),
     /// KiCAD answered and refused. The caller must return this result and must
     /// NOT touch the file.
     Refused(CallToolResult),
+}
+
+/// Why no live KiCad took the write, for the callers that say so.
+#[derive(Debug)]
+pub(crate) enum NoLiveBoard {
+    /// The request never reached KiCad.
+    Unreachable,
+    /// KiCad answered and holds another project, or none. Carries that
+    /// answer, which names the boards it does hold.
+    NotOpen(String),
+}
+
+impl NoLiveBoard {
+    /// The premise sentence an IPC-only tool leads its refusal with.
+    pub(crate) fn premise(&self) -> String {
+        match self {
+            Self::Unreachable => "KiCad IPC is unreachable.".to_string(),
+            Self::NotOpen(answer) => format!("KiCad is reachable but {answer}."),
+        }
+    }
+
+    /// Stable machine-readable evidence for why a direct file edit was allowed.
+    pub(crate) fn evidence(&self) -> serde_json::Value {
+        match self {
+            Self::Unreachable => json!({
+                "kind": "transport_unreachable",
+                "message": "KiCad IPC is unreachable and no exact-board sibling lock was present."
+            }),
+            Self::NotOpen(answer) => json!({
+                "kind": "board_not_open",
+                "message": answer
+            }),
+        }
+    }
+
+    /// User-facing warning derived from the same classification that unlocked
+    /// the file path. Do not collapse these cases: their recovery steps differ.
+    pub(crate) fn warning(&self) -> String {
+        let observed = match self {
+            Self::Unreachable => {
+                "KiCad IPC was unreachable, so Konnect could not contact a live editor; no exact-board sibling lock was present.".to_string()
+            }
+            Self::NotOpen(answer) => format!("KiCad was reachable, and {answer}"),
+        };
+        format!(
+            "{observed} This board has not been observed live during the current Konnect server \
+             session, so Konnect edited the saved board file directly. If KiCad crashed or was \
+             force-quit before this server started, reconcile any unsaved work before relying on \
+             this change. Reload the file in KiCad before editing it there."
+        )
+    }
 }
 
 /// Run `f` over IPC against the board named by `board_path`, deciding what the
@@ -210,6 +264,9 @@ pub(crate) enum BoardWrite<T = ()> {
 ///   classification, never a text match. A KiCad that answers — even with an
 ///   error — fails closed. An unreachable transport permits the file path only
 ///   when this server has never observed the requested board live.
+/// * A reachable KiCAD that does not hold this board is a third answer, not a
+///   refusal: it has no unsaved state for a board it never opened, so the file
+///   is authoritative and the edit proceeds there.
 pub(crate) async fn attempt_ipc_write<T, F>(
     ctx: &ToolContext,
     board_path: &std::path::Path,
@@ -229,27 +286,95 @@ where
                  board open, so editing the file directly could be silently overwritten."
             ))))
         }
-        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+        Err(konnect_ipc::IpcFailure::Target { error, message }) if error.proves_not_open() => {
             if ctx.board_session.was_observed_live(board_path) {
-                Ok(BoardWrite::Refused(unsafe_file_fallback(board_path)))
+                Ok(BoardWrite::Refused(unsafe_file_fallback(
+                    board_path,
+                    "board_previously_observed_live",
+                    "Konnect previously reached KiCad with this board open, and KiCad no longer \
+                     has it open.",
+                )))
             } else {
-                Ok(BoardWrite::File)
+                Ok(BoardWrite::File(NoLiveBoard::NotOpen(message)))
+            }
+        }
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => Ok(BoardWrite::Refused(
+            crate::tools::ipc_target_error_result(&error),
+        )),
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+            if let Some(refusal) = board_lock_refusal(board_path) {
+                Ok(BoardWrite::Refused(refusal))
+            } else if ctx.board_session.was_observed_live(board_path) {
+                Ok(BoardWrite::Refused(unsafe_file_fallback(
+                    board_path,
+                    "board_previously_observed_live",
+                    "Konnect previously reached KiCad with this board open, but IPC is now \
+                     unreachable.",
+                )))
+            } else {
+                Ok(BoardWrite::File(NoLiveBoard::Unreachable))
             }
         }
     }
 }
 
-fn unsafe_file_fallback(board_path: &std::path::Path) -> CallToolResult {
+/// The refusal both gates share. `reason` is stable machine-readable evidence;
+/// `situation` explains that evidence and the recovery boundary to a person.
+fn unsafe_file_fallback(
+    board_path: &std::path::Path,
+    reason: &str,
+    situation: &str,
+) -> CallToolResult {
     CallToolResult::error_kind(
         ToolErrorKind::UnsafeFileFallback {
             path: board_path.display().to_string(),
+            reason: reason.to_string(),
         },
-        "Konnect previously reached KiCad with this board open, but IPC is now unreachable. \
-         The saved board file may be older than unsaved editor state, so Konnect did not \
-         modify it. Reopen or recover the board in KiCad, reconcile it, and save the \
-         authoritative state. If KiCad was deliberately closed cleanly, restart Konnect \
-         only after confirming that the saved file is authoritative.",
+        format!(
+            "{situation} The saved board file may be older than unsaved editor state, so \
+             Konnect did not modify it. Reopen or recover the board in KiCad, reconcile it, \
+             and save the authoritative state. If KiCad was deliberately closed cleanly, \
+             restart Konnect only after confirming that the saved file is authoritative."
+        ),
     )
+}
+
+/// A KiCad sibling lock is persistent evidence that the saved board may not be
+/// authoritative even when this server has never reached the editor. Lock
+/// contents do not prove process ownership or freshness, so both an observed
+/// lock and an inspection failure veto the unreachable-IPC file fallback.
+fn board_lock_refusal(board_path: &std::path::Path) -> Option<CallToolResult> {
+    board_lock_refusal_with(board_path, |path| {
+        std::fs::symlink_metadata(path).map(|_| ())
+    })
+}
+
+fn board_lock_refusal_with(
+    board_path: &std::path::Path,
+    inspect: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> Option<CallToolResult> {
+    let lock_path = konnect_sexp::writer::kicad_editor_lock_path(board_path)?;
+    match inspect(&lock_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(()) => Some(unsafe_file_fallback(
+            board_path,
+            "kicad_lock_present",
+            &format!(
+                "KiCad sibling lock '{}' is present; its contents cannot prove whether an editor \
+                 still owns newer in-memory state.",
+                lock_path.display()
+            ),
+        )),
+        Err(error) => Some(unsafe_file_fallback(
+            board_path,
+            "kicad_lock_unreadable",
+            &format!(
+                "KiCad sibling lock '{}' could not be inspected ({error}); its absence cannot be \
+                 established.",
+                lock_path.display()
+            ),
+        )),
+    }
 }
 
 /// Refuse a direct file edit when KiCAD is reachable AND holds this very
@@ -272,10 +397,31 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
              there) and retry — this tool has no IPC path for a live board yet."
         )))),
         Err(konnect_ipc::IpcFailure::Rejected(_)) => Ok(None),
-        Err(konnect_ipc::IpcFailure::Unreachable(_)) => Ok(ctx
-            .board_session
-            .was_observed_live(board_path)
-            .then(|| unsafe_file_fallback(board_path))),
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) if error.proves_not_open() => {
+            Ok(ctx.board_session.was_observed_live(board_path).then(|| {
+                unsafe_file_fallback(
+                    board_path,
+                    "board_previously_observed_live",
+                    "Konnect previously reached KiCad with this board open, and KiCad no longer \
+                     has it open.",
+                )
+            }))
+        }
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            Ok(Some(crate::tools::ipc_target_error_result(&error)))
+        }
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+            Ok(board_lock_refusal(board_path).or_else(|| {
+                ctx.board_session.was_observed_live(board_path).then(|| {
+                    unsafe_file_fallback(
+                        board_path,
+                        "board_previously_observed_live",
+                        "Konnect previously reached KiCad with this board open, but IPC is now \
+                         unreachable.",
+                    )
+                })
+            }))
+        }
     }
 }
 
@@ -287,13 +433,14 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
 pub(crate) const DEFAULT_ZONE_CLEARANCE_MM: f64 = 0.2;
 pub(crate) const DEFAULT_ZONE_MIN_WIDTH_MM: f64 = 0.2;
 
-/// What the caller gets back when no live KiCAD could be reached and the zone
-/// went into the file instead.
-pub(crate) const FILE_FALLBACK_WARNING: &str =
-    "KiCad IPC was unreachable and this board has not been observed live during the current \
-     Konnect server session, so Konnect edited the saved board file directly. If KiCad \
-     crashed or was force-quit before this server started, reconcile any unsaved work \
-     before relying on this change.";
+/// Warning for a board operation that has no live IPC implementation. Its
+/// preflight established only that no live KiCad is holding this board.
+const FILE_ONLY_EDIT_WARNING: &str =
+    "No live KiCad is holding this board, and it has not been observed live during the current \
+     Konnect server session, and no KiCad sibling lock was present, so Konnect edited the saved \
+     board file directly. If KiCad crashed or was force-quit before this server started without \
+     leaving a lock, reconcile any unsaved work before relying on this change. Reload the file in \
+     KiCad before editing it there.";
 
 /// The `pad_connection` argument in both the representations it needs: the IPC
 /// enum and the token KiCad's `(connect_pads …)` takes.
@@ -551,27 +698,191 @@ fn format_gr_text(text: &str, x: f64, y: f64, rot: f64, layer: &str, size: f64) 
     )
 }
 
-/// Library identifier a mounting hole is placed under. Shared by the IPC and
-/// file paths so the two cannot drift.
-fn mounting_hole_lib_id(drill_d: f64) -> String {
-    format!("MountingHole:MountingHole_{drill_d:.1}mm")
+/// Every unplated mounting-hole footprint KiCad 10 ships in `MountingHole.pretty`
+/// without a pad, keyed by drill diameter, spelled exactly as the library
+/// spells it (#462).
+///
+/// Two conventions coexist in that library and neither is derivable from the
+/// number: round sizes are `MountingHole_3mm` (no `.0`), metric-clearance
+/// sizes carry the screw (`MountingHole_3.2mm_M3`), and a plain
+/// `MountingHole_3.2mm` does not exist at all. Formatting the drill as
+/// `{:.1}mm` wrote a name for the default call and for every integer size
+/// that no stock KiCad resolves. Where a drill has both a plain and a screw
+/// variant (2.7 mm), the plain one is used: the caller named a hole, not a
+/// screw.
+///
+/// `every_shipped_name_exists_in_the_installed_library` checks this table
+/// against the installed KiCad when one is present.
+const MOUNTING_HOLE_NAMES: &[(f64, &str)] = &[
+    (2.0, "MountingHole_2mm"),
+    (2.1, "MountingHole_2.1mm"),
+    (2.2, "MountingHole_2.2mm_M2"),
+    (2.5, "MountingHole_2.5mm"),
+    (2.7, "MountingHole_2.7mm"),
+    (3.0, "MountingHole_3mm"),
+    (3.2, "MountingHole_3.2mm_M3"),
+    (3.5, "MountingHole_3.5mm"),
+    (3.7, "MountingHole_3.7mm"),
+    (4.0, "MountingHole_4mm"),
+    (4.3, "MountingHole_4.3mm_M4"),
+    (4.5, "MountingHole_4.5mm"),
+    (5.0, "MountingHole_5mm"),
+    (5.3, "MountingHole_5.3mm_M5"),
+    (5.5, "MountingHole_5.5mm"),
+    (6.0, "MountingHole_6mm"),
+    (6.4, "MountingHole_6.4mm_M6"),
+    (6.5, "MountingHole_6.5mm"),
+    (8.4, "MountingHole_8.4mm_M8"),
+];
+
+#[derive(Clone)]
+struct MountingHoleSpec {
+    drill_diameter_mm: f64,
+    reference: String,
+    lib_id: String,
 }
 
-/// Copper/mask annulus diameter around a `drill_d` mounting hole.
-fn mounting_hole_pad_size(drill_d: f64) -> f64 {
-    drill_d + 0.5
+impl MountingHoleSpec {
+    fn new(drill_diameter_mm: f64, reference: String) -> Option<Self> {
+        mounting_hole_lib_id(drill_diameter_mm).map(|lib_id| Self {
+            drill_diameter_mm,
+            reference,
+            lib_id,
+        })
+    }
+}
+
+/// Library identifier a mounting hole is placed under, or `None` when KiCad 10
+/// ships no footprint for that drill. Shared by the IPC and file paths so the
+/// two cannot drift.
+fn mounting_hole_lib_id(drill_diameter_mm: f64) -> Option<String> {
+    MOUNTING_HOLE_NAMES
+        .iter()
+        .find(|(drill, _)| (drill - drill_diameter_mm).abs() < 1e-6)
+        .map(|(_, name)| format!("MountingHole:{name}"))
+}
+
+/// Structured refusal for a drill KiCad ships no mounting hole for. Writing a
+/// name that does not resolve was the defect; the alternative is to say so
+/// before touching the board.
+fn mounting_hole_refusal(drill_diameter_mm: f64) -> CallToolResult {
+    let shipped = MOUNTING_HOLE_NAMES
+        .iter()
+        .map(|(drill, _)| format!("{drill}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: "drill_diameter".to_string(),
+            reason: format!(
+                "KiCad 10 ships no MountingHole footprint for a {drill_diameter_mm} mm drill; shipped \
+                 drills are {shipped} mm"
+            ),
+        },
+        format!(
+            "No stock KiCad mounting hole has a {drill_diameter_mm} mm drill, so a footprint under that \
+             name would not resolve. Shipped drill sizes: {shipped} mm. Nothing was written."
+        ),
+    )
+}
+
+/// Pad diameter of a `drill_d` mounting hole: equal to the drill, as KiCad's
+/// own plain `MountingHole_*` footprints are — an unplated hole with no
+/// annulus. The old `drill + 0.5` annulus matched no library footprint, so a
+/// hole placed under a library name disagreed with that library's pad.
+fn mounting_hole_pad_size(drill_diameter_mm: f64) -> f64 {
+    drill_diameter_mm
+}
+
+/// The `Library:Footprint` id the board file carries for `reference`, read
+/// back from the saved text rather than echoed from the request.
+fn written_footprint_lib_id(content: &str, reference: &str) -> anyhow::Result<Option<String>> {
+    let tree = konnect_sexp::parse_sexp(content)?;
+    let matches = tree
+        .find_all("footprint")
+        .into_iter()
+        .filter_map(|fp| {
+            let named = fp.find_all("property").into_iter().any(|property| {
+                property.get(1).and_then(|n| n.as_str()) == Some("Reference")
+                    && property.get(2).and_then(|n| n.as_str()) == Some(reference)
+            });
+            if named {
+                fp.get(1).and_then(|n| n.as_str()).map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [lib_id] => Ok(Some(lib_id.clone())),
+        _ => anyhow::bail!("footprint reference '{reference}' is ambiguous after placement"),
+    }
+}
+
+fn insert_mounting_hole_file(
+    board_path: &Path,
+    spec: &MountingHoleSpec,
+    prepared: &super::pcb_components::PreparedFootprintPlacement,
+) -> Result<String, CallToolResult> {
+    if let Err(error) = prepared.insert_into_board(board_path) {
+        if error.to_string().contains("already exists on the board") {
+            return Err(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "reference".to_string(),
+                    reason: format!(
+                        "footprint reference '{}' already exists on the board",
+                        spec.reference
+                    ),
+                },
+                format!(
+                    "Footprint reference '{}' already exists on the board. Nothing was written.",
+                    spec.reference
+                ),
+            ));
+        }
+        return Err(CallToolResult::error(format!(
+            "Could not add mounting hole {} to {}: {error:#}",
+            spec.reference,
+            board_path.display()
+        )));
+    }
+
+    let written = match std::fs::read_to_string(board_path) {
+        Ok(written) => written,
+        Err(error) => {
+            return Err(CallToolResult::error(format!(
+                "Mounting hole {} was committed but {} could not be read back: {error}",
+                spec.reference,
+                board_path.display()
+            )))
+        }
+    };
+    match written_footprint_lib_id(&written, &spec.reference) {
+        Ok(Some(lib_id)) => Ok(lib_id),
+        Ok(None) => Err(CallToolResult::error(format!(
+            "Mounting hole {} was committed but is absent from readback of {}",
+            spec.reference,
+            board_path.display()
+        ))),
+        Err(error) => Err(CallToolResult::error(format!(
+            "Mounting hole {} was committed but readback from {} was ambiguous: {error:#}",
+            spec.reference,
+            board_path.display()
+        ))),
+    }
 }
 
 /// Footprint-local Y offset of the Reference/Value text of a mounting hole.
-fn mounting_hole_text_offset(drill_d: f64) -> f64 {
-    drill_d + 1.5
+fn mounting_hole_text_offset(drill_diameter_mm: f64) -> f64 {
+    drill_diameter_mm + 1.5
 }
 
 /// The single NPTH pad of a mounting hole, in footprint-local coordinates —
 /// the IPC-path equivalent of the `(pad "" np_thru_hole …)` node that
 /// [`format_npth_footprint`] writes.
-fn mounting_hole_pad(drill_d: f64) -> konnect_ipc::IpcPadDefinition {
-    let pad_size = mounting_hole_pad_size(drill_d);
+fn mounting_hole_pad(drill_diameter_mm: f64) -> konnect_ipc::IpcPadDefinition {
+    let pad_size = mounting_hole_pad_size(drill_diameter_mm);
     konnect_ipc::IpcPadDefinition {
         number: String::new(),
         pad_type: "np_thru_hole".to_string(),
@@ -581,21 +892,23 @@ fn mounting_hole_pad(drill_d: f64) -> konnect_ipc::IpcPadDefinition {
         rotation: 0.0,
         size_x: pad_size,
         size_y: pad_size,
-        drill_x: Some(drill_d),
-        drill_y: Some(drill_d),
+        drill_x: Some(drill_diameter_mm),
+        drill_y: Some(drill_diameter_mm),
         drill_oval: false,
         layers: vec!["*.Cu".to_string(), "*.Mask".to_string()],
         roundrect_ratio: 0.0,
     }
 }
 
-fn format_npth_footprint(x: f64, y: f64, drill_d: f64, reference: &str) -> String {
+fn format_npth_footprint(x: f64, y: f64, spec: &MountingHoleSpec) -> String {
     let fp_uuid = new_uuid();
     let ref_uuid = new_uuid();
     let val_uuid = new_uuid();
     let pad_uuid = new_uuid();
-    let pad_size = mounting_hole_pad_size(drill_d);
-    let lib_id = mounting_hole_lib_id(drill_d);
+    let pad_size = mounting_hole_pad_size(spec.drill_diameter_mm);
+    let reference = &spec.reference;
+    let lib_id = &spec.lib_id;
+    let drill_diameter_mm = spec.drill_diameter_mm;
     format!(
         "\n  (footprint \"{lib_id}\"\n    \
          (layer \"F.Cu\")\n    (at {x} {y})\n    \
@@ -603,9 +916,9 @@ fn format_npth_footprint(x: f64, y: f64, drill_d: f64, reference: &str) -> Strin
          (property \"Reference\" \"{reference}\"\n      (at 0 {offset} 0)\n      (layer \"F.SilkS\")\n      (uuid \"{ref_uuid}\")\n    )\n    \
          (property \"Value\" \"MountingHole\"\n      (at 0 -{offset} 0)\n      (layer \"F.Fab\")\n      (uuid \"{val_uuid}\")\n    )\n    \
          (pad \"\" np_thru_hole circle (at 0 0) (size {pad_size} {pad_size})\n      \
-         (drill {drill_d})\n      (layers \"*.Cu\" \"*.Mask\")\n      (uuid \"{pad_uuid}\")\n    )\n    \
+         (drill {drill_diameter_mm})\n      (layers \"*.Cu\" \"*.Mask\")\n      (uuid \"{pad_uuid}\")\n    )\n    \
          (uuid \"{fp_uuid}\")\n  )",
-        offset = mounting_hole_text_offset(drill_d)
+        offset = mounting_hole_text_offset(drill_diameter_mm)
     )
 }
 
@@ -878,14 +1191,18 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "add_mounting_hole",
-            "Add an NPTH mounting hole footprint at the specified position.",
+            "Add an NPTH mounting hole footprint at the specified position, under the \
+             MountingHole library name stock KiCad 10 ships for that drill (3.2 → \
+             MountingHole_3.2mm_M3, 3 → MountingHole_3mm). A drill KiCad ships no \
+             footprint for is refused. Places KiCad's own library footprint when the \
+             library resolves; otherwise an equivalent unplated hole under the same name.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":          { "type": "string" },
                     "x":              { "type": "number", "description": "X position in mm" },
                     "y":              { "type": "number", "description": "Y position in mm" },
-                    "drill_diameter": { "type": "number", "description": "Drill diameter in mm", "default": 3.2 },
+                    "drill_diameter": { "type": "number", "description": "Drill diameter in mm. Must be one KiCad 10 ships a MountingHole footprint for: 2, 2.1, 2.2, 2.5, 2.7, 3, 3.2, 3.5, 3.7, 4, 4.3, 4.5, 5, 5.3, 5.5, 6, 6.4, 6.5 or 8.4.", "default": 3.2 },
                     "reference":      { "type": "string", "description": "Designator for the hole (e.g. 'H1')", "default": "H1" }
                 },
                 "required": ["board", "x", "y"]
@@ -1037,7 +1354,7 @@ async fn handle_set_board_size(
     // to Edge.Cuts and the board failed DRC with a self-intersecting outline
     // while the tool reported success (#314).
     let items = rect_outline_items(ox, oy, x2, y2, w);
-    match attempt_ipc_write(ctx, &board_path, "board size", move |c| {
+    let fallback_reason = match attempt_ipc_write(ctx, &board_path, "board size", move |c| {
         let existing =
             c.get_items(konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbShape)?;
         let (segment_ids, other_kinds) = partition_edge_cuts_shapes(&existing);
@@ -1067,8 +1384,8 @@ async fn handle_set_board_size(
             return Ok(outline_not_replaceable(&kinds))
         }
         BoardWrite::Refused(err) => return Ok(err),
-        BoardWrite::File => {}
-    }
+        BoardWrite::File(reason) => reason,
+    };
 
     let content = std::fs::read_to_string(&board_path)?;
 
@@ -1118,7 +1435,8 @@ async fn handle_set_board_size(
         "x1": ox, "y1": oy, "x2": x2, "y2": y2,
         "replaced_segments": removed,
         "source": "file",
-        "warning": FILE_FALLBACK_WARNING
+        "fallback_reason": fallback_reason.evidence(),
+        "warning": fallback_reason.warning()
     })))
 }
 
@@ -1247,9 +1565,9 @@ async fn handle_get_board_info(
     // A layer is `(0 "F.Cu" signal)`, keyed by its ordinal rather than by a
     // tag, so find_all("") — which matches on the head — never matched one and
     // this was always 0. See konnect_sexp::layers.
-    let stack = konnect_sexp::layers::layers(&tree);
-    let layer_count = stack.len();
-    let copper_layer_count = konnect_sexp::layers::copper(&stack).len();
+    let layer_count = konnect_sexp::layers::layers(&tree).len();
+    // Shared with validate_for_manufacturing and estimate_cost (#461).
+    let copper_layer_count = konnect_sexp::layers::copper_layer_count(&tree);
     let paper = paper_name(&tree);
 
     // Not find_all("net"): that counts only direct children of (kicad_pcb …),
@@ -1552,7 +1870,7 @@ async fn handle_add_board_outline(
     let arc_count = primitives.len() - line_count;
 
     let items = outline_items(&primitives, w);
-    match attempt_ipc_write(ctx, &board_path, "board outline", move |c| {
+    let fallback_reason = match attempt_ipc_write(ctx, &board_path, "board outline", move |c| {
         c.create_items(items).map(|_| ())
     })
     .await?
@@ -1567,8 +1885,8 @@ async fn handle_add_board_outline(
             })))
         }
         BoardWrite::Refused(err) => return Ok(err),
-        BoardWrite::File => {}
-    }
+        BoardWrite::File(reason) => reason,
+    };
 
     let outline = format_outline(&primitives, "Edge.Cuts", w);
 
@@ -1583,7 +1901,8 @@ async fn handle_add_board_outline(
         "corner_radius": corner_radius,
         "line_count": line_count, "arc_count": arc_count,
         "source": "file",
-        "warning": FILE_FALLBACK_WARNING
+        "fallback_reason": fallback_reason.evidence(),
+        "warning": fallback_reason.warning()
     })))
 }
 
@@ -1682,7 +2001,7 @@ async fn handle_delete_graphics(
     })
     .await?;
 
-    let (graphics, source) = match attempt {
+    let (graphics, source, fallback_reason) = match attempt {
         BoardWrite::Ipc(matched) => (
             matched
                 .iter()
@@ -1696,9 +2015,10 @@ async fn handle_delete_graphics(
                 })
                 .collect::<Vec<_>>(),
             "ipc",
+            None,
         ),
         BoardWrite::Refused(result) => return Ok(result),
-        BoardWrite::File => {
+        BoardWrite::File(reason) => {
             let content = std::fs::read_to_string(&board_path)?;
             let matched: Vec<FileGraphic> = read_file_graphics(&content)
                 .into_iter()
@@ -1716,7 +2036,7 @@ async fn handle_delete_graphics(
                     .collect();
                 write_atomic(&board_path, &apply_edits(content, edits))?;
             }
-            (graphics, "file")
+            (graphics, "file", Some(reason))
         }
     };
 
@@ -1726,8 +2046,9 @@ async fn handle_delete_graphics(
         "dry_run": dry_run,
         "graphics": graphics,
         "source": source,
+        "fallback_reason": fallback_reason.as_ref().map(NoLiveBoard::evidence),
         "warning": if source == "file" && !dry_run {
-            Some(FILE_FALLBACK_WARNING)
+            fallback_reason.as_ref().map(NoLiveBoard::warning)
         } else {
             None
         }
@@ -1747,30 +2068,86 @@ async fn handle_add_mounting_hole(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let drill_d = args["drill_diameter"].as_f64().unwrap_or(3.2);
+    let drill_diameter_mm = args["drill_diameter"].as_f64().unwrap_or(3.2);
     let reference = args["reference"].as_str().unwrap_or("H1").to_string();
+
+    // The name must be one stock KiCad resolves (#462). A drill with no
+    // shipped footprint is refused here, before any transport is dialled or
+    // any byte written.
+    let Some(spec) = MountingHoleSpec::new(drill_diameter_mm, reference) else {
+        return Ok(mounting_hole_refusal(drill_diameter_mm));
+    };
+
+    // Prefer KiCad's own footprint. When `MountingHole.pretty` resolves from
+    // this machine (project or global fp-lib-table, or a discovered install),
+    // the hole placed is that library footprint — pads, courtyard, comments
+    // layer circle and all — exactly as `place_component` would place it, so
+    // the name and the geometry are KiCad's and `lib_footprint_mismatch` has
+    // nothing to say. Without a resolvable library, Konnect's own NPTH
+    // geometry is written under the same shipped name and the response says
+    // so.
+    let library_source =
+        super::pcb_components::resolve_footprint_source(&spec.lib_id, &board_path).ok();
+    let geometry = if library_source.is_some() {
+        "library"
+    } else {
+        "inline"
+    };
+    let text_offset = mounting_hole_text_offset(spec.drill_diameter_mm);
+    let prepared = match &library_source {
+        Some(source) => {
+            match super::pcb_components::PreparedFootprintPlacement::from_library(
+                source,
+                &spec.lib_id,
+                &spec.reference,
+                None,
+                x,
+                y,
+                0.0,
+                "F.Cu",
+                board_path.parent(),
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => return Ok(CallToolResult::error(error.to_string())),
+            }
+        }
+        None => super::pcb_components::PreparedFootprintPlacement::from_inline(
+            "MountingHole".to_string(),
+            vec![mounting_hole_pad(spec.drill_diameter_mm)],
+            Vec::new(),
+            konnect_ipc::IpcFieldPlacement {
+                reference_at: Some((0.0, text_offset, 0.0)),
+                value_at: Some((0.0, -text_offset, 0.0)),
+            },
+            format_npth_footprint(x, y, &spec),
+        ),
+    };
+    let geometry_note = (geometry == "inline").then(|| {
+        format!(
+            "KiCad's MountingHole library was not resolvable from this machine, so Konnect's \
+             own unplated-hole geometry was placed under the shipped name {}; KiCad may \
+             report lib_footprint_mismatch until the footprint is updated from the library",
+            spec.lib_id
+        )
+    });
 
     // A mounting hole is a footprint, so the same rule as every other
     // board-mutating tool applies (see `attempt_ipc_write`): the request must
     // name the board KiCAD has open, and only an IPC transport that was never
     // reached may fall back to editing the file.
     let requested_board = board_path.clone();
-    let lib_id = mounting_hole_lib_id(drill_d);
-    let lib_id_ipc = lib_id.clone();
-    let reference_ipc = reference.clone();
-    let text_offset = mounting_hole_text_offset(drill_d);
+    let lib_id_ipc = spec.lib_id.clone();
+    let reference_ipc = spec.reference.clone();
+    let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board_path, "mounting hole", move |c| {
         c.place_footprint(
             &requested_board,
             &lib_id_ipc,
             &reference_ipc,
-            "MountingHole",
-            std::slice::from_ref(&mounting_hole_pad(drill_d)),
-            &[],
-            &konnect_ipc::IpcFieldPlacement {
-                reference_at: Some((0.0, text_offset, 0.0)),
-                value_at: Some((0.0, -text_offset, 0.0)),
-            },
+            &prepared_ipc.value,
+            &prepared_ipc.pads,
+            &prepared_ipc.graphics,
+            &prepared_ipc.fields,
             x,
             y,
             0.0,
@@ -1782,24 +2159,32 @@ async fn handle_add_mounting_hole(
     match attempt {
         BoardWrite::Ipc(fp) => Ok(CallToolResult::json(&json!({
             "reference": fp.reference, "x": fp.position.x, "y": fp.position.y,
-            "drill_diameter": drill_d, "footprint": fp.footprint,
+            "drill_diameter": spec.drill_diameter_mm, "footprint": fp.footprint,
+            "geometry": geometry,
+            "geometry_note": geometry_note,
             "source": "ipc"
         }))),
         BoardWrite::Refused(err) => Ok(err),
-        BoardWrite::File => {
+        BoardWrite::File(reason) => {
             // No live KiCad now, and this board was not observed live during
             // the current server session: use the guarded file path.
-            let fp_sexp = format_npth_footprint(x, y, drill_d, &reference);
-            let content = std::fs::read_to_string(&board_path)?;
-            let close_pos = content.rfind(')').unwrap_or(content.len());
-            let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, fp_sexp)]);
-            write_atomic(&board_path, &new_content)?;
+            // Duplicate-reference rejection, atomic insertion, and identity-
+            // bound readback are one operation for both library and inline
+            // geometry.
+            let footprint = match insert_mounting_hole_file(&board_path, &spec, &prepared) {
+                Ok(footprint) => footprint,
+                Err(result) => return Ok(result),
+            };
 
             Ok(CallToolResult::json(&json!({
-                "reference": reference, "x": x, "y": y, "drill_diameter": drill_d,
-                "footprint": lib_id,
+                "reference": spec.reference, "x": x, "y": y,
+                "drill_diameter": spec.drill_diameter_mm,
+                "footprint": footprint,
+                "geometry": geometry,
+                "geometry_note": geometry_note,
                 "source": "file",
-                "warning": FILE_FALLBACK_WARNING
+                "fallback_reason": reason.evidence(),
+                "warning": reason.warning()
             })))
         }
     }
@@ -1828,7 +2213,7 @@ async fn handle_add_board_text(
 
     let text_ipc = text.clone();
     let layer_ipc = layer.clone();
-    match attempt_ipc_write(ctx, &board_path, "board text", move |c| {
+    let fallback_reason = match attempt_ipc_write(ctx, &board_path, "board text", move |c| {
         let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, false);
         let any = builders::pack_any(&bt, "kiapi.board.types.BoardText");
         c.create_items(vec![any]).map(|_| ())
@@ -1842,8 +2227,8 @@ async fn handle_add_board_text(
             })))
         }
         BoardWrite::Refused(err) => return Ok(err),
-        BoardWrite::File => {}
-    }
+        BoardWrite::File(reason) => reason,
+    };
 
     let gr_text = format_gr_text(&text, x, y, rotation, &layer, size);
     let content = std::fs::read_to_string(&board_path)?;
@@ -1854,7 +2239,8 @@ async fn handle_add_board_text(
     Ok(CallToolResult::json(&json!({
         "text": text, "x": x, "y": y, "layer": layer, "size": size,
         "source": "file",
-        "warning": FILE_FALLBACK_WARNING
+        "fallback_reason": fallback_reason.evidence(),
+        "warning": fallback_reason.warning()
     })))
 }
 
@@ -1934,7 +2320,7 @@ pub(crate) async fn add_zone_impl(
     })
     .await?;
 
-    match ipc_attempt {
+    let fallback_reason = match ipc_attempt {
         BoardWrite::Refused(err) => return Ok(err),
         BoardWrite::Ipc(zone_id) => {
             let mut body = describe();
@@ -1945,8 +2331,8 @@ pub(crate) async fn add_zone_impl(
             };
             return Ok(CallToolResult::json(&body));
         }
-        BoardWrite::File => {}
-    }
+        BoardWrite::File(reason) => reason,
+    };
 
     let content = std::fs::read_to_string(&board_path)?;
     let tree = konnect_sexp::parse_sexp(&content)?;
@@ -1969,7 +2355,8 @@ pub(crate) async fn add_zone_impl(
 
     let mut body = describe();
     body["source"] = json!("file");
-    body["warning"] = json!(FILE_FALLBACK_WARNING);
+    body["fallback_reason"] = fallback_reason.evidence();
+    body["warning"] = json!(fallback_reason.warning());
     Ok(CallToolResult::json(&body))
 }
 
@@ -2039,7 +2426,7 @@ async fn handle_import_svg_logo(
         "layer": layer,
         "width_mm": width_mm,
         "source": "file",
-        "warning": FILE_FALLBACK_WARNING
+        "warning": FILE_ONLY_EDIT_WARNING
     })))
 }
 
@@ -2186,6 +2573,45 @@ pub(crate) mod board_mock {
         board: &std::path::Path,
         respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
     ) -> String {
+        spawn_kicad_holding_boards(&[board], respond)
+    }
+
+    /// As [`spawn_kicad_holding_board`], for the two answers that are not
+    /// "the board you asked about": some other project, and nothing at all.
+    pub fn spawn_kicad_holding_boards(
+        boards: &[&std::path::Path],
+        respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
+    ) -> String {
+        spawn_kicad_reporting_documents(
+            boards
+                .iter()
+                .map(|board| board_document(&board.to_string_lossy()))
+                .collect(),
+            respond,
+        )
+    }
+
+    /// One open PCB document in the form KiCad sends: a `board_filename` and,
+    /// when the name is relative, the project directory that places it.
+    pub fn board_document(filename: &str) -> kiapi::common::types::DocumentSpecifier {
+        kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            project: None,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    filename.to_string(),
+                ),
+            ),
+        }
+    }
+
+    /// As [`spawn_kicad_holding_boards`], but the caller supplies the open
+    /// documents verbatim — including the shapes Konnect cannot place on
+    /// disk, which is the whole subject of the ambiguity gate.
+    pub fn spawn_kicad_reporting_documents(
+        documents: Vec<kiapi::common::types::DocumentSpecifier>,
+        respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
+    ) -> String {
         use nng::options::Options;
 
         let port = {
@@ -2199,7 +2625,6 @@ pub(crate) mod board_mock {
             .unwrap();
         socket.listen(&url).expect("mock listen");
 
-        let board = board.to_string_lossy().to_string();
         std::thread::spawn(move || {
             while let Ok(message) = socket.recv() {
                 let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
@@ -2207,15 +2632,7 @@ pub(crate) mod board_mock {
                 let body = if command.type_url.ends_with("GetOpenDocuments") {
                     Some(konnect_ipc::builders::pack_any(
                         &kiapi::common::commands::GetOpenDocumentsResponse {
-                            documents: vec![kiapi::common::types::DocumentSpecifier {
-                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-                                project: None,
-                                identifier: Some(
-                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                        board.clone(),
-                                    ),
-                                ),
-                            }],
+                            documents: documents.clone(),
                         },
                         "kiapi.common.commands.GetOpenDocumentsResponse",
                     ))
@@ -2239,6 +2656,257 @@ pub(crate) mod board_mock {
             }
         });
         url
+    }
+}
+
+/// The gate between "KiCad answered" and "the saved file is authoritative".
+///
+/// `BoardNotOpen` is what unlocks a direct file write, so it may only be
+/// reached from an open-document list that was read in full. Every shape that
+/// cannot be placed on disk — no identifier, an empty or bare filename, a
+/// duplicate — has to stop there instead, because a record Konnect skipped is
+/// not evidence that the board is closed (#426).
+#[cfg(test)]
+mod open_document_ambiguity_tests {
+    use super::board_mock::{board_document, ctx_talking_to, spawn_kicad_reporting_documents};
+    use super::*;
+    use konnect_ipc::gen::kiapi;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn kind_of(result: &CallToolResult) -> Option<String> {
+        crate::mcp::error::extract_error_kind(result)
+    }
+
+    /// A document KiCad reports that Konnect cannot place on disk: a bare
+    /// filename with no project directory. KiCad's own contract pairs a bare
+    /// `board_filename` with `ProjectSpecifier.path`; without one there is no
+    /// directory, and the record names no file.
+    fn unplaceable_document() -> kiapi::common::types::DocumentSpecifier {
+        board_document("mystery.kicad_pcb")
+    }
+
+    fn document_without_identifier() -> kiapi::common::types::DocumentSpecifier {
+        kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            project: None,
+            identifier: None,
+        }
+    }
+
+    /// Run a write against a KiCad reporting `documents`, and report both the
+    /// outcome and whether the write closure was ever entered.
+    async fn write_against(
+        board: &std::path::Path,
+        documents: Vec<kiapi::common::types::DocumentSpecifier>,
+    ) -> (BoardWrite<()>, bool) {
+        let ctx = ctx_talking_to(spawn_kicad_reporting_documents(documents, |_| None));
+        let entered = Arc::new(AtomicBool::new(false));
+        let flag = entered.clone();
+        let outcome = attempt_ipc_write(&ctx, board, "test write", move |_| {
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        (outcome, entered.load(Ordering::SeqCst))
+    }
+
+    /// The defect: the unresolvable record was skipped, the requested board
+    /// was then "not open", and a file write proceeded on evidence nobody had
+    /// read.
+    #[tokio::test]
+    async fn an_unplaceable_open_document_refuses_and_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let before = std::fs::read(&board).unwrap();
+
+        let (outcome, entered) = write_against(&board, vec![unplaceable_document()]).await;
+
+        let BoardWrite::Refused(result) = outcome else {
+            panic!("an unidentifiable open document must not authorize a file write")
+        };
+        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_open_board"));
+        assert!(!entered, "the IPC write closure must not run");
+        assert_eq!(std::fs::read(&board).unwrap(), before, "board bytes");
+    }
+
+    #[tokio::test]
+    async fn a_document_with_no_identifier_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+
+        let (outcome, entered) = write_against(&board, vec![document_without_identifier()]).await;
+
+        let BoardWrite::Refused(result) = outcome else {
+            panic!("a document with no identifier must not authorize a file write")
+        };
+        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_open_board"));
+        assert!(!entered);
+    }
+
+    #[tokio::test]
+    async fn an_empty_board_filename_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+
+        let (outcome, _) = write_against(&board, vec![board_document("")]).await;
+
+        let BoardWrite::Refused(result) = outcome else {
+            panic!("an empty board filename must not authorize a file write")
+        };
+        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_open_board"));
+    }
+
+    /// One unreadable record poisons the verdict even beside a readable one.
+    /// "Board A is open" says nothing about board B, so a list containing a
+    /// record that might be B cannot prove B closed.
+    #[tokio::test]
+    async fn one_unplaceable_document_beside_a_readable_one_still_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let elsewhere = dir.path().join("other.kicad_pcb");
+
+        let (outcome, entered) = write_against(
+            &board,
+            vec![
+                board_document(&elsewhere.to_string_lossy()),
+                unplaceable_document(),
+            ],
+        )
+        .await;
+
+        assert!(matches!(outcome, BoardWrite::Refused(_)));
+        assert!(!entered);
+    }
+
+    /// KiCad opening one board twice is not a list Konnect models, so it is
+    /// not one absence can be read from either.
+    #[tokio::test]
+    async fn a_duplicated_open_document_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let elsewhere = dir.path().join("other.kicad_pcb");
+        let twice = board_document(&elsewhere.to_string_lossy());
+
+        let (outcome, entered) = write_against(&board, vec![twice.clone(), twice]).await;
+
+        let BoardWrite::Refused(result) = outcome else {
+            panic!("a duplicated open document must not authorize a file write")
+        };
+        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_open_board"));
+        assert!(!entered);
+    }
+
+    /// And the requested board itself reported twice: there is no single
+    /// document an edit would reach, so neither path may run.
+    #[tokio::test]
+    async fn the_requested_board_reported_twice_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let twice = board_document(&board.to_string_lossy());
+
+        let (outcome, entered) = write_against(&board, vec![twice.clone(), twice]).await;
+
+        let BoardWrite::Refused(result) = outcome else {
+            panic!("the requested board open twice must not be resolved by order")
+        };
+        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_target"));
+        assert!(!entered, "no single document to address");
+    }
+
+    /// A positive identification is the safe direction — the operation goes to
+    /// KiCad, not to the file — so it is not withheld because some *other*
+    /// open document is unreadable.
+    #[tokio::test]
+    async fn a_positive_match_is_not_blocked_by_another_unreadable_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+
+        let (outcome, entered) = write_against(
+            &board,
+            vec![
+                unplaceable_document(),
+                board_document(&board.to_string_lossy()),
+            ],
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, BoardWrite::Ipc(())),
+            "KiCad holds this board; the edit belongs there"
+        );
+        assert!(entered);
+    }
+
+    /// The empty list is its own answer and always was: KiCad is running with
+    /// nothing open, which is what a freshly launched editor looks like.
+    #[tokio::test]
+    async fn an_empty_open_document_list_edits_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+
+        let (outcome, entered) = write_against(&board, vec![]).await;
+
+        assert!(matches!(outcome, BoardWrite::File(NoLiveBoard::NotOpen(_))));
+        assert!(!entered, "there was no board to address over IPC");
+    }
+
+    /// The file-only guard reaches the same verdict from the same evidence.
+    #[tokio::test]
+    async fn the_file_only_guard_refuses_an_unplaceable_open_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let before = std::fs::read(&board).unwrap();
+        let ctx = ctx_talking_to(spawn_kicad_reporting_documents(
+            vec![unplaceable_document()],
+            |_| None,
+        ));
+
+        let result = refuse_if_board_open_in_kicad(&ctx, &board, "test edit")
+            .await
+            .unwrap()
+            .expect("an unidentifiable open document must refuse the edit");
+
+        assert_eq!(kind_of(&result).as_deref(), Some("ambiguous_open_board"));
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    /// Ambiguity is not a rejection either. KiCad declined nothing — it was
+    /// never asked — and reporting a refusal it did not make is the same
+    /// misreading in the other direction.
+    #[tokio::test]
+    async fn ambiguity_is_reported_as_itself_not_as_a_kicad_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+
+        let (outcome, _) = write_against(&board, vec![unplaceable_document()]).await;
+
+        let BoardWrite::Refused(result) = outcome else {
+            panic!("expected a refusal")
+        };
+        let text = super::mounting_hole_tests::result_text(&result);
+        assert!(!text.contains("rejected"), "{text}");
+        assert!(text.contains("cannot be compared safely"), "{text}");
+    }
+
+    /// A board this session watched KiCad hold stays protected: an unreadable
+    /// list cannot release it any more than a proven-closed one can.
+    #[tokio::test]
+    async fn a_previously_live_board_stays_refused_under_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let ctx = ctx_talking_to(spawn_kicad_reporting_documents(
+            vec![unplaceable_document()],
+            |_| None,
+        ));
+        ctx.board_session.observe_live(&board);
+
+        let outcome = attempt_ipc_write(&ctx, &board, "test write", |_| Ok(()))
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, BoardWrite::Refused(_)));
     }
 }
 
@@ -2340,7 +3008,7 @@ mod board_session_safety_tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, BoardWrite::File));
+        assert!(matches!(outcome, BoardWrite::File(_)));
     }
 
     #[tokio::test]
@@ -2428,7 +3096,103 @@ mod board_session_safety_tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, BoardWrite::File));
+        assert!(matches!(outcome, BoardWrite::File(_)));
+    }
+
+    fn error_reason(result: &CallToolResult) -> String {
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        body["error"]["reason"]
+            .as_str()
+            .expect("structured refusal reason")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn any_exact_board_lock_refuses_both_offline_fallback_gates_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let before = std::fs::read(&board).unwrap();
+        let lock = konnect_sexp::writer::kicad_editor_lock_path(&board).unwrap();
+        let ctx = ctx_talking_to(String::new());
+
+        for body in [
+            r#"{"username":"test","hostname":"host"}"#,
+            r#"{"username":"former","hostname":"retired"}"#,
+            "not parseable lock data",
+        ] {
+            std::fs::write(&lock, body).unwrap();
+            let outcome = attempt_ipc_write(&ctx, &board, "test write", |_| Ok(()))
+                .await
+                .unwrap();
+            let BoardWrite::Refused(result) = outcome else {
+                panic!("an exact sibling lock must refuse file mode")
+            };
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("unsafe_file_fallback")
+            );
+            assert_eq!(error_reason(&result), "kicad_lock_present");
+            assert_eq!(std::fs::read(&board).unwrap(), before);
+        }
+
+        let guarded = refuse_if_board_open_in_kicad(&ctx, &board, "file-only test write")
+            .await
+            .unwrap()
+            .expect("the file-only gate must honor the same exact lock");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&guarded).as_deref(),
+            Some("unsafe_file_fallback")
+        );
+        assert_eq!(error_reason(&guarded), "kicad_lock_present");
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_lock_for_another_board_does_not_taint_the_requested_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let requested = super::mounting_hole_tests::blank_board(dir.path());
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&other, "(kicad_pcb)\n").unwrap();
+        let other_lock = konnect_sexp::writer::kicad_editor_lock_path(&other).unwrap();
+        std::fs::write(other_lock, "locked").unwrap();
+        let ctx = ctx_talking_to(String::new());
+
+        let outcome = attempt_ipc_write(&ctx, &requested, "test write", |_| Ok(()))
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, BoardWrite::File(_)));
+        assert!(
+            refuse_if_board_open_in_kicad(&ctx, &requested, "file-only test write")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_uninspectable_exact_board_lock_fails_closed_with_distinct_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let before = std::fs::read(&board).unwrap();
+        let result = board_lock_refusal_with(&board, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "mock access denied",
+            ))
+        })
+        .expect("inspection failure must refuse");
+
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("unsafe_file_fallback")
+        );
+        assert_eq!(error_reason(&result), "kicad_lock_unreadable");
+        assert_eq!(std::fs::read(&board).unwrap(), before);
     }
 
     #[tokio::test]
@@ -2491,6 +3255,124 @@ mod board_session_safety_tests {
 
         assert!(matches!(result, Err(konnect_ipc::IpcFailure::Rejected(_))));
         assert!(!ctx.board_session.was_observed_live(&board));
+    }
+
+    /// KiCad up on another project is the ordinary state of a machine where
+    /// one board is being edited by hand and another by Konnect. It used to
+    /// classify as a rejection, so every `attempt_ipc_write` caller refused
+    /// and wrote nothing, quoting a KiCad that had said no such thing.
+    #[tokio::test]
+    async fn a_kicad_holding_another_project_edits_this_board_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let elsewhere = dir.path().join("other.kicad_pcb");
+        let ctx = ctx_talking_to(super::board_mock::spawn_kicad_holding_boards(
+            &[elsewhere.as_path()],
+            |_| None,
+        ));
+
+        let result = handle_add_mounting_hole(
+            &json!({
+                "board": board.to_str().unwrap(),
+                "x": 5.0, "y": 6.0, "drill_diameter": 3.2, "reference": "H1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "handler errored: {:?}", result.content);
+        let body: serde_json::Value =
+            serde_json::from_str(&super::mounting_hole_tests::result_text(&result)).unwrap();
+        assert_eq!(body["source"], json!("file"));
+        assert_eq!(body["fallback_reason"]["kind"], json!("board_not_open"));
+        assert!(body["fallback_reason"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("other.kicad_pcb")));
+        assert!(std::fs::read_to_string(&board).unwrap().contains("H1"));
+        assert!(
+            body["warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("is not open in KiCad")),
+            "the warning must cover the path taken, not only an unreachable transport: {}",
+            body["warning"]
+        );
+        assert!(
+            !ctx.board_session.was_observed_live(&board),
+            "KiCad never had this board, so it must not count as observed live"
+        );
+    }
+
+    /// The other half: KiCad running with nothing open, which is what a user
+    /// who has just launched it has.
+    #[tokio::test]
+    async fn a_kicad_with_no_board_open_edits_the_board_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let ctx = ctx_talking_to(super::board_mock::spawn_kicad_holding_boards(&[], |_| None));
+
+        let write = attempt_ipc_write(&ctx, &board, "test edit", |_| Ok(()))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(write, BoardWrite::File(_)),
+            "an empty document list is not a refusal"
+        );
+    }
+
+    /// The board this session watched KiCad hold, which KiCad no longer has:
+    /// a crash and restart, or a close mid-operation. The transport being
+    /// reachable again says nothing about the work that board carried, so
+    /// this stays the #240 refusal rather than joining the file path.
+    #[tokio::test]
+    async fn a_board_closed_since_konnect_saw_it_live_still_refuses_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let elsewhere = dir.path().join("other.kicad_pcb");
+        let ctx = ctx_talking_to(super::board_mock::spawn_kicad_holding_boards(
+            &[elsewhere.as_path()],
+            |_| None,
+        ));
+        ctx.board_session.observe_live(&board);
+
+        let write = attempt_ipc_write(&ctx, &board, "next write", |_| Ok(()))
+            .await
+            .unwrap();
+
+        let BoardWrite::Refused(result) = write else {
+            panic!("a board KiCad has since closed must not take the file path")
+        };
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("unsafe_file_fallback")
+        );
+        assert!(
+            super::mounting_hole_tests::result_text(&result).contains("no longer has it open"),
+            "the refusal must name what actually changed"
+        );
+    }
+
+    /// The same distinction for the no-IPC-path gate beside it, whose doc
+    /// comment has always claimed it — until now nothing held it to it (#241).
+    #[tokio::test]
+    async fn a_file_only_edit_proceeds_while_kicad_holds_another_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = super::mounting_hole_tests::blank_board(dir.path());
+        let elsewhere = dir.path().join("other.kicad_pcb");
+        let ctx = ctx_talking_to(super::board_mock::spawn_kicad_holding_boards(
+            &[elsewhere.as_path()],
+            |_| None,
+        ));
+
+        let refusal = refuse_if_board_open_in_kicad(&ctx, &board, "test edit")
+            .await
+            .unwrap();
+
+        assert!(
+            refusal.is_none(),
+            "a KiCad holding a different board does not interfere with this file"
+        );
     }
 }
 
@@ -3035,17 +3917,18 @@ mod mounting_hole_tests {
     }
 
     #[test]
-    fn mounting_hole_pad_is_an_unplated_hole_with_drill_and_annulus() {
-        let pad = mounting_hole_pad(3.45);
+    fn mounting_hole_pad_is_an_unplated_hole_with_no_annulus() {
+        let pad = mounting_hole_pad(3.2);
         assert_eq!(pad.pad_type, "np_thru_hole");
         assert_eq!(pad.shape, "circle");
-        assert_eq!(pad.drill_x, Some(3.45));
-        assert_eq!(pad.drill_y, Some(3.45));
+        assert_eq!(pad.drill_x, Some(3.2));
+        assert_eq!(pad.drill_y, Some(3.2));
         assert!(!pad.drill_oval);
-        // Annulus matches the (size …) the file path writes, so a hole placed
-        // over IPC and one written to the file are the same hole.
-        assert_eq!(pad.size_x, 3.95);
-        assert_eq!(pad.size_y, 3.95);
+        // Pad equals drill, as KiCad's own plain MountingHole_* footprints are
+        // (#462); and it matches the (size …) the file path writes, so a hole
+        // placed over IPC and one written to the file are the same hole.
+        assert_eq!(pad.size_x, 3.2);
+        assert_eq!(pad.size_y, 3.2);
         assert_eq!(pad.layers, ["*.Cu", "*.Mask"]);
         assert_eq!(pad.x, 0.0);
         assert_eq!(pad.y, 0.0);
@@ -3064,7 +3947,7 @@ mod mounting_hole_tests {
         let ctx = ctx_with_ipc(spawn_rejecting_kicad());
         let args = json!({
             "board": board.to_str().unwrap(),
-            "x": 5.0, "y": 6.0, "drill_diameter": 3.45, "reference": "H1"
+            "x": 5.0, "y": 6.0, "drill_diameter": 3.2, "reference": "H1"
         });
         let res = handle_add_mounting_hole(&args, &ctx).await.unwrap();
 
@@ -3091,7 +3974,7 @@ mod mounting_hole_tests {
         let ctx = ctx_with_ipc(String::new());
         let args = json!({
             "board": board.to_str().unwrap(),
-            "x": 5.0, "y": 6.0, "drill_diameter": 3.45, "reference": "H1"
+            "x": 5.0, "y": 6.0, "drill_diameter": 3.2, "reference": "H1"
         });
         let res = handle_add_mounting_hole(&args, &ctx).await.unwrap();
         assert!(!res.is_error, "handler errored: {:?}", res.content);
@@ -3105,8 +3988,203 @@ mod mounting_hole_tests {
             updated.contains("(pad \"\" np_thru_hole circle"),
             "{updated}"
         );
-        assert!(updated.contains("(drill 3.45)"), "{updated}");
+        assert!(updated.contains("(drill 3.2)"), "{updated}");
         assert!(updated.contains("\"H1\""), "{updated}");
+    }
+}
+
+#[cfg(test)]
+mod mounting_hole_name_tests {
+    //! Issue #462: `add_mounting_hole` wrote `MountingHole:MountingHole_{drill:.1}mm`.
+    //! KiCad 10 ships no plain `MountingHole_3.2mm` (3.2 mm exists only as the
+    //! M3 family) and spells round sizes without a decimal (`MountingHole_3mm`,
+    //! never `3.0mm`), so the default call and every integer size wrote a name
+    //! no stock KiCad resolves.
+
+    use super::mounting_hole_tests::{blank_board, ctx_with_ipc, result_text};
+    use super::*;
+
+    #[test]
+    fn shipped_drills_get_the_library_spelling() {
+        for (drill, expected) in [
+            (3.2, "MountingHole:MountingHole_3.2mm_M3"),
+            (3.0, "MountingHole:MountingHole_3mm"),
+            (4.0, "MountingHole:MountingHole_4mm"),
+            (2.7, "MountingHole:MountingHole_2.7mm"),
+            (4.3, "MountingHole:MountingHole_4.3mm_M4"),
+            (8.4, "MountingHole:MountingHole_8.4mm_M8"),
+        ] {
+            assert_eq!(
+                mounting_hole_lib_id(drill).as_deref(),
+                Some(expected),
+                "{drill}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unshipped_drill_has_no_name() {
+        for drill in [3.3, 3.45, 0.0, -1.0, 10.0, f64::NAN] {
+            assert_eq!(mounting_hole_lib_id(drill), None, "{drill}");
+        }
+    }
+
+    /// The table is a copy of what KiCad ships; the installed library is the
+    /// truth. Skips silently on a machine without KiCad, like the other
+    /// installed-library conformance checks.
+    #[test]
+    fn every_shipped_name_exists_in_the_installed_library() {
+        let Some(pretty) = crate::kicad_install::share_roots()
+            .into_iter()
+            .map(|root| root.join("footprints").join("MountingHole.pretty"))
+            .find(|dir| dir.is_dir())
+        else {
+            eprintln!("no installed KiCad footprint library found; skipping");
+            return;
+        };
+        let mut missing = Vec::new();
+        for (_, name) in MOUNTING_HOLE_NAMES {
+            if !pretty.join(format!("{name}.kicad_mod")).is_file() {
+                missing.push(*name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "names not shipped by the installed KiCad at {}: {missing:?}",
+            pretty.display()
+        );
+        // And the names the old formatter produced must NOT exist — otherwise
+        // this fixture no longer proves the defect.
+        for absent in [
+            "MountingHole_3.2mm",
+            "MountingHole_3.0mm",
+            "MountingHole_4.0mm",
+        ] {
+            assert!(
+                !pretty.join(format!("{absent}.kicad_mod")).is_file(),
+                "{absent} exists in the installed library; the premise of #462 changed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unshipped_drill_refuses_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let ctx = ctx_with_ipc(String::new());
+        let res = handle_add_mounting_hole(
+            &json!({
+                "board": board.to_str().unwrap(),
+                "x": 5.0, "y": 6.0, "drill_diameter": 3.3, "reference": "H1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            res.is_error,
+            "3.3 mm is not a shipped hole: {:?}",
+            res.content
+        );
+        let text = result_text(&res);
+        assert!(text.contains("3.3") && text.contains("3.2"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            before,
+            "nothing written"
+        );
+    }
+
+    #[test]
+    fn inline_file_placement_refuses_a_duplicate_reference_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+        let spec = MountingHoleSpec::new(3.2, "H1".to_string()).unwrap();
+        let text_offset = mounting_hole_text_offset(spec.drill_diameter_mm);
+        let prepared = super::super::pcb_components::PreparedFootprintPlacement::from_inline(
+            "MountingHole".to_string(),
+            vec![mounting_hole_pad(spec.drill_diameter_mm)],
+            Vec::new(),
+            konnect_ipc::IpcFieldPlacement {
+                reference_at: Some((0.0, text_offset, 0.0)),
+                value_at: Some((0.0, -text_offset, 0.0)),
+            },
+            format_npth_footprint(5.0, 6.0, &spec),
+        );
+
+        let observed = insert_mounting_hole_file(&board, &spec, &prepared).unwrap();
+        assert_eq!(observed, spec.lib_id);
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let refusal = insert_mounting_hole_file(&board, &spec, &prepared).unwrap_err();
+        assert!(refusal.is_error);
+        let text = result_text(&refusal);
+        assert!(text.contains("reference 'H1' already exists"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            before,
+            "duplicate-reference refusal must leave the board byte-identical"
+        );
+    }
+
+    /// The default call — the one Chris's E2E made — writes the name KiCad
+    /// ships, and the response reports the name read back from the file.
+    #[tokio::test]
+    async fn the_default_drill_writes_a_name_stock_kicad_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+
+        let ctx = ctx_with_ipc(String::new());
+        let res = handle_add_mounting_hole(
+            &json!({ "board": board.to_str().unwrap(), "x": 5.0, "y": 6.0, "reference": "H1" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+        let parsed: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert!(
+            updated.contains("(footprint \"MountingHole:MountingHole_3.2mm_M3\""),
+            "{updated}"
+        );
+        assert!(
+            !updated.contains("MountingHole_3.2mm\""),
+            "the old name must be gone"
+        );
+        assert_eq!(
+            parsed["footprint"],
+            json!("MountingHole:MountingHole_3.2mm_M3")
+        );
+        assert_eq!(parsed["drill_diameter"], json!(3.2));
+
+        // Which geometry landed depends on whether this machine resolves
+        // KiCad's library; either way the response must say which, and the
+        // file must agree with it.
+        match parsed["geometry"].as_str() {
+            Some("library") => {
+                assert!(
+                    updated.contains("fp_circle"),
+                    "library footprint carries its circles: {updated}"
+                );
+                assert!(parsed["geometry_note"].is_null());
+            }
+            Some("inline") => {
+                assert!(
+                    updated.contains("(size 3.2 3.2)"),
+                    "no annulus, like KiCad's: {updated}"
+                );
+                assert!(parsed["geometry_note"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not resolvable"));
+            }
+            other => panic!("geometry must be library or inline, got {other:?}"),
+        }
     }
 }
 
@@ -3408,7 +4486,16 @@ mod zone_net_format_tests {
         assert!(!result.is_error, "{}", text_of(&result));
         let body = body_of(&result);
         assert_eq!(body["source"], json!("file"));
+        assert_eq!(
+            body["fallback_reason"],
+            json!({
+                "kind": "transport_unreachable",
+                "message": "KiCad IPC is unreachable and no exact-board sibling lock was present."
+            })
+        );
         let warning = body["warning"].as_str().expect("a fallback must warn");
+        assert!(warning.contains("IPC was unreachable"), "{warning}");
+        assert!(warning.contains("no exact-board sibling lock"), "{warning}");
         assert!(
             warning.contains("current Konnect server session"),
             "{warning}"

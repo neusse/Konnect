@@ -7,7 +7,11 @@
 
 use konnect_ipc::builders;
 use konnect_ipc::gen::kiapi;
-use konnect_ipc::KiCadIpcClient;
+use konnect_ipc::{
+    IpcEditorDocument, IpcEditorKind, IpcProjectIdentity, IpcSelectionMutation,
+    IpcSelectionMutationError, IpcSelectionMutationErrorKind, IpcSelectionObservationError,
+    IpcSelectionObservationErrorKind, IpcSheetInstancePath, KiCadIpcClient,
+};
 use nng::options::Options;
 use prost::Message;
 use std::sync::{Arc, Mutex};
@@ -95,20 +99,230 @@ fn reply_with(inner: prost_types::Any) -> kiapi::common::ApiResponse {
 
 fn open_board_response() -> kiapi::common::ApiResponse {
     let response = kiapi::common::commands::GetOpenDocumentsResponse {
-        documents: vec![kiapi::common::types::DocumentSpecifier {
-            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-            project: None,
-            identifier: Some(
-                kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                    "test.kicad_pcb".to_string(),
-                ),
-            ),
-        }],
+        documents: vec![doc_for("test.kicad_pcb")],
     };
     reply_with(builders::pack_any(
         &response,
         "kiapi.common.commands.GetOpenDocumentsResponse",
     ))
+}
+
+fn version_response() -> kiapi::common::ApiResponse {
+    let response = kiapi::common::commands::GetVersionResponse {
+        version: Some(kiapi::common::types::KiCadVersion {
+            major: 10,
+            minor: 0,
+            patch: 5,
+            full_version: "10.0.5".to_string(),
+        }),
+    };
+    reply_with(builders::pack_any(
+        &response,
+        "kiapi.common.commands.GetVersionResponse",
+    ))
+}
+
+fn unsupported_response(code: kiapi::common::ApiStatusCode) -> kiapi::common::ApiResponse {
+    kiapi::common::ApiResponse {
+        status: Some(kiapi::common::ApiResponseStatus {
+            status: code as i32,
+            error_message: String::new(),
+        }),
+        header: None,
+        message: None,
+    }
+}
+
+#[test]
+fn editor_state_observation_keeps_live_sheet_identity_and_unsupported_context_honest() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetVersion") {
+            return Some(version_response());
+        }
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let command =
+                kiapi::common::commands::GetOpenDocuments::decode(message.value.as_slice())
+                    .expect("decode GetOpenDocuments");
+            if command.r#type == kiapi::common::types::DocumentType::DoctypeSchematic as i32 {
+                let response = kiapi::common::commands::GetOpenDocumentsResponse {
+                    documents: vec![kiapi::common::types::DocumentSpecifier {
+                        r#type: kiapi::common::types::DocumentType::DoctypeSchematic as i32,
+                        project: Some(kiapi::common::types::ProjectSpecifier {
+                            name: "controller".to_string(),
+                            path: "C:/design/controller".to_string(),
+                        }),
+                        identifier: Some(
+                            kiapi::common::types::document_specifier::Identifier::SheetPath(
+                                kiapi::common::types::SheetPath {
+                                    path: vec![
+                                        kiapi::common::types::Kiid {
+                                            value: "root-kiid".to_string(),
+                                        },
+                                        kiapi::common::types::Kiid {
+                                            value: "power-kiid".to_string(),
+                                        },
+                                    ],
+                                    path_human_readable: "/power".to_string(),
+                                },
+                            ),
+                        ),
+                    }],
+                };
+                return Some(reply_with(builders::pack_any(
+                    &response,
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                )));
+            }
+            return Some(unsupported_response(
+                kiapi::common::ApiStatusCode::AsUnhandled,
+            ));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let state = KiCadIpcClient::new(&mock.url)
+        .observe_editor_state()
+        .expect("observe editor state");
+    assert_eq!(state.kicad_version.full_version, "10.0.5");
+    assert_eq!(state.evidence_source, "kicad_ipc");
+    assert_eq!(state.active_editor, None);
+    assert_eq!(state.active_document, None);
+    assert_eq!(state.active_sheet_instance, None);
+
+    let schematic = &state.editors[0];
+    assert_eq!(schematic.editor, konnect_ipc::IpcEditorKind::Schematic);
+    assert!(schematic.addressable);
+    assert_eq!(schematic.documents.len(), 1);
+    assert_eq!(schematic.documents[0].document_path, None);
+    assert_eq!(
+        schematic.documents[0]
+            .sheet_instance_path
+            .as_ref()
+            .expect("sheet path")
+            .kiids,
+        ["root-kiid", "power-kiid"]
+    );
+    assert_eq!(
+        schematic.capabilities.read_selection.availability,
+        konnect_ipc::IpcCapabilityAvailability::Available
+    );
+    assert_eq!(
+        schematic.capabilities.observe_active_context.availability,
+        konnect_ipc::IpcCapabilityAvailability::Unsupported
+    );
+    for capability in [
+        &schematic.capabilities.activate_document,
+        &schematic.capabilities.activate_sheet,
+        &schematic.capabilities.reveal_object,
+        &schematic.capabilities.center_object,
+        &schematic.capabilities.fit_view,
+    ] {
+        assert_eq!(
+            capability.availability,
+            konnect_ipc::IpcCapabilityAvailability::Unsupported
+        );
+        assert_eq!(capability.evidence_source, "konnect_bundled_kicad_protocol");
+        assert!(capability
+            .reason
+            .as_deref()
+            .is_some_and(|reason| { reason.contains("no stable typed") }));
+    }
+    assert_eq!(
+        schematic.capabilities.cross_probe.availability,
+        konnect_ipc::IpcCapabilityAvailability::Available
+    );
+
+    let pcb = &state.editors[1];
+    assert_eq!(pcb.editor, konnect_ipc::IpcEditorKind::Pcb);
+    assert!(!pcb.addressable);
+    assert!(pcb.documents.is_empty());
+    assert!(pcb
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("AS_UNHANDLED")));
+}
+
+#[test]
+fn handled_empty_document_sets_are_not_inferred_as_closed_frames() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetVersion") {
+            return Some(version_response());
+        }
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let response = kiapi::common::commands::GetOpenDocumentsResponse { documents: vec![] };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let state = KiCadIpcClient::new(&mock.url)
+        .observe_editor_state()
+        .expect("observe editor state");
+    assert!(state
+        .editors
+        .iter()
+        .all(|editor| editor.addressable && editor.documents.is_empty()));
+}
+
+#[test]
+fn malformed_cross_type_document_identity_is_typed_and_never_retargeted() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetVersion") {
+            return Some(version_response());
+        }
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let response = kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![kiapi::common::types::DocumentSpecifier {
+                    r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                    project: None,
+                    identifier: Some(
+                        kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                            "wrong.kicad_pcb".to_string(),
+                        ),
+                    ),
+                }],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let error = KiCadIpcClient::new(&mock.url)
+        .observe_editor_state()
+        .expect_err("cross-type document must refuse");
+    assert!(error
+        .chain()
+        .any(|cause| cause.is::<konnect_ipc::IpcDocumentObservationError>()));
+}
+
+#[test]
+fn unsupported_status_is_typed_without_changing_existing_rejection_classification() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        assert!(message.type_url.ends_with("GetOpenDocuments"));
+        Some(unsupported_response(
+            kiapi::common::ApiStatusCode::AsUnimplemented,
+        ))
+    });
+    let error = KiCadIpcClient::new(&mock.url)
+        .get_open_documents_for(konnect_ipc::IpcEditorKind::Pcb)
+        .expect_err("unsupported command must fail");
+    let status = konnect_ipc::ApiStatusError::from_error(&error).expect("typed status");
+    assert!(status.is_unsupported());
+    assert_eq!(status.code_name, "AS_UNIMPLEMENTED");
+    assert!(matches!(
+        konnect_ipc::IpcFailure::from_error(error),
+        konnect_ipc::IpcFailure::Rejected(_)
+    ));
 }
 
 #[test]
@@ -145,7 +359,7 @@ fn save_document_to_string_targets_the_named_open_board() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
     let snapshot = client
         .save_document_to_string_in(document)
@@ -220,7 +434,7 @@ fn effective_routing_rules_preserve_complete_kicad_values() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
     let rules = client
         .get_effective_routing_rules_in(document)
@@ -572,7 +786,7 @@ fn place_footprint_sends_graphics_children() {
     let client = KiCadIpcClient::new(&mock.url);
     let placed = client
         .place_footprint(
-            std::path::Path::new("test.kicad_pcb"),
+            &mock_board("test.kicad_pcb"),
             "Resistor_SMD:R_0402",
             "R1",
             "R_0402",
@@ -817,6 +1031,67 @@ fn a_live_kicad_that_says_no_classifies_as_rejected() {
     assert!(failure.message().contains("no board open"), "{failure:?}");
 }
 
+/// A KiCad holding some other project has rejected nothing — it was asked
+/// about a board it does not have. Classifying that as `Rejected` made every
+/// board-file write refuse itself while KiCad sat on an unrelated project.
+#[test]
+fn a_kicad_holding_another_board_classifies_as_not_open() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_board_response());
+        }
+        Some(ok_response())
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+    let failure = konnect_ipc::IpcFailure::from_error(
+        client
+            .find_open_board(&mock_board("other.kicad_pcb"))
+            .unwrap_err(),
+    );
+    assert!(
+        matches!(
+            failure,
+            konnect_ipc::IpcFailure::Target {
+                error: konnect_ipc::BoardTargetError::WrongDocument { .. },
+                ..
+            }
+        ),
+        "unexpected classification: {failure:?}"
+    );
+    assert!(failure.message().contains("test.kicad_pcb"), "{failure:?}");
+}
+
+#[test]
+fn a_kicad_with_nothing_open_classifies_as_not_open() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetOpenDocumentsResponse { documents: vec![] },
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )));
+        }
+        Some(ok_response())
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+    let failure = konnect_ipc::IpcFailure::from_error(
+        client
+            .find_open_board(&mock_board("test.kicad_pcb"))
+            .unwrap_err(),
+    );
+    assert!(
+        matches!(
+            failure,
+            konnect_ipc::IpcFailure::Target {
+                error: konnect_ipc::BoardTargetError::NoOpenDocuments { .. },
+                ..
+            }
+        ),
+        "unexpected classification: {failure:?}"
+    );
+}
+
 /// The regression the recv timeout exists for: a server that accepts the
 /// request and never replies. The predecessor project hung >600 s here; the
 /// client must give up at its recv timeout instead.
@@ -900,7 +1175,7 @@ fn placement_targets_the_named_board_among_several_open() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let _ = client.place_footprint(
-        std::path::Path::new("target.kicad_pcb"),
+        &mock_board("target.kicad_pcb"),
         "Resistor_SMD:R_0402",
         "R1",
         "R_0402",
@@ -924,15 +1199,226 @@ fn placement_targets_the_named_board_among_several_open() {
     );
 }
 
+/// The project directory the mock's open documents report.
+///
+/// KiCad identifies an open PCB by a *bare* `board_filename` plus its
+/// `ProjectSpecifier.path` — the form its own proto documents ("a PCB with a
+/// given filename, e.g. `board.kicad_pcb`"). A mock sending `project: None`
+/// was reproducing a document form KiCad does not emit, and it was the one
+/// form Konnect cannot place on disk.
+/// Absolute on the platform running the test: `Path::is_absolute` is what
+/// lets a project directory place a bare board filename, and a POSIX-rooted
+/// path is not absolute on Windows.
+const MOCK_PROJECT_DIR: &str = if cfg!(windows) {
+    r"C:\konnect-mock-project"
+} else {
+    "/konnect-mock-project"
+};
+
+/// The absolute path a caller asks about, for a board the mock reports open.
+fn mock_board(filename: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(MOCK_PROJECT_DIR).join(filename)
+}
+
 fn doc_for(filename: &str) -> kiapi::common::types::DocumentSpecifier {
     kiapi::common::types::DocumentSpecifier {
         r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-        project: None,
+        project: Some(kiapi::common::types::ProjectSpecifier {
+            name: "konnect-mock".to_string(),
+            path: MOCK_PROJECT_DIR.to_string(),
+        }),
         identifier: Some(
             kiapi::common::types::document_specifier::Identifier::BoardFilename(
                 filename.to_string(),
             ),
         ),
+    }
+}
+
+#[test]
+fn generic_read_and_write_helpers_keep_the_bound_named_board() {
+    let captured = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let captured_in_mock = captured.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let response = kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![doc_for("other.kicad_pcb"), doc_for("target.kicad_pcb")],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )));
+        }
+        if message.type_url.ends_with("GetItems") {
+            let command =
+                kiapi::common::commands::GetItems::decode(message.value.as_slice()).unwrap();
+            let document = command.header.unwrap().document.unwrap();
+            captured_in_mock
+                .lock()
+                .unwrap()
+                .push(("read".to_string(), board_filename(&document)));
+            let response = kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                items: Vec::new(),
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("CreateItems") {
+            let command =
+                kiapi::common::commands::CreateItems::decode(message.value.as_slice()).unwrap();
+            let document = command.header.unwrap().document.unwrap();
+            captured_in_mock
+                .lock()
+                .unwrap()
+                .push(("write".to_string(), board_filename(&document)));
+            let response = kiapi::common::commands::CreateItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                created_items: vec![creation_result(
+                    kiapi::common::commands::ItemStatusCode::IscOk,
+                    "",
+                )],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.CreateItemsResponse",
+            )));
+        }
+        panic!("unexpected command {}", message.type_url);
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    client
+        .find_open_board(&mock_board("target.kicad_pcb"))
+        .expect("bind target");
+    client
+        .get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)
+        .expect("generic read");
+    client
+        .create_items(vec![any_item()])
+        .expect("generic write");
+
+    assert_eq!(
+        *captured.lock().unwrap(),
+        [
+            ("read".to_string(), "target.kicad_pcb".to_string()),
+            ("write".to_string(), "target.kicad_pcb".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn zero_wrong_and_duplicate_open_document_sets_are_typed_target_failures() {
+    let cases = [
+        (Vec::new(), "no_open", mock_board("target.kicad_pcb")),
+        (
+            vec![doc_for("other.kicad_pcb")],
+            "wrong",
+            mock_board("target.kicad_pcb"),
+        ),
+        (
+            vec![doc_for("target.kicad_pcb"), doc_for("target.kicad_pcb")],
+            "ambiguous",
+            mock_board("target.kicad_pcb"),
+        ),
+    ];
+
+    for (documents, expected, requested) in cases {
+        let mock = spawn_mock(move |request| {
+            let message = request.message.expect("request must pack a command");
+            assert!(message.type_url.ends_with("GetOpenDocuments"));
+            let response = kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: documents.clone(),
+            };
+            Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )))
+        });
+        let client = KiCadIpcClient::new(&mock.url);
+        let failure = konnect_ipc::IpcFailure::from_error(
+            client
+                .find_open_board(&requested)
+                .expect_err("target selection must refuse"),
+        );
+        match (expected, failure) {
+            (
+                "no_open",
+                konnect_ipc::IpcFailure::Target {
+                    error: konnect_ipc::BoardTargetError::NoOpenDocuments { .. },
+                    ..
+                },
+            )
+            | (
+                "wrong",
+                konnect_ipc::IpcFailure::Target {
+                    error: konnect_ipc::BoardTargetError::WrongDocument { .. },
+                    ..
+                },
+            )
+            | (
+                "ambiguous",
+                konnect_ipc::IpcFailure::Target {
+                    error: konnect_ipc::BoardTargetError::AmbiguousDocument { .. },
+                    ..
+                },
+            ) => {}
+            (_, other) => panic!("unexpected target classification: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_bound_document_disappearing_before_a_generic_command_is_stale() {
+    let observations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observations_in_mock = observations.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        assert!(message.type_url.ends_with("GetOpenDocuments"));
+        let count = observations_in_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let response = kiapi::common::commands::GetOpenDocumentsResponse {
+            documents: if count == 0 {
+                vec![doc_for("target.kicad_pcb")]
+            } else {
+                vec![doc_for("other.kicad_pcb")]
+            },
+        };
+        Some(reply_with(builders::pack_any(
+            &response,
+            "kiapi.common.commands.GetOpenDocumentsResponse",
+        )))
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    client
+        .find_open_board(&mock_board("target.kicad_pcb"))
+        .expect("initial target binding");
+    let failure = konnect_ipc::IpcFailure::from_error(
+        client
+            .get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)
+            .expect_err("closed bound document must refuse before GetItems"),
+    );
+    assert!(matches!(
+        failure,
+        konnect_ipc::IpcFailure::Target {
+            error: konnect_ipc::BoardTargetError::StaleDocument { .. },
+            ..
+        }
+    ));
+    assert_eq!(observations.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+fn board_filename(document: &kiapi::common::types::DocumentSpecifier) -> String {
+    match document.identifier.as_ref() {
+        Some(kiapi::common::types::document_specifier::Identifier::BoardFilename(name)) => {
+            name.clone()
+        }
+        other => panic!("expected board filename, got {other:?}"),
     }
 }
 
@@ -1205,7 +1691,7 @@ fn a_failed_item_read_is_an_error_not_an_empty_board() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
 
     let error = client
@@ -1228,7 +1714,7 @@ fn footprint_pads_come_back_in_board_coordinates_with_their_nets() {
     )]);
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
 
     let pads = client
@@ -1257,7 +1743,7 @@ fn an_unreadable_live_pad_is_reported_instead_of_silently_dropped() {
     )]);
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
 
     let error = client
@@ -1278,7 +1764,7 @@ fn a_live_pad_without_a_position_is_reported_instead_of_fabricated_at_zero() {
     let mock = spawn_kicad_holding_items(vec![footprint_with_pads("U1", vec![pad])]);
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
 
     let error = client
@@ -1295,7 +1781,7 @@ fn a_footprint_absent_from_the_live_board_reads_as_none() {
     )]);
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
 
     assert!(client
@@ -1342,7 +1828,7 @@ fn pad_reads_target_the_named_board_among_several_open() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("target.kicad_pcb"))
+        .find_open_board(&mock_board("target.kicad_pcb"))
         .expect("target.kicad_pcb is open");
     let _ = client.get_footprint_pads_in(document, "R1");
 
@@ -1380,7 +1866,7 @@ fn board_graphics_come_back_with_their_kind_layer_and_identifier() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .find_open_board(&mock_board("test.kicad_pcb"))
         .expect("the mock holds test.kicad_pcb");
 
     let graphics = client
@@ -1442,7 +1928,7 @@ fn deletes_target_the_named_board_among_several_open() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
-        .find_open_board(std::path::Path::new("target.kicad_pcb"))
+        .find_open_board(&mock_board("target.kicad_pcb"))
         .expect("target.kicad_pcb is open");
     client
         .delete_items_in(document, vec!["edge-top".to_string()])
@@ -1503,7 +1989,7 @@ fn verified_trace_delete_refuses_a_non_trace_before_delete_items() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let deleted = client
-        .delete_trace_segment_verified(std::path::Path::new("test.kicad_pcb"), "via-or-zone")
+        .delete_trace_segment_verified(&mock_board("test.kicad_pcb"), "via-or-zone")
         .expect("a non-trace is an observed outcome, not an IPC failure");
 
     assert!(deleted.is_none());
@@ -1581,7 +2067,7 @@ fn verified_trace_delete_targets_one_board_and_returns_observed_preimage() {
 
     let client = KiCadIpcClient::new(&mock.url);
     let observed = client
-        .delete_trace_segment_verified(std::path::Path::new("target.kicad_pcb"), "segment-1")
+        .delete_trace_segment_verified(&mock_board("target.kicad_pcb"), "segment-1")
         .expect("verified deletion")
         .expect("the segment existed");
 
@@ -1638,9 +2124,589 @@ fn verified_trace_delete_refuses_success_when_readback_still_contains_the_segmen
 
     let client = KiCadIpcClient::new(&mock.url);
     let error = client
-        .delete_trace_segment_verified(std::path::Path::new("test.kicad_pcb"), "segment-1")
+        .delete_trace_segment_verified(&mock_board("test.kicad_pcb"), "segment-1")
         .unwrap_err()
         .to_string();
 
     assert!(error.contains("read-back still reports it"), "{error}");
+}
+
+#[test]
+fn generic_helpers_refuse_unbound_ambiguous_or_unidentifiable_documents() {
+    let mut unidentifiable = doc_for("unknown.kicad_pcb");
+    unidentifiable.project = None;
+    for (documents, expected) in [
+        (vec![], "wrong"),
+        (
+            vec![doc_for("a.kicad_pcb"), doc_for("b.kicad_pcb")],
+            "multiple",
+        ),
+        (vec![unidentifiable], "unresolved"),
+    ] {
+        let mock = spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            assert!(
+                message.type_url.ends_with("GetOpenDocuments"),
+                "must refuse before command"
+            );
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetOpenDocumentsResponse {
+                    documents: documents.clone(),
+                },
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )))
+        });
+        let client = KiCadIpcClient::new(&mock.url);
+        let failure =
+            konnect_ipc::IpcFailure::from_error(client.create_items(vec![any_item()]).unwrap_err());
+        match (expected, failure) {
+            (
+                "wrong",
+                konnect_ipc::IpcFailure::Target {
+                    error: konnect_ipc::BoardTargetError::NoOpenDocuments { .. },
+                    ..
+                },
+            )
+            | (
+                "multiple",
+                konnect_ipc::IpcFailure::Target {
+                    error: konnect_ipc::BoardTargetError::AmbiguousDocument { .. },
+                    ..
+                },
+            )
+            | (
+                "unresolved",
+                konnect_ipc::IpcFailure::Target {
+                    error: konnect_ipc::BoardTargetError::UnresolvedDocumentIdentities { .. },
+                    ..
+                },
+            ) => {}
+            (_, other) => panic!("unexpected classification: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn repeating_lookup_cannot_replace_the_bound_typed_document() {
+    let observations = std::sync::atomic::AtomicUsize::new(0);
+    let mock = spawn_mock(move |request| {
+        assert!(request
+            .message
+            .unwrap()
+            .type_url
+            .ends_with("GetOpenDocuments"));
+        let mut doc = doc_for("target.kicad_pcb");
+        if observations.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+            doc.project.as_mut().unwrap().name = "replacement".into();
+        }
+        Some(reply_with(builders::pack_any(
+            &kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![doc],
+            },
+            "kiapi.common.commands.GetOpenDocumentsResponse",
+        )))
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+    client
+        .find_open_board(&mock_board("target.kicad_pcb"))
+        .unwrap();
+    let failure = konnect_ipc::IpcFailure::from_error(
+        client
+            .find_open_board(&mock_board("target.kicad_pcb"))
+            .unwrap_err(),
+    );
+    assert!(matches!(
+        failure,
+        konnect_ipc::IpcFailure::Target {
+            error: konnect_ipc::BoardTargetError::StaleDocument { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn generic_reobservation_cannot_replace_the_bound_typed_document() {
+    let observations = std::sync::atomic::AtomicUsize::new(0);
+    let mock = spawn_mock(move |request| {
+        let message = request.message.unwrap();
+        if message.type_url.ends_with("GetItems") {
+            return Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items: vec![],
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        assert!(message.type_url.ends_with("GetOpenDocuments"));
+        let mut doc = doc_for("target.kicad_pcb");
+        if observations.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+            doc.project.as_mut().unwrap().name = "replacement".into();
+        }
+        Some(reply_with(builders::pack_any(
+            &kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![doc],
+            },
+            "kiapi.common.commands.GetOpenDocumentsResponse",
+        )))
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+    client
+        .find_open_board(&mock_board("target.kicad_pcb"))
+        .unwrap();
+    let failure = konnect_ipc::IpcFailure::from_error(
+        client
+            .get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)
+            .unwrap_err(),
+    );
+    assert!(matches!(
+        failure,
+        konnect_ipc::IpcFailure::Target {
+            error: konnect_ipc::BoardTargetError::StaleDocument { .. },
+            ..
+        }
+    ));
+}
+
+fn navigation_project_path() -> &'static str {
+    if cfg!(windows) {
+        r"C:\design"
+    } else {
+        "/design"
+    }
+}
+
+fn navigation_project() -> kiapi::common::types::ProjectSpecifier {
+    kiapi::common::types::ProjectSpecifier {
+        name: "navigation".to_string(),
+        path: navigation_project_path().to_string(),
+    }
+}
+
+fn navigation_board_document() -> kiapi::common::types::DocumentSpecifier {
+    kiapi::common::types::DocumentSpecifier {
+        r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+        identifier: Some(
+            kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                "navigation.kicad_pcb".to_string(),
+            ),
+        ),
+        project: Some(navigation_project()),
+    }
+}
+
+fn navigation_sheet_document(ids: &[&str]) -> kiapi::common::types::DocumentSpecifier {
+    kiapi::common::types::DocumentSpecifier {
+        r#type: kiapi::common::types::DocumentType::DoctypeSchematic as i32,
+        identifier: Some(
+            kiapi::common::types::document_specifier::Identifier::SheetPath(
+                kiapi::common::types::SheetPath {
+                    path: ids.iter().map(|id| kiid(id)).collect(),
+                    path_human_readable: "/child".to_string(),
+                },
+            ),
+        ),
+        project: Some(navigation_project()),
+    }
+}
+
+fn open_navigation_documents_response(
+    documents: Vec<kiapi::common::types::DocumentSpecifier>,
+) -> kiapi::common::ApiResponse {
+    reply_with(builders::pack_any(
+        &kiapi::common::commands::GetOpenDocumentsResponse { documents },
+        "kiapi.common.commands.GetOpenDocumentsResponse",
+    ))
+}
+
+fn selection_response(items: Vec<prost_types::Any>) -> kiapi::common::ApiResponse {
+    reply_with(builders::pack_any(
+        &kiapi::common::commands::SelectionResponse { items },
+        "kiapi.common.commands.SelectionResponse",
+    ))
+}
+
+fn navigation_project_identity() -> Option<IpcProjectIdentity> {
+    Some(IpcProjectIdentity {
+        name: "navigation".to_string(),
+        path: navigation_project_path().to_string(),
+    })
+}
+
+fn navigation_board_target() -> IpcEditorDocument {
+    let document_path = std::path::Path::new(navigation_project_path())
+        .join("navigation.kicad_pcb")
+        .display()
+        .to_string();
+    IpcEditorDocument {
+        editor: IpcEditorKind::Pcb,
+        project: navigation_project_identity(),
+        document_path: Some(document_path),
+        sheet_instance_path: None,
+    }
+}
+
+fn navigation_sheet_target(ids: &[&str]) -> IpcEditorDocument {
+    IpcEditorDocument {
+        editor: IpcEditorKind::Schematic,
+        project: navigation_project_identity(),
+        document_path: None,
+        sheet_instance_path: Some(IpcSheetInstancePath {
+            kiids: ids.iter().map(|id| (*id).to_string()).collect(),
+            human_readable: "/child".to_string(),
+        }),
+    }
+}
+
+fn selection_kind(error: &anyhow::Error) -> IpcSelectionObservationErrorKind {
+    IpcSelectionObservationError::from_error(error)
+        .expect("typed selection observation error")
+        .kind
+}
+
+#[test]
+fn selection_observation_is_bound_to_the_exact_board_and_returns_stable_kiids() {
+    let captured = Arc::new(Mutex::new(None));
+    let captured_in_mock = captured.clone();
+    let footprint = kiapi::board::types::FootprintInstance {
+        id: Some(kiid("footprint-kiid")),
+        ..Default::default()
+    };
+    let selected = builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_navigation_documents_response(vec![
+                navigation_board_document(),
+            ]));
+        }
+        if message.type_url.ends_with("GetSelection") {
+            let request = kiapi::common::commands::GetSelection::decode(message.value.as_slice())
+                .expect("selection request");
+            record_doc(&captured_in_mock, &request.header);
+            return Some(selection_response(vec![selected.clone()]));
+        }
+        panic!("unexpected request {}", message.type_url);
+    });
+
+    let observation = KiCadIpcClient::new(&mock.url)
+        .observe_selection(&navigation_board_target())
+        .expect("selection observation");
+    assert_eq!(observation.editor, IpcEditorKind::Pcb);
+    assert_eq!(observation.project, navigation_project_identity());
+    assert_eq!(observation.selected_objects.len(), 1);
+    assert_eq!(observation.selected_objects[0].kiid, "footprint-kiid");
+    assert_eq!(observation.selected_objects[0].object_type, "pcb_footprint");
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some("navigation.kicad_pcb")
+    );
+}
+
+#[test]
+fn schematic_selection_preserves_the_exact_sheet_instance_and_label_kiid() {
+    let label = kiapi::schematic::types::LocalLabel {
+        id: Some(kiid("label-kiid")),
+        ..Default::default()
+    };
+    let selected = builders::pack_any(&label, "kiapi.schematic.types.LocalLabel");
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_navigation_documents_response(vec![
+                navigation_sheet_document(&["root", "child"]),
+            ]));
+        }
+        if message.type_url.ends_with("GetSelection") {
+            return Some(selection_response(vec![selected.clone()]));
+        }
+        panic!("unexpected request {}", message.type_url);
+    });
+    let target = navigation_sheet_target(&["root", "child"]);
+    let observation = KiCadIpcClient::new(&mock.url)
+        .observe_selection(&target)
+        .expect("schematic selection is valid");
+    assert_eq!(observation.selected_objects[0].kiid, "label-kiid");
+    assert_eq!(
+        observation.selected_objects[0].object_type,
+        "schematic_label"
+    );
+    assert_eq!(observation.sheet_instance_path, target.sheet_instance_path);
+}
+
+#[test]
+fn selection_refuses_wrong_project_document_and_sheet_without_retargeting() {
+    let cases = [
+        (
+            navigation_board_target(),
+            vec![kiapi::common::types::DocumentSpecifier {
+                project: Some(kiapi::common::types::ProjectSpecifier {
+                    name: "other".to_string(),
+                    path: r"C:\other".to_string(),
+                }),
+                ..navigation_board_document()
+            }],
+            IpcSelectionObservationErrorKind::WrongProject,
+        ),
+        (
+            navigation_board_target(),
+            vec![kiapi::common::types::DocumentSpecifier {
+                identifier: Some(
+                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                        "other.kicad_pcb".to_string(),
+                    ),
+                ),
+                ..navigation_board_document()
+            }],
+            IpcSelectionObservationErrorKind::WrongDocument,
+        ),
+        (
+            navigation_sheet_target(&["root", "requested"]),
+            vec![navigation_sheet_document(&["root", "other"])],
+            IpcSelectionObservationErrorKind::WrongSheetInstance,
+        ),
+    ];
+    for (target, documents, expected) in cases {
+        let mock = spawn_mock(move |request| {
+            let message = request.message.expect("command");
+            assert!(message.type_url.ends_with("GetOpenDocuments"));
+            Some(open_navigation_documents_response(documents.clone()))
+        });
+        let error = KiCadIpcClient::new(&mock.url)
+            .observe_selection(&target)
+            .expect_err("target mismatch must fail closed");
+        assert_eq!(selection_kind(&error), expected, "{error:#}");
+    }
+}
+
+#[test]
+fn duplicate_document_identity_is_ambiguous_not_first_match() {
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        assert!(message.type_url.ends_with("GetOpenDocuments"));
+        Some(open_navigation_documents_response(vec![
+            navigation_board_document(),
+            navigation_board_document(),
+        ]))
+    });
+    let error = KiCadIpcClient::new(&mock.url)
+        .observe_selection(&navigation_board_target())
+        .expect_err("duplicates must be ambiguous");
+    assert_eq!(
+        selection_kind(&error),
+        IpcSelectionObservationErrorKind::AmbiguousDocument
+    );
+}
+
+#[test]
+fn malformed_or_unsupported_selected_objects_fail_the_whole_observation() {
+    let items = [
+        builders::pack_any(
+            &kiapi::board::types::FootprintInstance::default(),
+            "kiapi.board.types.FootprintInstance",
+        ),
+        prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.ReferenceImage".to_string(),
+            value: Vec::new(),
+        },
+    ];
+    let expected = [
+        IpcSelectionObservationErrorKind::MalformedSelectedObject,
+        IpcSelectionObservationErrorKind::UnsupportedObjectType,
+    ];
+    for (item, expected) in items.into_iter().zip(expected) {
+        let mock = spawn_mock(move |request| {
+            let message = request.message.expect("command");
+            if message.type_url.ends_with("GetOpenDocuments") {
+                return Some(open_navigation_documents_response(vec![
+                    navigation_board_document(),
+                ]));
+            }
+            Some(selection_response(vec![item.clone()]))
+        });
+        let error = KiCadIpcClient::new(&mock.url)
+            .observe_selection(&navigation_board_target())
+            .expect_err("unverifiable selected object must fail closed");
+        assert_eq!(selection_kind(&error), expected, "{error:#}");
+    }
+}
+
+#[test]
+fn document_disappearing_during_selection_readback_is_stale_editor_state() {
+    let open_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reads_in_mock = open_reads.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let read = reads_in_mock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let documents = if read == 0 {
+                vec![navigation_board_document()]
+            } else {
+                Vec::new()
+            };
+            return Some(open_navigation_documents_response(documents));
+        }
+        Some(selection_response(Vec::new()))
+    });
+    let error = KiCadIpcClient::new(&mock.url)
+        .observe_selection(&navigation_board_target())
+        .expect_err("disappeared document is stale state");
+    assert_eq!(
+        selection_kind(&error),
+        IpcSelectionObservationErrorKind::StaleEditorState
+    );
+}
+
+fn selected_footprints(ids: &std::collections::BTreeSet<String>) -> Vec<prost_types::Any> {
+    ids.iter()
+        .map(|id| {
+            builders::pack_any(
+                &kiapi::board::types::FootprintInstance {
+                    id: Some(kiid(id)),
+                    ..Default::default()
+                },
+                "kiapi.board.types.FootprintInstance",
+            )
+        })
+        .collect()
+}
+
+fn spawn_selection_mutation_mock(initial: &[&str], apply_mutation: bool) -> MockKicad {
+    let selection = Arc::new(Mutex::new(
+        initial
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect::<std::collections::BTreeSet<_>>(),
+    ));
+    let selection_in_mock = selection.clone();
+    spawn_mock(move |request| {
+        let message = request.message.expect("command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_navigation_documents_response(vec![
+                navigation_board_document(),
+            ]));
+        }
+        if message.type_url.ends_with("GetSelection") {
+            return Some(selection_response(selected_footprints(
+                &selection_in_mock.lock().unwrap(),
+            )));
+        }
+
+        let mutation_header = if message.type_url.ends_with("ClearSelection") {
+            let command =
+                kiapi::common::commands::ClearSelection::decode(message.value.as_slice()).unwrap();
+            if apply_mutation {
+                selection_in_mock.lock().unwrap().clear();
+            }
+            command.header
+        } else if message.type_url.ends_with("AddToSelection") {
+            let command =
+                kiapi::common::commands::AddToSelection::decode(message.value.as_slice()).unwrap();
+            if apply_mutation {
+                selection_in_mock
+                    .lock()
+                    .unwrap()
+                    .extend(command.items.iter().map(|id| id.value.clone()));
+            }
+            command.header
+        } else if message.type_url.ends_with("RemoveFromSelection") {
+            let command =
+                kiapi::common::commands::RemoveFromSelection::decode(message.value.as_slice())
+                    .unwrap();
+            if apply_mutation {
+                let mut selection = selection_in_mock.lock().unwrap();
+                for id in &command.items {
+                    selection.remove(&id.value);
+                }
+            }
+            command.header
+        } else {
+            panic!("unexpected request {}", message.type_url);
+        };
+        let document = mutation_header
+            .as_ref()
+            .and_then(|header| header.document.as_ref())
+            .expect("selection mutation document");
+        assert_eq!(board_filename(document), "navigation.kicad_pcb");
+        Some(selection_response(selected_footprints(
+            &selection_in_mock.lock().unwrap(),
+        )))
+    })
+}
+
+#[test]
+fn clear_add_and_remove_selection_are_proven_by_exact_readback() {
+    let cases = [
+        (IpcSelectionMutation::Clear, vec!["a"], Vec::<String>::new()),
+        (
+            IpcSelectionMutation::Add,
+            vec!["a"],
+            vec!["a".to_string(), "b".to_string()],
+        ),
+        (
+            IpcSelectionMutation::Remove,
+            vec!["a", "b"],
+            vec!["a".to_string()],
+        ),
+    ];
+    for (operation, initial, expected) in cases {
+        let mock = spawn_selection_mutation_mock(&initial, true);
+        let requested = match operation {
+            IpcSelectionMutation::Clear => Vec::new(),
+            IpcSelectionMutation::Add | IpcSelectionMutation::Remove => vec!["b".to_string()],
+        };
+        let result = KiCadIpcClient::new(&mock.url)
+            .mutate_selection(&navigation_board_target(), operation, &requested)
+            .expect("verified selection mutation");
+        let mut observed = result
+            .after
+            .selected_objects
+            .iter()
+            .map(|object| object.kiid.clone())
+            .collect::<Vec<_>>();
+        observed.sort();
+        assert_eq!(observed, expected);
+        assert_eq!(result.operation, operation);
+        assert!(result.evidence_source.contains("get_selection_readback"));
+    }
+}
+
+#[test]
+fn transport_success_without_the_requested_selection_change_is_a_mismatch() {
+    let mock = spawn_selection_mutation_mock(&["a"], false);
+    let error = KiCadIpcClient::new(&mock.url)
+        .mutate_selection(
+            &navigation_board_target(),
+            IpcSelectionMutation::Add,
+            &["b".to_string()],
+        )
+        .expect_err("unchanged readback is not success");
+    let typed = IpcSelectionMutationError::from_error(&error).expect("typed mutation error");
+    assert_eq!(typed.kind, IpcSelectionMutationErrorKind::ReadbackMismatch);
+    assert_eq!(typed.before_kiids, ["a"]);
+    assert_eq!(typed.after_kiids, ["a"]);
+}
+
+#[test]
+fn invalid_selection_mutations_are_rejected_before_transport() {
+    let client = KiCadIpcClient::new("inproc://not-contacted");
+    for (operation, requested) in [
+        (IpcSelectionMutation::Clear, vec!["a".to_string()]),
+        (IpcSelectionMutation::Add, Vec::new()),
+        (
+            IpcSelectionMutation::Remove,
+            vec!["a".to_string(), "a".to_string()],
+        ),
+    ] {
+        let error = client
+            .mutate_selection(&navigation_board_target(), operation, &requested)
+            .expect_err("invalid request");
+        assert_eq!(
+            IpcSelectionMutationError::from_error(&error)
+                .expect("typed mutation error")
+                .kind,
+            IpcSelectionMutationErrorKind::InvalidRequest
+        );
+    }
 }
